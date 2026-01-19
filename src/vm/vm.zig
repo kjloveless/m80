@@ -1,5 +1,8 @@
 const std = @import("std");
 const Jailer = @import("../jailer/jailer.zig").Jailer;
+const windows = @import("windows.zig");
+const hvf = @import("hvf.zig");
+const posix = @import("posix.zig");
 
 pub const Vm = struct {
   allocator: std.mem.Allocator,
@@ -15,18 +18,50 @@ pub const Vm = struct {
     };
   }
 
-  pub fn start(self: *Vm) !void {
+  pub fn start(self: *Vm, cfg: @import("../core/config.zig").VmConfig) !void {
     _ = self;
-    std.debug.print("[m80] starting vm\n", .{});
+    switch (@import("builtin").os.tag) {
+      .windows => try windows.start(cfg),
+      .macos => try hvf.start(cfg),
+      .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .haiku => try posix.start(cfg),
+      else => return error.UnsupportedPlatform,
+    }
+  }
 
-    // placeholder: windows backend later
-    // hyper-v / wsl / custom microVM
-    std.Thread.sleep(std.time.ns_per_s);
-
-    std.debug.print("[m80] vm running\n", .{});
+  pub fn stop(self: *Vm) !void {
+    _ = self;
+    switch (@import("builtin").os.tag) {
+      .windows => try windows.stop(),
+      .macos => try hvf.stop(),
+      .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .haiku => try posix.stop(),
+      else => return error.UnsupportedPlatform,
+    }
   }
 
   pub fn deinit(self: *Vm) void {
     _ = self;
   }
 };
+
+test "smoke: backend start/stop" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  var jailer = try Jailer.init(allocator);
+  defer jailer.deinit();
+
+  var vm = try Vm.init(allocator, &jailer);
+  defer vm.deinit();
+
+  const cfg = try @import("../core/config.zig").defaultConfig(allocator, "test");
+  var cfg_mut = cfg;
+  defer @import("../core/config.zig").freeConfig(allocator, &cfg_mut);
+
+  vm.start(cfg_mut) catch |e| switch (e) {
+    error.NotImplemented,
+    => return error.SkipZigTest,
+    else => return e,
+  };
+  try vm.stop();
+}

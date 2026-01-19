@@ -1,5 +1,18 @@
 const std = @import("std");
 
+pub const VmNameError = error{ InvalidName };
+const max_name_len: usize = 64;
+
+pub fn validateVmName(name: []const u8) bool {
+  if (name.len == 0 or name.len > max_name_len) return false;
+
+  for (name) |c| {
+    if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') continue;
+    return false;
+  }
+  return true;
+}
+
 pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
   // windows: %localappdata%\m80
   if (@import("builtin").os.tag == .windows) {
@@ -28,7 +41,16 @@ pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn vmDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+  if (!validateVmName(name)) return error.InvalidName;
   const base = try dataDir(allocator);
   defer allocator.free(base);
   return try std.fs.path.join(allocator, &[_][]const u8{ base, "vms", name });
+}
+
+test "vm name validation" {
+  try std.testing.expect(validateVmName("abc-123_OK"));
+  try std.testing.expect(!validateVmName(""));
+  try std.testing.expect(!validateVmName(".."));
+  try std.testing.expect(!validateVmName("../evil"));
+  try std.testing.expect(!validateVmName("bad/name"));
 }

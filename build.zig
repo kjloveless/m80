@@ -25,14 +25,19 @@ pub fn build(b: *std.Build) void {
   const run_step = b.step("run", "run m80");
   run_step.dependOn(&run_cmd.step);
 
+  const test_step = b.step("test", "run tests");
+  const test_runner: std.Build.Step.Compile.TestRunner = .{
+    .path = b.path("src/test_runner.zig"),
+    .mode = .simple,
+  };
   const unit_tests = b.addTest(.{
     .root_module = b.createModule(.{
-      .root_source_file = b.path("src/main.zig"),
+      .root_source_file = b.path("src/all_tests.zig"),
       .target = target,
       .optimize = optimize,
     }),
+    .test_runner = test_runner,
   });
-
-  const test_step = b.step("test", "run tests");
-  test_step.dependOn(&unit_tests.step);
+  const run_unit_tests = b.addRunArtifact(unit_tests);
+  test_step.dependOn(&run_unit_tests.step);
 }
