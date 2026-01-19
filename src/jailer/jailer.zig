@@ -65,11 +65,12 @@ pub const Jailer = struct {
     }
 
     pub fn prepare(self: *Jailer) !void {
+        // Prepare enforces filesystem + resource constraints before VM startup.
         log.info("preparing jail at {s}", .{self.root});
 
         try std.fs.cwd().makePath(self.root);
 
-        // Harden directory permissions
+        // Harden directory permissions.
         if (self.config.harden_permissions) {
             acl.hardenVmDirectory(self.allocator, self.root) catch |e| {
                 log.err("failed to harden permissions: {}", .{e});
@@ -77,12 +78,12 @@ pub const Jailer = struct {
             };
         }
 
-        // Set resource limits (before dropping privileges)
+        // Set resource limits before dropping privileges.
         if (builtin.os.tag != .windows) {
             try setResourceLimits(self.config.limits);
         }
 
-        // Chroot if configured
+        // Chroot if configured.
         if (self.config.chroot_enabled) {
             if (self.config.chroot_path) |chroot_path| {
                 try performChroot(chroot_path);
@@ -91,7 +92,7 @@ pub const Jailer = struct {
             }
         }
 
-        // Drop privileges if configured
+        // Drop privileges if configured.
         if (self.config.target_uid != null or self.config.target_gid != null) {
             try dropPrivileges(self.config.target_gid, self.config.target_uid);
             try verifyPrivilegesDropped();
@@ -111,15 +112,15 @@ pub fn dropPrivileges(target_gid: ?u32, target_uid: ?u32) JailerError!void {
         return;
     }
 
-    // Drop supplementary groups first
+    // Drop supplementary groups first.
     dropSupplementaryGroups() catch return JailerError.PrivilegeDropFailed;
 
-    // Set GID before UID (required order)
+    // Set GID before UID (required order).
     if (target_gid) |gid| {
         setGid(gid) catch return JailerError.PrivilegeDropFailed;
     }
 
-    // Set UID last
+    // Set UID last.
     if (target_uid) |uid| {
         setUid(uid) catch return JailerError.PrivilegeDropFailed;
     }
@@ -329,4 +330,33 @@ test "jailer: isRoot check" {
     const root = isRoot();
     // If UID is 0, should be root. Otherwise not.
     try std.testing.expectEqual(getCurrentUid() == 0, root);
+}
+
+test "jailer: prepare creates root directory" {
+    const allocator = std.testing.allocator;
+    var jailer = try Jailer.init(allocator);
+    defer jailer.deinit();
+
+    try jailer.prepare();
+    const stat = try std.fs.cwd().statFile(jailer.root);
+    try std.testing.expectEqual(std.fs.File.Kind.directory, stat.kind);
+}
+
+test "jailer: prepare with no harden and no limits" {
+    const allocator = std.testing.allocator;
+    var jailer = try Jailer.initWithConfig(allocator, .{
+        .harden_permissions = false,
+        .limits = .{
+            .max_files = null,
+            .max_procs = null,
+            .max_address_space = null,
+            .max_core = null,
+            .max_cpu_time = null,
+        },
+    });
+    defer jailer.deinit();
+
+    try jailer.prepare();
+    const stat = try std.fs.cwd().statFile(jailer.root);
+    try std.testing.expectEqual(std.fs.File.Kind.directory, stat.kind);
 }

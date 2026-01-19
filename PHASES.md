@@ -65,6 +65,13 @@ Principles:
 - Start/stop works deterministically across platforms
 - No background services required
 
+### Notes
+- Current backends are still stubbed; Phase 1 “done” items reflect scaffolding, not full boot.
+
+### Testing Notes (2026-01-19)
+- `zig build test`: 176 passed, 5 skipped, 0 failed.
+- Skips are OS/integration gated (HVF/POSIX/WHP integration).
+
 ### Remaining (Phase 1)
 - Implement register setup + real boot flow (entry point, cmdline, stack)
 - Decode real HVF/KVM exit structs into IoExit (current mapping is stubbed)
@@ -100,6 +107,9 @@ Principles:
 - Killing m80 kills the VM
 - VM cannot access unauthorized host resources
 - Escape attempts fail
+
+### Notes
+- Some jailer pieces are implemented, but platform hardening remains incomplete.
 
 ---
 
@@ -165,6 +175,9 @@ Principles:
 - Read-only mounts cannot be written
 - Host filesystem remains protected
 
+### Notes
+- VirtIO-FS implementation is currently a stub and not production-safe.
+
 ---
 
 ## Phase 6 — Network Whitelisting
@@ -193,6 +206,9 @@ Principles:
 - Only whitelisted domains resolve
 - Non-whitelisted traffic fails hard
 - No silent fallbacks
+
+### Notes
+- DNS allowlist is implemented, but enforcement still needs full virtio-net integration.
 
 ---
 

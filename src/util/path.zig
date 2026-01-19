@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const windows = std.os.windows;
 
 pub const PathError = error{
     PathTraversal,
@@ -207,8 +208,25 @@ fn checkSymlinkEscape(
         }
         try current_path.appendSlice(allocator, component);
 
-        // Check if this is a symlink
-        const stat = std.fs.cwd().statFile(current_path.items) catch continue;
+        // Check if this is a symlink without following it where possible.
+        const stat = if (builtin.os.tag == .windows) blk: {
+            const path_w = windows.sliceToPrefixedFileW(null, current_path.items) catch return true;
+            const attrs = windows.kernel32.GetFileAttributesW(path_w.span().ptr);
+            if (attrs == windows.INVALID_FILE_ATTRIBUTES) {
+                break :blk std.fs.cwd().statFile(current_path.items) catch continue;
+            }
+            if ((attrs & windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                return true;
+            }
+            break :blk std.fs.cwd().statFile(current_path.items) catch continue;
+        } else blk: {
+            const posix_stat = std.posix.fstatat(
+                std.posix.AT.FDCWD,
+                current_path.items,
+                std.posix.AT.SYMLINK_NOFOLLOW,
+            ) catch continue;
+            break :blk std.fs.File.Stat.fromPosix(posix_stat);
+        };
         if (stat.kind == .sym_link) {
             // Resolve the symlink and check if it escapes
             const target = readLinkAlloc(allocator, current_path.items) catch continue;
@@ -261,6 +279,7 @@ pub fn safeDeleteTree(
     path: []const u8,
     allowed_root: []const u8,
 ) PathError!void {
+    // Validate and canonicalize first to avoid deleting outside allowed_root.
     const validated = try validateSafePath(allocator, path, .{
         .allowed_root = allowed_root,
         .min_depth = 2,
@@ -276,6 +295,7 @@ pub fn safeDeleteTree(
 
 /// Checks if a path contains any path traversal patterns
 pub fn containsTraversal(path: []const u8) bool {
+    // Reject ".." sequences for both native and Windows separators.
     var it = std.mem.splitScalar(u8, path, std.fs.path.sep);
     while (it.next()) |component| {
         if (std.mem.eql(u8, component, "..")) return true;
@@ -407,4 +427,96 @@ test "path: normalizePathComponents" {
         defer allocator.free(result);
         try std.testing.expectEqualStrings("/baz", result);
     }
+}
+
+test "path: containsTraversal detects windows separators" {
+    try std.testing.expect(containsTraversal("..\\evil"));
+    try std.testing.expect(containsTraversal("foo\\..\\bar"));
+    try std.testing.expect(!containsTraversal("foo\\bar"));
+}
+
+test "path: isWithinRoot enforces separator boundary" {
+    try std.testing.expect(!isWithinRoot("/home/user2", "/home/user"));
+    try std.testing.expect(isWithinRoot("/home/user", "/home/user"));
+    try std.testing.expect(isWithinRoot("/home/user/sub", "/home/user"));
+}
+
+test "path: validateSafePath rejects when root missing" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(PathError.PathNotWithinRoot, validateSafePath(allocator, "/tmp/thing", .{
+        .allowed_root = "/definitely/missing/root",
+        .min_depth = 2,
+    }));
+}
+
+test "path: validateSafePath rejects symlink escape" {
+    const allocator = std.testing.allocator;
+
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root/child");
+    try tmp.dir.makePath("outside");
+    try tmp.dir.symLink("../outside", "root/link", .{});
+
+    const root = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root);
+
+    const target = try std.fs.path.join(allocator, &[_][]const u8{ root, "link" });
+    defer allocator.free(target);
+
+    const result = validateSafePath(allocator, target, .{
+        .allowed_root = root,
+        .min_depth = 1,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        PathError.SymlinkEscape,
+        PathError.PathNotWithinRoot,
+        => return,
+        else => return err,
+    };
+    allocator.free(result);
+    return error.TestExpectedError;
+}
+
+test "path: safeDeleteTree rejects shallow paths" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root/child");
+    const root = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root);
+
+    const target = try std.fs.path.join(allocator, &[_][]const u8{ root, "child" });
+    defer allocator.free(target);
+
+    try std.testing.expectError(PathError.PathTooShallow, safeDeleteTree(allocator, target, root));
+}
+
+test "path: safeDeleteTree deletes deep tree" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root/a/b");
+    {
+        var f = try tmp.dir.createFile("root/a/b/file.txt", .{});
+        defer f.close();
+        try f.writeAll("x");
+    }
+
+    const root = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root);
+
+    const target = try std.fs.path.join(allocator, &[_][]const u8{ root, "a", "b" });
+    defer allocator.free(target);
+
+    try safeDeleteTree(allocator, target, root);
+
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().openDir(target, .{}));
 }

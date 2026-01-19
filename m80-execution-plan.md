@@ -45,6 +45,13 @@
 - Decode real HVF/KVM exit structs into IoExit (current mapping is stubbed)
 - Verify deterministic start/stop on real WHP/HVF backends
 
+**Notes**
+- Current Phase 1 “done” items reflect scaffolding; full boot is still pending.
+
+## Testing Notes (2026-01-19)
+- `zig build test`: 176 passed, 5 skipped, 0 failed.
+- Skips are OS/integration gated (HVF/POSIX/WHP integration).
+
 ---
 
 ## Phase 2 — Jailer
@@ -53,6 +60,9 @@
 - Restricted Windows token
 - Job Objects (CPU/mem caps)
 - Kill-on-exit guarantees
+
+**Notes**
+- Several jailer components are implemented, but end‑to‑end hardening is not complete.
 
 ---
 

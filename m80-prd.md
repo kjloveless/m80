@@ -13,7 +13,7 @@ m80 supports both **persistent microVMs (default)** and **ephemeral microVMs (op
 m80 is **not** a general-purpose VM manager and explicitly avoids heavyweight virtualization features.
 
 ### Current Status
-- Phase 1 in progress
+- Phase 1 in progress (backend scaffolding and tests in place; full boot still pending)
 - WHP partition lifecycle stubbed with dynamic loading and error mapping (done)
 - WHP guest memory allocation + GPA mapping stubbed (done)
 - WHP vCPU create/delete + run loop skeleton added (done)

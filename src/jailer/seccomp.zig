@@ -137,6 +137,8 @@ pub const SeccompFilter = struct {
     }
 
     pub fn buildAllowlist(self: *SeccompFilter, allowed: []const u32) !void {
+        // Builds a simple linear allowlist:
+        // load syscall -> chain of JEQ -> default action -> allow.
         self.instructions.clearRetainingCapacity();
 
         try self.instructions.append(self.allocator, BpfInstruction.loadSyscallNr());
@@ -220,4 +222,28 @@ test "seccomp: SeccompFilter buildAllowlist" {
 test "seccomp: vmm_allowlist is valid" {
     try std.testing.expect(vmm_allowlist.len > 0);
     try std.testing.expect(vmm_allowlist.len < 100);
+}
+
+test "seccomp: buildAllowlist handles empty list" {
+    const allocator = std.testing.allocator;
+
+    var filter = SeccompFilter.init(allocator, .errno_eperm);
+    defer filter.deinit();
+
+    const empty = [_]u32{};
+    try filter.buildAllowlist(&empty);
+    try std.testing.expectEqual(@as(usize, 3), filter.instructions.items.len);
+}
+
+test "seccomp: buildAllowlist includes default and allow" {
+    const allocator = std.testing.allocator;
+
+    var filter = SeccompFilter.init(allocator, .errno_eperm);
+    defer filter.deinit();
+
+    const allowed = [_]u32{ Syscall.read };
+    try filter.buildAllowlist(&allowed);
+
+    const last = filter.instructions.items[filter.instructions.items.len - 1];
+    try std.testing.expectEqual(@intFromEnum(SeccompAction.allow), last.k);
 }

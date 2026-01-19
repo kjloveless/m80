@@ -6,6 +6,7 @@ const max_name_len: usize = 64;
 pub fn validateVmName(name: []const u8) bool {
   if (name.len == 0 or name.len > max_name_len) return false;
 
+  // Names are simple and filesystem-safe to reduce traversal risk.
   for (name) |c| {
     if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') continue;
     return false;
@@ -23,7 +24,7 @@ pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
     }
   }
 
-  // fallback: $xdg_data_home/m80 or ~/.local/share/m80
+  // fallback: $XDG_DATA_HOME/m80 or ~/.local/share/m80
   const xdg = std.process.getEnvVarOwned(allocator, "XDG_DATA_HOME") catch null;
   if (xdg) |base| {
     defer allocator.free(base);
@@ -53,4 +54,26 @@ test "vm name validation" {
   try std.testing.expect(!validateVmName(".."));
   try std.testing.expect(!validateVmName("../evil"));
   try std.testing.expect(!validateVmName("bad/name"));
+
+  var max_buf: [max_name_len]u8 = undefined;
+  @memset(&max_buf, 'a');
+  try std.testing.expect(validateVmName(&max_buf));
+
+  var too_long: [max_name_len + 1]u8 = undefined;
+  @memset(&too_long, 'b');
+  try std.testing.expect(!validateVmName(&too_long));
+}
+
+test "paths: dataDir returns m80 path" {
+  const allocator = std.testing.allocator;
+  const path = try dataDir(allocator);
+  defer allocator.free(path);
+
+  try std.testing.expect(path.len > 0);
+  try std.testing.expect(std.mem.indexOf(u8, path, "m80") != null);
+}
+
+test "paths: vmDir rejects invalid name" {
+  const allocator = std.testing.allocator;
+  try std.testing.expectError(error.InvalidName, vmDir(allocator, "../evil"));
 }

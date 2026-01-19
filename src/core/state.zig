@@ -11,6 +11,20 @@ pub const VmRecord = struct {
   status: VmStatus,
 };
 
+fn statusLine(status: VmStatus) []const u8 {
+  return switch (status) {
+    .stopped => "stopped\n",
+    .running => "running\n",
+  };
+}
+
+fn writeStatusFile(vm_dir: std.fs.Dir, status: VmStatus) !void {
+  // Status is a simple sentinel file; last writer wins.
+  var sf = try vm_dir.createFile("status", .{ .truncate = true });
+  defer sf.close();
+  try sf.writeAll(statusLine(status));
+}
+
 fn ensureBaseDirs(allocator: std.mem.Allocator) !void {
   const base = try paths.dataDir(allocator);
   defer allocator.free(base);
@@ -49,14 +63,20 @@ pub fn initVm(allocator: std.mem.Allocator, name: []const u8) !void {
   try config.writeConfigFile(vm_dir, cfg);
 
   // status file (stopped)
-  var sf = try vm_dir.createFile("status", .{ .truncate = true });
-  defer sf.close();
-  try sf.writeAll("stopped\n");
+  try writeStatusFile(vm_dir, .stopped);
 }
 
 pub fn deleteVm(allocator: std.mem.Allocator, name: []const u8) !void {
   const dir_path = paths.vmDir(allocator, name) catch return errors.M80Error.InvalidArgs;
   defer allocator.free(dir_path);
+
+  // Avoid deleting a missing VM directory; map to NotFound early.
+  if (std.fs.cwd().openDir(dir_path, .{})) |dir| {
+    var d = dir;
+    d.close();
+  } else |_| {
+    return errors.M80Error.NotFound;
+  }
 
   // Get the data root for validation
   const data_root = paths.dataDir(allocator) catch return errors.M80Error.InvalidArgs;
@@ -83,17 +103,11 @@ pub fn setStatus(allocator: std.mem.Allocator, name: []const u8, status: VmStatu
   var vm_dir = cwd.openDir(dir_path, .{}) catch return errors.M80Error.NotFound;
   defer vm_dir.close();
 
-  var sf = try vm_dir.createFile("status", .{ .truncate = true });
-  defer sf.close();
-
-  const line = switch (status) {
-    .stopped => "stopped\n",
-    .running => "running\n",
-  };
-  try sf.writeAll(line);
+  try writeStatusFile(vm_dir, status);
 }
 
 pub fn getStatus(vm_dir: std.fs.Dir) !VmStatus {
+  // Missing or malformed status file defaults to stopped.
   var f = vm_dir.openFile("status", .{}) catch return .stopped;
   defer f.close();
 
@@ -298,4 +312,149 @@ test "state: deleteVm removes record" {
       return error.TestExpectedEqual;
     }
   }
+}
+
+test "state: initVm deleteVm removes config and status files" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  var rnd: [8]u8 = undefined;
+  std.crypto.random.bytes(&rnd);
+  const hex = std.fmt.bytesToHex(rnd, .lower);
+
+  var name_buf: [32]u8 = undefined;
+  const name = try std.fmt.bufPrint(&name_buf, "rm-{s}", .{hex[0..]});
+
+  initVm(allocator, name) catch |e| switch (e) {
+    error.AlreadyExists => return error.SkipZigTest,
+    else => return e,
+  };
+
+  const dir_path = try paths.vmDir(allocator, name);
+  defer allocator.free(dir_path);
+
+  {
+    var vm_dir = try std.fs.cwd().openDir(dir_path, .{});
+    defer vm_dir.close();
+    _ = try vm_dir.statFile("m80.conf");
+    _ = try vm_dir.statFile("status");
+  }
+
+  try deleteVm(allocator, name);
+
+  try std.testing.expectError(error.FileNotFound, std.fs.cwd().openDir(dir_path, .{}));
+}
+
+test "state: getStatus defaults to stopped when missing or invalid" {
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  // Missing status file should default to stopped.
+  try std.testing.expectEqual(VmStatus.stopped, try getStatus(tmp.dir));
+
+  // Invalid contents should also resolve to stopped.
+  var f = try tmp.dir.createFile("status", .{ .truncate = true });
+  defer f.close();
+  try f.writeAll("unknown\n");
+  try std.testing.expectEqual(VmStatus.stopped, try getStatus(tmp.dir));
+}
+
+test "state: deleteVm rejects invalid name" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  try std.testing.expectError(errors.M80Error.InvalidArgs, deleteVm(allocator, "../evil"));
+}
+
+test "state: deleteVm returns NotFound for missing vm" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  var rnd: [8]u8 = undefined;
+  std.crypto.random.bytes(&rnd);
+  const hex = std.fmt.bytesToHex(rnd, .lower);
+
+  var name_buf: [32]u8 = undefined;
+  const name = try std.fmt.bufPrint(&name_buf, "missing-{s}", .{hex[0..]});
+
+  const dir_path = paths.vmDir(allocator, name) catch return error.SkipZigTest;
+  defer allocator.free(dir_path);
+
+  if (std.fs.cwd().openDir(dir_path, .{})) |dir| {
+    var d = dir;
+    d.close();
+    return error.SkipZigTest;
+  } else |_| {}
+
+  try std.testing.expectError(errors.M80Error.NotFound, deleteVm(allocator, name));
+}
+
+test "state: setStatus returns NotFound for missing vm" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  var rnd: [8]u8 = undefined;
+  std.crypto.random.bytes(&rnd);
+  const hex = std.fmt.bytesToHex(rnd, .lower);
+
+  var name_buf: [32]u8 = undefined;
+  const name = try std.fmt.bufPrint(&name_buf, "missing-{s}", .{hex[0..]});
+
+  try std.testing.expectError(errors.M80Error.NotFound, setStatus(allocator, name, .running));
+}
+
+test "state: getStatus returns stopped on unexpected content" {
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  {
+    var f = try tmp.dir.createFile("status", .{ .truncate = true });
+    defer f.close();
+    try f.writeAll("gibberish\n");
+  }
+
+  try std.testing.expectEqual(VmStatus.stopped, try getStatus(tmp.dir));
+}
+
+test "state: listVms returns empty when data dir is empty" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  const data_root = try tmp.dir.realpathAlloc(allocator, ".");
+  defer allocator.free(data_root);
+
+  const vms_path = try std.fs.path.join(allocator, &[_][]const u8{ data_root, "vms" });
+  defer allocator.free(vms_path);
+  try tmp.dir.makePath("vms");
+
+  var vms_dir = try tmp.dir.openDir("vms", .{ .iterate = true });
+  defer vms_dir.close();
+
+  var it = vms_dir.iterate();
+  const next = try it.next();
+  try std.testing.expect(next == null);
+}
+
+test "state: deleteVm returns NotFound for valid but missing name" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  try std.testing.expectError(errors.M80Error.NotFound, deleteVm(allocator, "a"));
+}
+
+test "state: initVm rejects invalid name" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  try std.testing.expectError(errors.M80Error.InvalidArgs, initVm(allocator, "../evil"));
 }

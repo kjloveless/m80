@@ -4,6 +4,7 @@ pub const SerialIo = struct {
   buf: ?[]u8 = null,
   offset: usize = 0,
 
+  // If set, feeds readPort(0x3F8) with the provided bytes.
   pub fn setFromEnv(self: *SerialIo, allocator: std.mem.Allocator) void {
     const env = std.process.getEnvVarOwned(allocator, "M80_SERIAL_IN") catch null;
     if (env) |v| {
@@ -55,6 +56,7 @@ pub const SerialIo = struct {
       val = 0x20;
       if (self.hasData()) val |= 0x01;
     }
+    // Mask to requested width to mirror hardware behavior.
     if (size < 8) {
       const mask: u64 = (@as(u64, 1) << @as(u6, @intCast(size * 8))) - 1;
       val &= mask;
@@ -106,4 +108,18 @@ test "serial: readPort reflects data ready" {
 
   const lsr_empty = serial.readPort(0x3FD, 1);
   try std.testing.expect((lsr_empty & 0x01) == 0);
+}
+
+test "serial: readPort masks to width" {
+  var serial = SerialIo{};
+  serial.buf = try std.testing.allocator.dupe(u8, "\xFF");
+  serial.offset = 0;
+  defer serial.clear(std.testing.allocator);
+
+  const byte = serial.readPort(0x3F8, 1);
+  try std.testing.expectEqual(@as(u64, 0xFF), byte);
+
+  // With size 1, high bits should be masked off.
+  const status = serial.readPort(0x3FD, 1);
+  try std.testing.expect((status & 0xFF) == status);
 }

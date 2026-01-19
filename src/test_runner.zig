@@ -21,6 +21,7 @@ pub fn main() void {
     var fail_count: usize = 0;
     var leaks: usize = 0;
 
+    // Each test gets a fresh allocator instance to detect leaks per test.
     for (test_fns, 0..) |test_fn, i| {
         testing.allocator_instance = .{};
         defer {
@@ -81,4 +82,13 @@ pub fn log(
             args,
         );
     }
+}
+
+test "test_runner: log counts errors" {
+    const saved = log_err_count;
+    defer log_err_count = saved;
+
+    log_err_count = 0;
+    log(.err, .default, "test error {d}", .{1});
+    try std.testing.expectEqual(@as(usize, 1), log_err_count);
 }

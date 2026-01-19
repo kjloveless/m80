@@ -41,15 +41,15 @@ pub const Protocol = enum {
 
 /// A domain-based access rule
 pub const DomainRule = struct {
-    /// Domain pattern (supports wildcards like *.example.com)
-    pattern: []const u8,
-    /// Allowed port range (null = all ports)
-    port_min: ?u16 = null,
-    port_max: ?u16 = null,
-    /// Protocol filter
-    protocol: Protocol = .any,
-    /// Whether this is an allow or deny rule
-    allow: bool = true,
+  /// Domain pattern (supports wildcards like *.example.com)
+  pattern: []const u8,
+  /// Allowed port range (null = all ports)
+  port_min: ?u16 = null,
+  port_max: ?u16 = null,
+  /// Protocol filter
+  protocol: Protocol = .any,
+  /// Whether this is an allow or deny rule
+  allow: bool = true,
 
     /// Checks if a domain matches this rule
     pub fn matches(self: *const DomainRule, domain: []const u8) bool {
@@ -67,10 +67,10 @@ pub const DomainRule = struct {
 
 /// An IP-based access rule (CIDR notation)
 pub const IpRule = struct {
-    /// IP address (IPv4 as 4 bytes)
-    address: [4]u8,
-    /// CIDR prefix length (0-32)
-    prefix_len: u8,
+  /// IP address (IPv4 as 4 bytes)
+  address: [4]u8,
+  /// CIDR prefix length (0-32)
+  prefix_len: u8,
     /// Allowed port range
     port_min: ?u16 = null,
     port_max: ?u16 = null,
@@ -125,9 +125,9 @@ pub const ResolvedIp = struct {
 
 /// Main network policy configuration
 pub const NetworkPolicy = struct {
-    allocator: std.mem.Allocator,
-    /// Current network mode
-    mode: NetworkMode = .locked_down,
+  allocator: std.mem.Allocator,
+  /// Current network mode
+  mode: NetworkMode = .locked_down,
     /// DNS-based domain rules
     allowed_domains: std.ArrayList(DomainRule),
     /// Direct IP/CIDR rules
@@ -207,19 +207,19 @@ pub const NetworkPolicy = struct {
         return self.isDomainAllowedOnPort(domain, null);
     }
 
-    /// Checks if a domain is allowed on a specific port
-    pub fn isDomainAllowedOnPort(self: *const NetworkPolicy, domain: []const u8, port: ?u16) bool {
-        switch (self.mode) {
-            .locked_down => return false,
-            .open => return true,
-            .allowlist => {
-                for (self.allowed_domains.items) |rule| {
-                    if (rule.matches(domain)) {
-                        if (port) |p| {
-                            if (rule.portAllowed(p)) return rule.allow;
-                        } else {
-                            return rule.allow;
-                        }
+  /// Checks if a domain is allowed on a specific port
+  pub fn isDomainAllowedOnPort(self: *const NetworkPolicy, domain: []const u8, port: ?u16) bool {
+    switch (self.mode) {
+      .locked_down => return false,
+      .open => return true,
+      .allowlist => {
+        // First matching rule wins.
+        for (self.allowed_domains.items) |rule| {
+          if (rule.matches(domain)) {
+            const port_ok = if (port) |p| rule.portAllowed(p) else true;
+            if (port_ok) {
+              return rule.allow;
+            }
                     }
                 }
                 return false;
@@ -233,29 +233,28 @@ pub const NetworkPolicy = struct {
     }
 
     /// Checks if an IP is allowed on a specific port
-    pub fn isIpAllowedOnPort(self: *const NetworkPolicy, ip: [4]u8, port: ?u16) bool {
-        switch (self.mode) {
-            .locked_down => return false,
-            .open => return true,
-            .allowlist => {
-                // Check direct IP rules first
-                for (self.allowed_ips.items) |rule| {
-                    if (rule.matches(ip)) {
-                        if (port) |p| {
-                            if (rule.portAllowed(p)) return rule.allow;
-                        } else {
-                            return rule.allow;
-                        }
-                    }
-                }
+  pub fn isIpAllowedOnPort(self: *const NetworkPolicy, ip: [4]u8, port: ?u16) bool {
+    switch (self.mode) {
+      .locked_down => return false,
+      .open => return true,
+      .allowlist => {
+        // Check direct IP rules first
+        for (self.allowed_ips.items) |rule| {
+          if (rule.matches(ip)) {
+            const port_ok = if (port) |p| rule.portAllowed(p) else true;
+            if (port_ok) {
+              return rule.allow;
+            }
+          }
+        }
 
-                // Check resolved IPs from DNS
-                const now = std.time.timestamp();
-                for (self.resolved_ips.items) |resolved| {
-                    if (resolved.expires_at > now and std.mem.eql(u8, &resolved.address, &ip)) {
-                        return true;
-                    }
-                }
+        // Check resolved IPs from DNS (cache only applies in allowlist mode)
+        const now = std.time.timestamp();
+        for (self.resolved_ips.items) |resolved| {
+          if (resolved.expires_at > now and std.mem.eql(u8, &resolved.address, &ip)) {
+            return true;
+          }
+        }
 
                 return false;
             },
@@ -263,9 +262,10 @@ pub const NetworkPolicy = struct {
     }
 
     /// Adds a resolved IP to the cache
-    pub fn addResolvedIp(self: *NetworkPolicy, domain: []const u8, ip: [4]u8, ttl: u32) !void {
-        const capped_ttl = @min(ttl, self.max_dns_ttl_seconds);
-        const expires_at = std.time.timestamp() + @as(i64, capped_ttl);
+  pub fn addResolvedIp(self: *NetworkPolicy, domain: []const u8, ip: [4]u8, ttl: u32) !void {
+    // TTL is capped to avoid unbounded cache lifetimes.
+    const capped_ttl = @min(ttl, self.max_dns_ttl_seconds);
+    const expires_at = std.time.timestamp() + @as(i64, capped_ttl);
 
         const owned_domain = try self.allocator.dupe(u8, domain);
         try self.resolved_ips.append(self.allocator, .{
@@ -306,23 +306,21 @@ pub const NetworkPolicy = struct {
 /// Matches a domain against a pattern (supports wildcards)
 /// *.example.com matches sub.example.com but NOT example.com
 pub fn matchDomainPattern(pattern: []const u8, domain: []const u8) bool {
-    // Exact match
-    if (std.mem.eql(u8, pattern, domain)) return true;
+  // Exact match
+  if (std.mem.eql(u8, pattern, domain)) return true;
 
     // Wildcard match
-    if (std.mem.startsWith(u8, pattern, "*.")) {
-        const suffix = pattern[1..]; // .example.com
-        if (std.mem.endsWith(u8, domain, suffix)) {
-            // Make sure there's something before the suffix
-            const prefix_len = domain.len - suffix.len;
-            if (prefix_len > 0) {
-                // Make sure the prefix doesn't contain a dot (for *.example.com, foo.bar.example.com should NOT match)
-                // Actually, per the spec *.example.com SHOULD match sub.example.com but not example.com
-                // Let's allow multi-level subdomains
-                return true;
-            }
-        }
+  if (std.mem.startsWith(u8, pattern, "*.")) {
+    const suffix = pattern[1..]; // .example.com
+    if (std.mem.endsWith(u8, domain, suffix)) {
+      // Make sure there's something before the suffix
+      const prefix_len = domain.len - suffix.len;
+      if (prefix_len > 0) {
+        // Allow multi-level subdomains (e.g., deep.sub.example.com).
+        return true;
+      }
     }
+  }
 
     return false;
 }
@@ -391,6 +389,13 @@ test "policy: matchDomainPattern wildcard" {
     try std.testing.expect(matchDomainPattern("*.example.com", "deep.sub.example.com"));
     try std.testing.expect(!matchDomainPattern("*.example.com", "example.com"));
     try std.testing.expect(!matchDomainPattern("*.example.com", "other.com"));
+}
+
+test "policy: matchDomainPattern wildcard edge cases" {
+    try std.testing.expect(matchDomainPattern("*.example.com", "a.example.com"));
+    try std.testing.expect(!matchDomainPattern("*.example.com", "example.com.evil"));
+    try std.testing.expect(!matchDomainPattern("*.example.com", "badexample.com"));
+    try std.testing.expect(!matchDomainPattern("*.example.com", "example.com"));
 }
 
 test "policy: IpRule mask calculation" {
@@ -473,4 +478,147 @@ test "policy: DomainRule port filtering" {
     try std.testing.expect(rule.portAllowed(443));
     try std.testing.expect(!rule.portAllowed(80));
     try std.testing.expect(!rule.portAllowed(8080));
+}
+
+test "policy: NetworkPolicy domain allowlist with ports" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+
+    policy.mode = .allowlist;
+    try policy.addDomainRuleWithPorts("example.com", 443, 443);
+
+    try std.testing.expect(policy.isDomainAllowedOnPort("example.com", 443));
+    try std.testing.expect(!policy.isDomainAllowedOnPort("example.com", 80));
+}
+
+test "policy: NetworkPolicy domain deny rule" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+
+    policy.mode = .allowlist;
+    try policy.allowed_domains.append(allocator, .{
+        .pattern = try allocator.dupe(u8, "blocked.example.com"),
+        .allow = false,
+    });
+
+    try std.testing.expect(!policy.isDomainAllowed("blocked.example.com"));
+}
+
+test "policy: NetworkPolicy IP allowlist with ports" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+
+    policy.mode = .allowlist;
+    try policy.allowed_ips.append(allocator, .{
+        .address = [4]u8{ 10, 0, 0, 0 },
+        .prefix_len = 8,
+        .port_min = 22,
+        .port_max = 22,
+    });
+
+    try std.testing.expect(policy.isIpAllowedOnPort([4]u8{ 10, 1, 2, 3 }, 22));
+    try std.testing.expect(!policy.isIpAllowedOnPort([4]u8{ 10, 1, 2, 3 }, 80));
+}
+
+test "policy: NetworkPolicy resolved IP cache and cleanup" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+
+    policy.mode = .allowlist;
+    try policy.addResolvedIp("example.com", [4]u8{ 1, 2, 3, 4 }, 60);
+
+    try std.testing.expect(policy.isIpAllowed([4]u8{ 1, 2, 3, 4 }));
+
+    const now = std.time.timestamp();
+    policy.resolved_ips.items[0].expires_at = now - 1;
+    policy.cleanupExpiredEntries();
+    try std.testing.expect(!policy.isIpAllowed([4]u8{ 1, 2, 3, 4 }));
+}
+
+test "policy: validateOpenMode requires env var" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+
+    policy.mode = .open;
+    try std.testing.expect(!policy.validateOpenMode());
+}
+
+test "policy: addResolvedIp caps ttl" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+
+    policy.max_dns_ttl_seconds = 1;
+    try policy.addResolvedIp("example.com", [4]u8{ 1, 2, 3, 4 }, 100);
+    try std.testing.expect(policy.resolved_ips.items.len == 1);
+
+    const now = std.time.timestamp();
+    const ttl = policy.resolved_ips.items[0].expires_at - now;
+    try std.testing.expect(ttl <= 1);
+}
+
+test "policy: cleanupExpiredEntries removes expired" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+
+    try policy.addResolvedIp("example.com", [4]u8{ 1, 2, 3, 4 }, 60);
+    try std.testing.expectEqual(@as(usize, 1), policy.resolved_ips.items.len);
+
+    policy.resolved_ips.items[0].expires_at = std.time.timestamp() - 1;
+    policy.cleanupExpiredEntries();
+    try std.testing.expectEqual(@as(usize, 0), policy.resolved_ips.items.len);
+}
+
+test "policy: allowlist uses first matching rule" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+    policy.mode = .allowlist;
+
+    try policy.allowed_domains.append(allocator, .{
+        .pattern = try allocator.dupe(u8, "example.com"),
+        .allow = false,
+    });
+    try policy.allowed_domains.append(allocator, .{
+        .pattern = try allocator.dupe(u8, "example.com"),
+        .allow = true,
+    });
+
+    try std.testing.expect(!policy.isDomainAllowed("example.com"));
+}
+
+test "policy: open mode allows domain and ip" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+    policy.mode = .open;
+
+    try std.testing.expect(policy.isDomainAllowed("example.com"));
+    try std.testing.expect(policy.isIpAllowed([4]u8{ 1, 2, 3, 4 }));
+}
+
+test "policy: locked_down denies domain and ip" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+    policy.mode = .locked_down;
+
+    try std.testing.expect(!policy.isDomainAllowed("example.com"));
+    try std.testing.expect(!policy.isIpAllowed([4]u8{ 1, 2, 3, 4 }));
 }

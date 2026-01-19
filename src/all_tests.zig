@@ -1,4 +1,5 @@
 test "import: all modules" {
+    // Importing modules here ensures tests are discovered by the runner.
     _ = @import("core.zig");
     _ = @import("core/config.zig");
     _ = @import("core/errors.zig");

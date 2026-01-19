@@ -116,6 +116,7 @@ pub const JobObjectSandbox = struct {
             return SandboxError.JobObjectCreationFailed;
         }
 
+        // Apply hard limits before the process joins the job.
         try self.applyLimits();
         try self.applyUiRestrictions();
 
@@ -126,6 +127,7 @@ pub const JobObjectSandbox = struct {
         if (builtin.os.tag != .windows) return;
         if (self.job_handle == null) return SandboxError.InvalidConfiguration;
 
+        // Job object limits are best-effort; any failure aborts setup.
         const set_info = @extern(?*const fn (*anyopaque, u32, *anyopaque, u32) callconv(.winapi) c_int, .{
             .name = "SetInformationJobObject",
         });
@@ -178,6 +180,7 @@ pub const JobObjectSandbox = struct {
         if (builtin.os.tag != .windows) return;
         if (self.job_handle == null) return SandboxError.InvalidConfiguration;
 
+        // UI restrictions prevent desktop/clipboard/handle leakage.
         const set_info = @extern(?*const fn (*anyopaque, u32, *anyopaque, u32) callconv(.winapi) c_int, .{
             .name = "SetInformationJobObject",
         });
@@ -219,6 +222,7 @@ pub const JobObjectSandbox = struct {
         if (builtin.os.tag != .windows) return;
         if (self.job_handle == null) return SandboxError.InvalidConfiguration;
 
+        // Attach the current process so limits apply to this runner.
         const get_current = @extern(?*const fn () callconv(.winapi) *anyopaque, .{
             .name = "GetCurrentProcess",
         });

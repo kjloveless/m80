@@ -10,6 +10,7 @@ const guest_kernel_base: u64 = 0x100000;
 const guest_initrd_base: u64 = 0x4000000;
 const guest_cmdline_base: u64 = 0x20000;
 
+// Global stub state (single active VM instance).
 var active_memory_size: usize = 0;
 var active_vcpu_thread: ?std.Thread = null;
 var vcpu_running = std.atomic.Value(bool).init(false);
@@ -36,6 +37,12 @@ fn readLeU64(data: []const u8, size: usize) u64 {
     out |= @as(u64, data[i]) << @as(u6, @intCast(i * 8));
   }
   return out;
+}
+
+fn envFlagPresent(allocator: std.mem.Allocator, name: []const u8) bool {
+  const env = std.process.getEnvVarOwned(allocator, name) catch return false;
+  allocator.free(env);
+  return true;
 }
 
 fn kvmIoExitToIoExit(exit: KvmIoExit, data: []const u8) IoExit {
@@ -75,6 +82,7 @@ fn runVcpuStub(index: u32) void {
   log.info("posix vcpu {d} stub run loop entered", .{index});
   while (vcpu_running.load(.seq_cst)) {
     if (simulate_io.swap(false, .seq_cst)) {
+      // Emulate a single write/read IO cycle on the serial port.
       _ = handleIoExit(.{ .port = 0x3F8, .is_write = true, .size = 1, .rax = '>', .is_string = false, .has_rep = false });
       _ = handleIoExit(.{ .port = 0x3FD, .is_write = false, .size = 1, .rax = 0, .is_string = false, .has_rep = false });
     }
@@ -131,7 +139,7 @@ pub fn start(cfg: config.VmConfig) !void {
   active_memory_size = @intCast(size_bytes_u64);
 
   vcpu_running.store(true, .seq_cst);
-  if ((std.process.getEnvVarOwned(std.heap.page_allocator, "M80_IO_SIM") catch null) != null) {
+  if (envFlagPresent(std.heap.page_allocator, "M80_IO_SIM")) {
     simulate_io.store(true, .seq_cst);
   }
   serial_io.setFromEnv(std.heap.page_allocator);
@@ -188,4 +196,32 @@ test "posix: kvm io exit mapping" {
   try std.testing.expectEqual(@as(u64, 'B'), mapped.rax);
   try std.testing.expect(mapped.is_string);
   try std.testing.expect(mapped.has_rep);
+}
+
+test "posix: readLeU64 respects size and data length" {
+  try std.testing.expectEqual(@as(u64, 0), readLeU64("", 0));
+  try std.testing.expectEqual(@as(u64, 0x01), readLeU64("\x01\x02", 1));
+  try std.testing.expectEqual(@as(u64, 0x0201), readLeU64("\x01\x02", 2));
+  try std.testing.expectEqual(@as(u64, 0x0201), readLeU64("\x01\x02", 4));
+  try std.testing.expectEqual(@as(u64, 0x04030201), readLeU64("\x01\x02\x03\x04", 4));
+}
+
+test "posix: prepareGuestImage rejects too small memory" {
+  try std.testing.expectError(error.InvalidGuestLayout, prepareGuestImage(0x1000));
+}
+
+test "posix: loadGuestKernel errors on missing file" {
+  try std.testing.expectError(error.FileNotFound, loadGuestKernel(64 * 1024 * 1024, "missing-kernel"));
+}
+
+test "posix: loadGuestInitrd errors on missing file" {
+  try std.testing.expectError(error.FileNotFound, loadGuestInitrd(64 * 1024 * 1024, "missing-initrd"));
+}
+
+test "posix: loadGuestKernel skips when unset" {
+  try loadGuestKernel(64 * 1024 * 1024, null);
+}
+
+test "posix: loadGuestInitrd skips when unset" {
+  try loadGuestInitrd(64 * 1024 * 1024, null);
 }

@@ -8,6 +8,7 @@ const Vm = @import("vm/vm.zig").Vm;
 const Jailer = @import("jailer/jailer.zig").Jailer;
 
 fn printHelp() void {
+  // Minimal CLI surface for now; config format is intentionally simple.
   std.debug.print(
     \\m80 - windows-native microvm/sandbox manager (scaffold)
     \\
@@ -23,6 +24,23 @@ fn printHelp() void {
   , .{});
 }
 
+fn fileSizeIfExists(path_opt: ?[]const u8) ?u64 {
+  if (path_opt == null) return null;
+  const path = path_opt.?;
+  const file = if (std.fs.path.isAbsolute(path))
+    std.fs.openFileAbsolute(path, .{})
+  else
+    std.fs.cwd().openFile(path, .{});
+
+  if (file) |f| {
+    defer f.close();
+    const stat = f.stat() catch return null;
+    return stat.size;
+  } else |_| {
+    return null;
+  }
+}
+
 fn logPathAndSize(label: []const u8, path_opt: ?[]const u8) void {
   if (path_opt == null) {
     log.debug("{s} path: (unset)", .{label});
@@ -31,24 +49,15 @@ fn logPathAndSize(label: []const u8, path_opt: ?[]const u8) void {
   const path = path_opt.?;
   log.debug("{s} path: {s}", .{ label, path });
 
-  const file = if (std.fs.path.isAbsolute(path))
-    std.fs.openFileAbsolute(path, .{})
-  else
-    std.fs.cwd().openFile(path, .{});
-
-  if (file) |f| {
-    defer f.close();
-    const stat = f.stat() catch {
-      log.debug("{s} size: (unavailable)", .{label});
-      return;
-    };
-    log.debug("{s} size: {d} bytes", .{ label, stat.size });
-  } else |_| {
+  if (fileSizeIfExists(path_opt)) |size| {
+    log.debug("{s} size: {d} bytes", .{ label, size });
+  } else {
     log.debug("{s} size: (unavailable)", .{label});
   }
 }
 
 fn logStartPreflight(cfg: *const core.config.VmConfig) void {
+  // Preflight logs are debug-only to avoid leaking host paths by default.
   log.debug("vm start preflight:", .{});
   log.debug("cpu_cores: {d}", .{cfg.cpu_cores});
   log.debug("memory_mb: {d}", .{cfg.memory_mb});
@@ -134,6 +143,7 @@ pub fn main() !void {
   }
 
   if (std.mem.eql(u8, cmd, "start")) {
+    // start uses the local VM directory for config and path resolution.
     var jailer = try Jailer.init(allocator);
     defer jailer.deinit();
 
@@ -217,7 +227,32 @@ pub fn main() !void {
   errors.die("unknown command: {s}", .{cmd});
 }
 
-test "smoke: help prints" {
-  // placeholder to keep `zig build test` working once we add tests
-  try std.testing.expect(true);
+test "main: fileSizeIfExists returns null for missing file" {
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+  defer std.testing.allocator.free(base);
+
+  const missing = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ base, "missing" });
+  defer std.testing.allocator.free(missing);
+
+  try std.testing.expect(fileSizeIfExists(missing) == null);
+}
+
+test "main: fileSizeIfExists returns size for existing file" {
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  {
+    var f = try tmp.dir.createFile("blob", .{});
+    defer f.close();
+    try f.writeAll("abc");
+  }
+
+  const abs = try tmp.dir.realpathAlloc(std.testing.allocator, "blob");
+  defer std.testing.allocator.free(abs);
+
+  const size = fileSizeIfExists(abs) orelse return error.TestExpectedEqual;
+  try std.testing.expectEqual(@as(u64, 3), size);
 }

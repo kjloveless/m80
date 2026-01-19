@@ -12,6 +12,7 @@ pub const Vm = struct {
     allocator: std.mem.Allocator,
     jailer: *Jailer,  
   ) !Vm {
+    // Vm is a thin dispatcher; platform-specific state lives in backends.
     return Vm{
       .allocator = allocator,
       .jailer = jailer,
@@ -20,6 +21,7 @@ pub const Vm = struct {
 
   pub fn start(self: *Vm, cfg: @import("../core/config.zig").VmConfig) !void {
     _ = self;
+    // Choose backend by host OS; each backend implements start/stop.
     switch (@import("builtin").os.tag) {
       .windows => try windows.start(cfg),
       .macos => try hvf.start(cfg),
@@ -30,6 +32,7 @@ pub const Vm = struct {
 
   pub fn stop(self: *Vm) !void {
     _ = self;
+    // Stop mirrors start and delegates to the active backend.
     switch (@import("builtin").os.tag) {
       .windows => try windows.stop(),
       .macos => try hvf.stop(),

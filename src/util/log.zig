@@ -44,11 +44,13 @@ fn levelValue(lvl: Level) u8 {
 }
 
 fn enabled(lvl: Level) bool {
+  // Higher value means higher severity; enabled when message severity >= current level.
   return levelValue(lvl) >= levelValue(level);
 }
 
 pub fn log(lvl: Level, comptime fmt: []const u8, args: anytype) void {
   if (!enabled(lvl)) return;
+  // Timestamp is milliseconds since epoch; used for quick local tracing.
   const ts_ms = std.time.milliTimestamp();
   std.debug.print("[{d}] {s} " ++ fmt ++ "\n", .{ ts_ms, levelTag(lvl) } ++ args);
 }
@@ -67,4 +69,18 @@ pub fn warn(comptime fmt: []const u8, args: anytype) void {
 
 pub fn err(comptime fmt: []const u8, args: anytype) void {
   log(.err, fmt, args);
+}
+
+test "log: enabled respects level ordering" {
+  const saved = level;
+  defer level = saved;
+
+  level = .info;
+  try std.testing.expect(!enabled(.debug));
+  try std.testing.expect(enabled(.info));
+  try std.testing.expect(enabled(.err));
+
+  level = .err;
+  try std.testing.expect(!enabled(.warn));
+  try std.testing.expect(enabled(.err));
 }

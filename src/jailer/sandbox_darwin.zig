@@ -36,6 +36,7 @@ pub const SandboxProfile = struct {
         self.profile.clearRetainingCapacity();
         var w = self.profile.writer(self.allocator);
 
+        // Sandbox profile is built as a declarative allowlist.
         try w.writeAll("(version 1)\n");
         try w.writeAll("(deny default)\n\n");
 
@@ -87,6 +88,7 @@ pub const SandboxProfile = struct {
     pub fn apply(self: *SandboxProfile) SandboxError!void {
         if (builtin.os.tag != .macos) return;
 
+        // sandbox_init is looked up dynamically to keep non-macOS builds clean.
         const sandbox_init_fn = @extern(?*const fn (
             [*:0]const u8,
             u64,

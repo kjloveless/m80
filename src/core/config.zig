@@ -6,7 +6,7 @@ pub const VmConfig = struct {
   name: []const u8,
   ephemeral: bool = false,
 
-  // placeholder fields for later
+  // Placeholder fields for later; these are the minimum required to boot.
   memory_mb: u32 = default_memory_mb,
   cpu_cores: u16 = default_cpu_cores,
   kernel_path: ?[]const u8 = null,
@@ -72,6 +72,7 @@ pub fn readConfigFile(
   var cfg = try defaultConfig(allocator, fallback_name);
   errdefer freeConfig(allocator, &cfg);
 
+  // Missing config is allowed: return defaults and fallback name.
   var file = dir.openFile("m80.conf", .{}) catch return cfg;
   defer file.close();
 
@@ -89,52 +90,7 @@ pub fn readConfigFile(
     const value = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
     if (key.len == 0) return error.InvalidFormat;
 
-    if (std.mem.eql(u8, key, "name")) {
-      if (!paths.validateVmName(value)) return error.InvalidValue;
-      allocator.free(cfg.name);
-      cfg.name = try allocator.dupe(u8, value);
-      continue;
-    }
-
-    if (std.mem.eql(u8, key, "ephemeral")) {
-      cfg.ephemeral = try parseBool(value);
-      continue;
-    }
-
-    if (std.mem.eql(u8, key, "memory_mb")) {
-      cfg.memory_mb = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
-      continue;
-    }
-
-    if (std.mem.eql(u8, key, "cpu_cores")) {
-      cfg.cpu_cores = std.fmt.parseInt(u16, value, 10) catch return error.InvalidValue;
-      continue;
-    }
-
-    if (std.mem.eql(u8, key, "kernel_path")) {
-      try setOptionalPath(allocator, &cfg.kernel_path, value);
-      continue;
-    }
-
-    if (std.mem.eql(u8, key, "initrd_path")) {
-      try setOptionalPath(allocator, &cfg.initrd_path, value);
-      continue;
-    }
-
-    if (std.mem.eql(u8, key, "network_mode")) {
-      cfg.network_mode = net_policy.NetworkMode.fromString(value) orelse return error.InvalidValue;
-      continue;
-    }
-
-    if (std.mem.eql(u8, key, "allowed_domains")) {
-      cfg.allowed_domains = try parseCommaSeparated(allocator, value);
-      continue;
-    }
-
-    if (std.mem.eql(u8, key, "allowed_ips")) {
-      cfg.allowed_ips = try parseCommaSeparated(allocator, value);
-      continue;
-    }
+    try applyConfigEntry(allocator, &cfg, key, value);
   }
 
   return cfg;
@@ -210,6 +166,7 @@ fn parseBool(value: []const u8) ConfigError!bool {
   return error.InvalidValue;
 }
 
+// Trims each list entry and returns owned slices for each element.
 fn parseCommaSeparated(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
   if (value.len == 0) return &[_][]const u8{};
 
@@ -232,6 +189,17 @@ fn parseCommaSeparated(allocator: std.mem.Allocator, value: []const u8) ![]const
   return result;
 }
 
+fn replaceStringList(
+  allocator: std.mem.Allocator,
+  target: *[]const []const u8,
+  value: []const u8,
+) !void {
+  // Free the previous list before replacing to avoid leaks.
+  for (target.*) |item| allocator.free(item);
+  if (target.*.len > 0) allocator.free(target.*);
+  target.* = try parseCommaSeparated(allocator, value);
+}
+
 fn setOptionalPath(
   allocator: std.mem.Allocator,
   target: *?[]const u8,
@@ -243,6 +211,61 @@ fn setOptionalPath(
     return;
   }
   target.* = try allocator.dupe(u8, value);
+}
+
+fn applyConfigEntry(
+  allocator: std.mem.Allocator,
+  cfg: *VmConfig,
+  key: []const u8,
+  value: []const u8,
+) ConfigError!void {
+  // Unknown keys are intentionally ignored to allow forward-compatible configs.
+  if (std.mem.eql(u8, key, "name")) {
+    if (!paths.validateVmName(value)) return error.InvalidValue;
+    allocator.free(cfg.name);
+    cfg.name = try allocator.dupe(u8, value);
+    return;
+  }
+
+  if (std.mem.eql(u8, key, "ephemeral")) {
+    cfg.ephemeral = try parseBool(value);
+    return;
+  }
+
+  if (std.mem.eql(u8, key, "memory_mb")) {
+    cfg.memory_mb = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
+    return;
+  }
+
+  if (std.mem.eql(u8, key, "cpu_cores")) {
+    cfg.cpu_cores = std.fmt.parseInt(u16, value, 10) catch return error.InvalidValue;
+    return;
+  }
+
+  if (std.mem.eql(u8, key, "kernel_path")) {
+    try setOptionalPath(allocator, &cfg.kernel_path, value);
+    return;
+  }
+
+  if (std.mem.eql(u8, key, "initrd_path")) {
+    try setOptionalPath(allocator, &cfg.initrd_path, value);
+    return;
+  }
+
+  if (std.mem.eql(u8, key, "network_mode")) {
+    cfg.network_mode = net_policy.NetworkMode.fromString(value) orelse return error.InvalidValue;
+    return;
+  }
+
+  if (std.mem.eql(u8, key, "allowed_domains")) {
+    try replaceStringList(allocator, &cfg.allowed_domains, value);
+    return;
+  }
+
+  if (std.mem.eql(u8, key, "allowed_ips")) {
+    try replaceStringList(allocator, &cfg.allowed_ips, value);
+    return;
+  }
 }
 
 // super minimal "format" right now: key=value lines
@@ -415,4 +438,132 @@ test "config: validateStartFiles checks existence" {
   allocator.free(cfg.kernel_path.?);
   cfg.kernel_path = try allocator.dupe(u8, "missing-kernel");
   try std.testing.expectError(error.KernelNotFound, validateStartFiles(&cfg));
+}
+
+test "config: empty path clears optional value" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
+  defer f.close();
+  try f.writeAll(
+    "kernel_path=/tmp/kernel\n" ++
+      "kernel_path=\n"
+  );
+
+  const cfg = try readConfigFile(allocator, tmp.dir, "fallback");
+  var cfg_mut = cfg;
+  defer freeConfig(allocator, &cfg_mut);
+
+  try std.testing.expect(cfg_mut.kernel_path == null);
+}
+
+test "config: allowed list parsing and overrides" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
+  defer f.close();
+  try f.writeAll(
+    "allowed_domains=example.com, api.example.com\n" ++
+      "allowed_domains=second.com\n" ++
+      "allowed_ips=10.0.0.1 , 10.0.0.2\n"
+  );
+
+  const cfg = try readConfigFile(allocator, tmp.dir, "fallback");
+  var cfg_mut = cfg;
+  defer freeConfig(allocator, &cfg_mut);
+
+  try std.testing.expectEqual(@as(usize, 1), cfg_mut.allowed_domains.len);
+  try std.testing.expectEqualStrings("second.com", cfg_mut.allowed_domains[0]);
+
+  try std.testing.expectEqual(@as(usize, 2), cfg_mut.allowed_ips.len);
+  try std.testing.expectEqualStrings("10.0.0.1", cfg_mut.allowed_ips[0]);
+  try std.testing.expectEqualStrings("10.0.0.2", cfg_mut.allowed_ips[1]);
+}
+
+test "config: parseBool accepts 0/1 and rejects other" {
+  try std.testing.expectEqual(true, try parseBool("1"));
+  try std.testing.expectEqual(false, try parseBool("0"));
+  try std.testing.expectError(error.InvalidValue, parseBool("yes"));
+}
+
+test "config: parseCommaSeparated trims whitespace" {
+  const allocator = std.testing.allocator;
+  const list = try parseCommaSeparated(allocator, " a , b,  c ");
+  defer {
+    for (list) |item| allocator.free(item);
+    if (list.len > 0) allocator.free(list);
+  }
+
+  try std.testing.expectEqual(@as(usize, 3), list.len);
+  try std.testing.expectEqualStrings("a", list[0]);
+  try std.testing.expectEqualStrings("b", list[1]);
+  try std.testing.expectEqualStrings("c", list[2]);
+}
+
+test "config: parseCommaSeparated handles empty string" {
+  const allocator = std.testing.allocator;
+  const list = try parseCommaSeparated(allocator, "");
+  defer if (list.len > 0) allocator.free(list);
+  try std.testing.expectEqual(@as(usize, 0), list.len);
+}
+
+test "config: writeConfigFile emits allowlists" {
+  const allocator = std.testing.allocator;
+
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  var cfg = try defaultConfig(allocator, "testvm");
+  defer freeConfig(allocator, &cfg);
+
+  cfg.allowed_domains = try parseCommaSeparated(allocator, "example.com,api.example.com");
+  cfg.allowed_ips = try parseCommaSeparated(allocator, "10.0.0.1,10.0.0.2");
+
+  try writeConfigFile(tmp.dir, cfg);
+  const data = try tmp.dir.readFileAlloc(allocator, "m80.conf", 64 * 1024);
+  defer allocator.free(data);
+
+  try std.testing.expect(std.mem.indexOf(u8, data, "allowed_domains=") != null);
+  try std.testing.expect(std.mem.indexOf(u8, data, "allowed_ips=") != null);
+}
+
+test "config: validateStartConfig missing fields" {
+  var cfg = try defaultConfig(std.testing.allocator, "test");
+  defer freeConfig(std.testing.allocator, &cfg);
+
+  try std.testing.expectError(error.MissingKernel, validateStartConfig(&cfg));
+  cfg.kernel_path = try std.testing.allocator.dupe(u8, "/kernel");
+  try std.testing.expectError(error.MissingInitrd, validateStartConfig(&cfg));
+}
+
+test "config: unknown keys are ignored" {
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
+  defer f.close();
+  try f.writeAll("unknown_key=what\n");
+
+  const cfg = try readConfigFile(allocator, tmp.dir, "fallback");
+  var cfg_mut = cfg;
+  defer freeConfig(allocator, &cfg_mut);
+
+  try std.testing.expectEqualStrings("fallback", cfg_mut.name);
+  try std.testing.expect(!cfg_mut.ephemeral);
+  try std.testing.expectEqual(default_memory_mb, cfg_mut.memory_mb);
+  try std.testing.expectEqual(default_cpu_cores, cfg_mut.cpu_cores);
 }

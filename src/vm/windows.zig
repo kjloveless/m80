@@ -336,6 +336,7 @@ const PFN_WHvSetPartitionProperty = *const fn (
   }
 };
 
+// Global runtime state (single active VM instance).
 var active_partition: ?Whp.PartitionHandle = null;
 var active_memory: ?windows.LPVOID = null;
 var active_memory_size: usize = 0;
@@ -400,13 +401,7 @@ fn handleCpuidExit(handle: Whp.PartitionHandle, index: u32, ctx: *const WhvRunVp
 fn handleIoPortExit(handle: Whp.PartitionHandle, index: u32, ctx: *const WhvRunVpExitContext) bool {
   const io = ctx.Union.IoPortAccess;
   const access = io.AccessInfo.Bits;
-  const size = switch (access.AccessSize) {
-    0 => 1,
-    1 => 2,
-    2 => 4,
-    3 => 8,
-    else => 1,
-  };
+  const size = ioAccessSizeBytes(access.AccessSize);
 
   _ = ioport_exit_count.fetchAdd(1, .seq_cst);
   const exit: IoExit = .{
@@ -420,6 +415,7 @@ fn handleIoPortExit(handle: Whp.PartitionHandle, index: u32, ctx: *const WhvRunV
   const read_val = handleIoExit(exit);
 
   if (!exit.is_write) {
+    // Read path updates RAX with the device result.
     var names = [_]WhvRegisterName{ .Rax };
     var values = [_]WhvRegisterValue{ .{ .Reg64 = read_val } };
     Whp.setVirtualProcessorRegisters(handle, index, &names, &values) catch |e| {
@@ -428,6 +424,16 @@ fn handleIoPortExit(handle: Whp.PartitionHandle, index: u32, ctx: *const WhvRunV
     };
   }
   return advanceRip(handle, index, ctx);
+}
+
+fn ioAccessSizeBytes(access_size: u3) usize {
+  return switch (access_size) {
+    0 => 1,
+    1 => 2,
+    2 => 4,
+    3 => 8,
+    else => 1,
+  };
 }
 
 fn handleExitReason(reason: u32, index: u32) bool {
@@ -498,6 +504,7 @@ fn runVcpu(index: u32) void {
       log.err("vcpu {d} run failed: {s}", .{ index, @errorName(e) });
       break;
     };
+    // Fast-path the common exits we know how to handle.
     switch (exit_ctx.ExitReason) {
       @intFromEnum(WhvRunVpExitReason.X64Cpuid) => {
         if (!handleCpuidExit(handle, index, exit_ctx)) break;
@@ -529,7 +536,7 @@ fn prepareGuestImage(memory_size_bytes: u64) !void {
 }
 
 fn copyFileToGuest(
-  mem: windows.LPVOID,
+  mem: ?windows.LPVOID,
   memory_size_bytes: u64,
   guest_base: u64,
   path: []const u8,
@@ -548,12 +555,14 @@ fn copyFileToGuest(
   const base_ptr: [*]u8 = @ptrCast(@alignCast(mem_ptr));
   const dst = base_ptr + @as(usize, @intCast(guest_base));
 
-  var reader = file.reader();
+  var buf: [4096]u8 = undefined;
+  var reader = file.reader(&buf);
+  const r = &reader.interface;
   var remaining: usize = @intCast(stat.size);
   var offset: usize = 0;
   while (remaining > 0) {
     const chunk = @min(remaining, 64 * 1024);
-    const n = try reader.read(dst[offset .. offset + chunk]);
+    const n = try r.readSliceShort(dst[offset .. offset + chunk]);
     if (n == 0) return error.UnexpectedEof;
     remaining -= n;
     offset += n;
@@ -722,4 +731,60 @@ test "integration: cpuid/io port exits keep vcpu running" {
 
   try std.testing.expect(vcpu_alive.load(.seq_cst));
   try std.testing.expect(cpuid_exit_count.load(.seq_cst) > 0 or ioport_exit_count.load(.seq_cst) > 0);
+}
+
+test "windows: io access size mapping" {
+  try std.testing.expectEqual(@as(usize, 1), ioAccessSizeBytes(0));
+  try std.testing.expectEqual(@as(usize, 2), ioAccessSizeBytes(1));
+  try std.testing.expectEqual(@as(usize, 4), ioAccessSizeBytes(2));
+  try std.testing.expectEqual(@as(usize, 8), ioAccessSizeBytes(3));
+  try std.testing.expectEqual(@as(usize, 1), ioAccessSizeBytes(7));
+}
+
+test "windows: exit reason handling" {
+  try std.testing.expect(handleExitReason(@intFromEnum(WhvRunVpExitReason.None), 0));
+  try std.testing.expect(!handleExitReason(@intFromEnum(WhvRunVpExitReason.X64IoPortAccess), 0));
+  try std.testing.expect(!handleExitReason(@intFromEnum(WhvRunVpExitReason.X64Halt), 0));
+}
+
+test "windows: copyFileToGuest rejects oversized image" {
+  const allocator = std.testing.allocator;
+
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  {
+    var f = try tmp.dir.createFile("big.bin", .{});
+    defer f.close();
+    try f.writeAll("ab");
+  }
+
+  const path = try tmp.dir.realpathAlloc(allocator, "big.bin");
+  defer allocator.free(path);
+
+  try std.testing.expectError(
+    error.GuestImageTooLarge,
+    copyFileToGuest(null, 1, 0, path, "kernel"),
+  );
+}
+
+test "windows: copyFileToGuest rejects null memory" {
+  const allocator = std.testing.allocator;
+
+  var tmp = std.testing.tmpDir(.{});
+  defer tmp.cleanup();
+
+  {
+    var f = try tmp.dir.createFile("small.bin", .{});
+    defer f.close();
+    try f.writeAll("a");
+  }
+
+  const path = try tmp.dir.realpathAlloc(allocator, "small.bin");
+  defer allocator.free(path);
+
+  try std.testing.expectError(
+    error.MemoryAllocFailed,
+    copyFileToGuest(null, 4096, 0, path, "kernel"),
+  );
 }

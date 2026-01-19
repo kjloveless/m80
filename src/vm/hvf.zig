@@ -38,6 +38,7 @@ pub const Hvf = struct {
   }
 };
 
+// Global stub state (single active VM instance).
 var active_vm: ?Hvf.VmHandle = null;
 var active_memory_size: usize = 0;
 var active_vcpu_thread: ?std.Thread = null;
@@ -72,6 +73,12 @@ fn hvfIoExitToIoExit(exit: HvfIoExit) IoExit {
   };
 }
 
+fn envFlagPresent(allocator: std.mem.Allocator, name: []const u8) bool {
+  const env = std.process.getEnvVarOwned(allocator, name) catch return false;
+  allocator.free(env);
+  return true;
+}
+
 fn handleIoPortWrite(port: u16, size: usize, rax: u64) void {
   if (port == 0x3F8) {
     SerialIo.writeToStdout(size, rax);
@@ -96,6 +103,7 @@ fn runVcpuStub(index: u32) void {
   log.info("hvf vcpu {d} stub run loop entered", .{index});
   while (vcpu_running.load(.seq_cst)) {
     if (simulate_io.swap(false, .seq_cst)) {
+      // Emulate a single write/read IO cycle on the serial port.
       _ = handleIoExit(.{ .port = 0x3F8, .is_write = true, .size = 1, .rax = '>', .is_string = false, .has_rep = false });
       _ = handleIoExit(.{ .port = 0x3FD, .is_write = false, .size = 1, .rax = 0, .is_string = false, .has_rep = false });
     }
@@ -163,7 +171,7 @@ pub fn start(cfg: config.VmConfig) !void {
   active_memory_size = @intCast(size_bytes_u64);
 
   vcpu_running.store(true, .seq_cst);
-  if ((std.process.getEnvVarOwned(std.heap.page_allocator, "M80_IO_SIM") catch null) != null) {
+  if (envFlagPresent(std.heap.page_allocator, "M80_IO_SIM")) {
     simulate_io.store(true, .seq_cst);
   }
   serial_io.setFromEnv(std.heap.page_allocator);
@@ -231,4 +239,38 @@ test "hvf: io exit mapping" {
   try std.testing.expectEqual(@as(usize, 1), mapped.size);
   try std.testing.expectEqual(@as(u64, 'A'), mapped.rax);
   try std.testing.expect(mapped.has_rep);
+}
+
+test "hvf: io exit mapping defaults unknown size to 1" {
+  const raw = HvfIoExit{
+    .port = 0x3F8,
+    .access_size = 3,
+    .access_type = 0,
+    .is_string = false,
+    .has_rep = false,
+    .rax = 0,
+  };
+  const mapped = hvfIoExitToIoExit(raw);
+  try std.testing.expectEqual(@as(usize, 1), mapped.size);
+  try std.testing.expect(!mapped.is_write);
+}
+
+test "hvf: prepareGuestImage rejects too small memory" {
+  try std.testing.expectError(error.InvalidGuestLayout, prepareGuestImage(0x1000));
+}
+
+test "hvf: loadGuestKernel errors on missing file" {
+  try std.testing.expectError(error.FileNotFound, loadGuestKernel(64 * 1024 * 1024, "missing-kernel"));
+}
+
+test "hvf: loadGuestInitrd errors on missing file" {
+  try std.testing.expectError(error.FileNotFound, loadGuestInitrd(64 * 1024 * 1024, "missing-initrd"));
+}
+
+test "hvf: loadGuestKernel skips when unset" {
+  try loadGuestKernel(64 * 1024 * 1024, null);
+}
+
+test "hvf: loadGuestInitrd skips when unset" {
+  try loadGuestInitrd(64 * 1024 * 1024, null);
 }
