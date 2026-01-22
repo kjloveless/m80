@@ -218,7 +218,7 @@ fn buildQuery(buf: []u8, domain: []const u8, id: u16) !usize {
     return pos;
 }
 
-fn parseResponse(allocator: std.mem.Allocator, response: []const u8) ![]DnsRecord {
+pub fn parseResponse(allocator: std.mem.Allocator, response: []const u8) ![]DnsRecord {
     // Minimal parser: expects a valid response and collects A records only.
     if (response.len < @sizeOf(DnsHeader)) {
         return error.InvalidResponse;
@@ -304,6 +304,55 @@ fn skipName(response: []const u8, start: usize) !usize {
         pos += 1 + len;
     }
     return error.InvalidResponse;
+}
+
+pub fn parseQueryDomain(buf: []const u8, out: []u8) ![]const u8 {
+    if (buf.len < @sizeOf(DnsHeader)) return error.InvalidResponse;
+    const qd_count = std.mem.readInt(u16, buf[4..][0..2], .big);
+    if (qd_count == 0) return error.InvalidResponse;
+    const name = try decodeName(buf, @sizeOf(DnsHeader), out);
+    _ = std.ascii.lowerString(name, name);
+    return name;
+}
+
+pub fn parseResponseDomain(buf: []const u8, out: []u8) ![]const u8 {
+    if (buf.len < @sizeOf(DnsHeader)) return error.InvalidResponse;
+    const name = try decodeName(buf, @sizeOf(DnsHeader), out);
+    _ = std.ascii.lowerString(name, name);
+    return name;
+}
+
+fn decodeName(buf: []const u8, start: usize, out: []u8) ![]u8 {
+    var pos = start;
+    var out_pos: usize = 0;
+    var depth: u8 = 0;
+    while (pos < buf.len) {
+        const len = buf[pos];
+        if (len == 0) {
+            break;
+        }
+        if ((len & 0xC0) == 0xC0) {
+            if (pos + 1 >= buf.len) return error.InvalidResponse;
+            const offset = (@as(u16, len & 0x3F) << 8) | buf[pos + 1];
+            if (offset >= buf.len) return error.InvalidResponse;
+            if (depth > 8) return error.InvalidResponse;
+            depth += 1;
+            pos = offset;
+            continue;
+        }
+        pos += 1;
+        if (pos + len > buf.len) return error.InvalidResponse;
+        if (out_pos != 0) {
+            if (out_pos >= out.len) return error.InvalidResponse;
+            out[out_pos] = '.';
+            out_pos += 1;
+        }
+        if (out_pos + len > out.len) return error.InvalidResponse;
+        @memcpy(out[out_pos .. out_pos + len], buf[pos .. pos + len]);
+        out_pos += len;
+        pos += len;
+    }
+    return out[0..out_pos];
 }
 
 pub fn matchesDomainWildcard(pattern: []const u8, domain: []const u8) bool {
@@ -784,6 +833,14 @@ test "dns: resolveWithPolicy caches resolved ip" {
 
     try std.testing.expectEqual(@as(usize, 1), net_policy.resolved_ips.items.len);
     try std.testing.expect(net_policy.isIpAllowed([4]u8{ 1, 2, 3, 4 }));
+}
+
+test "dns: parseQueryDomain parses query name" {
+    var buf: [512]u8 = undefined;
+    const len = try buildQuery(&buf, "example.com", 0x1234);
+    var out: [256]u8 = undefined;
+    const name = try parseQueryDomain(buf[0..len], &out);
+    try std.testing.expectEqualStrings("example.com", name);
 }
 
 test "dns: resolveWithPolicy rejects disallowed domain" {

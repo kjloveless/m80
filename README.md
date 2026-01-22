@@ -81,7 +81,11 @@ Common keys:
 - `disk_path`: rootfs block image path (virtio-blk)
 - `seed_path`: cloud-init NoCloud seed image (attached as secondary read-only disk)
 - `disk_readonly`: attach `disk_path` read-only (default: false)
+- `data_disk_path`: optional extra data disk image (virtio-blk)
+- `data_disk_readonly`: attach `data_disk_path` read-only (default: false)
 - `kernel_cmdline`: optional kernel command line override
+- `mount_roots`: comma-separated allowed host roots for sharing
+- `mounts`: comma-separated mount configs (`tag:host:guest:ro|rw:virtiofs`)
 
 Example (arm64 + initramfs):
 
@@ -114,6 +118,83 @@ m80 console deb
 
 Note: `start` runs the VM in the background. `console` attaches to the running VM.
 If the VM isn't running, start it first.
+
+Shared directory example (strict roots required):
+
+```
+mount_roots=/Users/you/projects
+mounts=code:/Users/you/projects/m80:/mnt/code:rw:virtiofs
+```
+
+Guest-side mount (virtiofs tag `code`):
+
+```
+mkdir -p /mnt/code
+mount -t virtiofs code /mnt/code
+```
+
+Firecracker-style data disk (block device attached; guest mounts it):
+
+```
+data_disk_path=images/share.ext4
+data_disk_readonly=false
+```
+
+Guest-side mount (example):
+
+```
+mkdir -p /mnt/data
+mount /dev/vdc /mnt/data
+```
+
+Device order is typically:
+- `/dev/vda`: `disk_path` (rootfs)
+- `/dev/vdb`: `seed_path` (if present)
+- `/dev/vdc`: `data_disk_path` (if present)
+
+On macOS, create the disk image on the host and format it in the guest:
+
+```
+dd if=/dev/zero of=images/share.ext4 bs=1m count=512
+# inside the guest:
+mkfs.ext4 /dev/vdc
+mount /dev/vdc /mnt/data
+```
+
+## Networking (macOS vmnet + allowlist)
+
+On macOS, HVF can expose virtio-net via vmnet (shared/NAT). Network access is
+**blocked by default** and must be explicitly enabled in `m80.conf`.
+
+vmnet requires a restricted entitlement on macOS. By default, builds use the
+hypervisor-only entitlements file. If you have the vmnet entitlement available,
+opt in at build time:
+
+```
+M80_VMNET_ENTITLEMENTS=1 zig build
+```
+
+Config keys:
+- `network_mode`: `locked_down` (default) | `allowlist` | `open`
+- `allowed_domains`: comma-separated domain allowlist (used by DNS enforcement)
+- `allowed_ips`: comma-separated IPv4/CIDR allowlist (e.g., `1.2.3.4,10.0.0.0/8`)
+
+Example (allow Debian repos):
+
+```
+network_mode=allowlist
+allowed_domains=deb.debian.org,security.debian.org,ftp.us.debian.org
+```
+
+Open network (explicit opt-in required):
+
+```
+network_mode=open
+```
+
+```
+export M80_ALLOW_OPEN_NETWORK=1
+```
 
 ## HVF arm64 Boot Smoke Test
 

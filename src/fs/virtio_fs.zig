@@ -143,6 +143,25 @@ pub const FuseInitOut = extern struct {
     unused: [8]u32,
 };
 
+pub const FuseSetattrIn = extern struct {
+    valid: u32,
+    padding: u32,
+    fh: u64,
+    size: u64,
+    lock_owner: u64,
+    atime: u64,
+    mtime: u64,
+    ctime: u64,
+    atimensec: u32,
+    mtimensec: u32,
+    ctimensec: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    unused4: u32,
+    unused5: u64,
+};
+
 pub const FuseAttr = extern struct {
     ino: u64,
     size: u64,
@@ -182,6 +201,25 @@ pub const FuseEntryOut = extern struct {
 pub const FuseOpenIn = extern struct {
     flags: u32,
     unused: u32,
+};
+
+pub const FuseMkdirIn = extern struct {
+    mode: u32,
+    umask: u32,
+};
+
+pub const FuseMknodIn = extern struct {
+    mode: u32,
+    rdev: u32,
+    umask: u32,
+    padding: u32,
+};
+
+pub const FuseCreateIn = extern struct {
+    flags: u32,
+    mode: u32,
+    umask: u32,
+    padding: u32,
 };
 
 pub const FuseOpenOut = extern struct {
@@ -303,9 +341,15 @@ pub const VirtioFsDevice = struct {
             .FUSE_INIT => self.handleInit(&header, payload, response_buf),
             .FUSE_LOOKUP => self.handleLookup(&header, payload, response_buf),
             .FUSE_GETATTR => self.handleGetattr(&header, response_buf),
+            .FUSE_SETATTR => self.handleSetattr(&header, payload, response_buf),
             .FUSE_OPEN => self.handleOpen(&header, payload, response_buf),
+            .FUSE_MKDIR => self.handleMkdir(&header, payload, response_buf),
+            .FUSE_MKNOD => self.handleMknod(&header, payload, response_buf),
             .FUSE_READ => self.handleRead(&header, payload, response_buf),
             .FUSE_WRITE => self.handleWrite(&header, payload, response_buf),
+            .FUSE_CREATE => self.handleCreate(&header, payload, response_buf),
+            .FUSE_UNLINK => self.handleUnlink(&header, payload, response_buf),
+            .FUSE_RMDIR => self.handleRmdir(&header, payload, response_buf),
             .FUSE_RELEASE => self.handleRelease(&header, payload, response_buf),
             .FUSE_OPENDIR => self.handleOpendir(&header, payload, response_buf),
             .FUSE_READDIR => self.handleReaddir(&header, payload, response_buf),
@@ -362,6 +406,9 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
         const name_end = std.mem.indexOfScalar(u8, payload, 0) orelse payload.len;
         const name = payload[0..name_end];
 
@@ -398,10 +445,41 @@ pub const VirtioFsDevice = struct {
         header: *const FuseInHeader,
         response_buf: []u8,
     ) VirtioFsError!usize {
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
         const node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
 
+        const stat = std.fs.cwd().statFile(node.path) catch {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        return self.sendAttrOut(header, &stat, response_buf);
+    }
+
+    fn handleSetattr(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        // Accept short payloads; some kernels send a smaller setattr struct.
+        // We currently ignore the requested changes and return current attrs.
+        if (payload.len < 8) {
+            return self.sendError(header, -22, response_buf);
+        }
+
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
+        const node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        // TODO: apply attribute changes (size, mode, times). For now, report success
+        // with current attrs to avoid "Function not implemented" from tools like touch.
         const stat = std.fs.cwd().statFile(node.path) catch {
             return self.sendError(header, -2, response_buf);
         };
@@ -417,6 +495,9 @@ pub const VirtioFsDevice = struct {
     ) VirtioFsError!usize {
         _ = payload;
 
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
         const node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
@@ -433,6 +514,99 @@ pub const VirtioFsDevice = struct {
         };
 
         return self.sendOpenOut(header, fh, response_buf);
+    }
+
+    fn handleMkdir(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseMkdirIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const name = payload[@sizeOf(FuseMkdirIn)..];
+        const name_end = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
+        const entry_name = name[0..name_end];
+        if (entry_name.len == 0) {
+            return self.sendError(header, -2, response_buf);
+        }
+        if (path_util.containsTraversal(entry_name)) {
+            return self.sendError(header, -1, response_buf);
+        }
+
+        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(full_path);
+
+        std.fs.cwd().makeDir(full_path) catch |e| switch (e) {
+            error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        const stat = std.fs.cwd().statFile(full_path) catch return self.sendError(header, -5, response_buf);
+        const nodeid = self.allocateNode(full_path, true) catch return self.sendError(header, -12, response_buf);
+        return self.sendEntryOut(header, nodeid, &stat, response_buf);
+    }
+
+    fn handleMknod(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseMknodIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const name = payload[@sizeOf(FuseMknodIn)..];
+        const name_end = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
+        const entry_name = name[0..name_end];
+        if (entry_name.len == 0) {
+            return self.sendError(header, -2, response_buf);
+        }
+        if (path_util.containsTraversal(entry_name)) {
+            return self.sendError(header, -1, response_buf);
+        }
+
+        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(full_path);
+
+        const file = std.fs.cwd().createFile(full_path, .{ .read = true, .truncate = false }) catch |e| switch (e) {
+            error.PathAlreadyExists => std.fs.cwd().openFile(full_path, .{ .mode = .read_write }) catch |open_err| switch (open_err) {
+                error.AccessDenied => return self.sendError(header, -13, response_buf),
+                error.FileNotFound => return self.sendError(header, -2, response_buf),
+                else => return self.sendError(header, -5, response_buf),
+            },
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+        defer file.close();
+
+        const stat = std.fs.cwd().statFile(full_path) catch return self.sendError(header, -5, response_buf);
+        const nodeid = self.allocateNode(full_path, false) catch return self.sendError(header, -12, response_buf);
+        return self.sendEntryOut(header, nodeid, &stat, response_buf);
     }
 
     fn handleRead(
@@ -506,6 +680,141 @@ pub const VirtioFsDevice = struct {
         return self.sendWriteOut(header, @intCast(bytes_written), response_buf);
     }
 
+    fn handleCreate(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseCreateIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const name = payload[@sizeOf(FuseCreateIn)..];
+        const name_end = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
+        const entry_name = name[0..name_end];
+        if (entry_name.len == 0) {
+            return self.sendError(header, -2, response_buf);
+        }
+        if (path_util.containsTraversal(entry_name)) {
+            return self.sendError(header, -1, response_buf);
+        }
+
+        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(full_path);
+
+        const file = std.fs.cwd().createFile(full_path, .{ .read = true, .truncate = false }) catch |e| switch (e) {
+            error.PathAlreadyExists => std.fs.cwd().openFile(full_path, .{ .mode = .read_write }) catch |open_err| switch (open_err) {
+                error.AccessDenied => return self.sendError(header, -13, response_buf),
+                error.FileNotFound => return self.sendError(header, -2, response_buf),
+                else => return self.sendError(header, -5, response_buf),
+            },
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        const stat = file.stat() catch {
+            file.close();
+            return self.sendError(header, -5, response_buf);
+        };
+
+        const nodeid = self.allocateNode(full_path, false) catch {
+            file.close();
+            return self.sendError(header, -12, response_buf);
+        };
+        const fh = self.allocateFileHandle(nodeid, file) catch {
+            file.close();
+            return self.sendError(header, -12, response_buf);
+        };
+
+        return self.sendCreateOut(header, nodeid, &stat, fh, response_buf);
+    }
+
+    fn handleUnlink(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const name_end = std.mem.indexOfScalar(u8, payload, 0) orelse payload.len;
+        const entry_name = payload[0..name_end];
+        if (entry_name.len == 0) {
+            return self.sendError(header, -2, response_buf);
+        }
+        if (path_util.containsTraversal(entry_name)) {
+            return self.sendError(header, -1, response_buf);
+        }
+
+        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(full_path);
+
+        std.fs.cwd().deleteFile(full_path) catch |e| switch (e) {
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.IsDir => return self.sendError(header, -21, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleRmdir(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const name_end = std.mem.indexOfScalar(u8, payload, 0) orelse payload.len;
+        const entry_name = payload[0..name_end];
+        if (entry_name.len == 0) {
+            return self.sendError(header, -2, response_buf);
+        }
+        if (path_util.containsTraversal(entry_name)) {
+            return self.sendError(header, -1, response_buf);
+        }
+
+        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(full_path);
+
+        std.fs.cwd().deleteDir(full_path) catch |e| switch (e) {
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.NotDir => return self.sendError(header, -20, response_buf),
+            error.DirNotEmpty => return self.sendError(header, -39, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        return self.sendError(header, 0, response_buf);
+    }
+
     fn handleRelease(
         self: *VirtioFsDevice,
         header: *const FuseInHeader,
@@ -534,6 +843,9 @@ pub const VirtioFsDevice = struct {
     ) VirtioFsError!usize {
         _ = payload;
 
+        if (header.nodeid == 1) {
+            try self.ensureRootNode();
+        }
         const node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
@@ -594,6 +906,7 @@ pub const VirtioFsDevice = struct {
         const DT_REG: u32 = 8;
 
         var pos: usize = out_header_size;
+        var next_off: u64 = 1;
         var d = dir;
         var it = d.iterate();
         while (true) {
@@ -606,8 +919,8 @@ pub const VirtioFsDevice = struct {
             if (pos + padded_size > out_header_size + max_data) break;
 
             var dirent = FuseDirent{
-                .ino = 1,
-                .off = 0,
+                .ino = next_off,
+                .off = next_off,
                 .namelen = name_len,
                 .@"type" = switch (entry_val.kind) {
                     .directory => DT_DIR,
@@ -625,6 +938,7 @@ pub const VirtioFsDevice = struct {
                 0,
             );
             pos += padded_size;
+            next_off += 1;
         }
 
         const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
@@ -712,6 +1026,44 @@ pub const VirtioFsDevice = struct {
         attr_out.attr_valid_nsec = 0;
         attr_out.dummy = 0;
         attr_out.attr = statToFuseAttr(header.nodeid, stat);
+
+        return total_size;
+    }
+
+    fn sendCreateOut(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        nodeid: u64,
+        stat: *const std.fs.File.Stat,
+        fh: u64,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        _ = self;
+        const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut) + @sizeOf(FuseOpenOut);
+        if (response_buf.len < total_size) {
+            return VirtioFsError.IoError;
+        }
+
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(total_size);
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+
+        const entry_out: *FuseEntryOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
+        entry_out.nodeid = nodeid;
+        entry_out.generation = 1;
+        entry_out.entry_valid = 1;
+        entry_out.attr_valid = 1;
+        entry_out.entry_valid_nsec = 0;
+        entry_out.attr_valid_nsec = 0;
+        entry_out.attr = statToFuseAttr(nodeid, stat);
+
+        const open_out: *FuseOpenOut = @ptrCast(@alignCast(
+            response_buf.ptr + @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut),
+        ));
+        open_out.fh = fh;
+        open_out.open_flags = 0;
+        open_out.padding = 0;
 
         return total_size;
     }
@@ -808,6 +1160,29 @@ pub const VirtioFsDevice = struct {
         });
 
         return nodeid;
+    }
+
+    fn ensureRootNode(self: *VirtioFsDevice) VirtioFsError!void {
+        if (self.nodes.contains(1)) return;
+
+        const mount = self.mount_manager.getMountByTag(self.tag) orelse {
+            return VirtioFsError.NotFound;
+        };
+
+        const stat = std.fs.cwd().statFile(mount.host_path) catch {
+            return VirtioFsError.NotFound;
+        };
+
+        const owned_path = self.allocator.dupe(u8, mount.host_path) catch {
+            return VirtioFsError.OutOfMemory;
+        };
+        errdefer self.allocator.free(owned_path);
+
+        self.nodes.put(1, .{
+            .inode = 1,
+            .path = owned_path,
+            .is_dir = stat.kind == .directory,
+        }) catch return VirtioFsError.OutOfMemory;
     }
 
     fn allocateFileHandle(self: *VirtioFsDevice, nodeid: u64, file: std.fs.File) !u64 {

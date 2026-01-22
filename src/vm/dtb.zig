@@ -54,12 +54,21 @@ pub const DtbConfig = struct {
     virtio_blk2_base: ?u64 = null,
     virtio_blk2_size: u64 = 0x1000,
     virtio_blk2_irq: ?u32 = null,
+    virtio_blk3_base: ?u64 = null,
+    virtio_blk3_size: u64 = 0x1000,
+    virtio_blk3_irq: ?u32 = null,
     virtio_console_base: ?u64 = null,
     virtio_console_size: u64 = 0x1000,
     virtio_console_irq: ?u32 = null,
     virtio_rng_base: ?u64 = null,
     virtio_rng_size: u64 = 0x1000,
     virtio_rng_irq: ?u32 = null,
+    virtio_net_base: ?u64 = null,
+    virtio_net_size: u64 = 0x1000,
+    virtio_net_irq: ?u32 = null,
+    virtio_fs_base: ?u64 = null,
+    virtio_fs_size: u64 = 0x1000,
+    virtio_fs_irq: ?u32 = null,
 };
 
 pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
@@ -172,6 +181,16 @@ pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
         try endNode(allocator, &struct_buf);
     }
 
+    if (cfg.virtio_blk3_base != null and cfg.virtio_blk3_irq != null) {
+        var node_name_buf: [64]u8 = undefined;
+        const node_name = try std.fmt.bufPrint(&node_name_buf, "virtio_blk@{x}", .{cfg.virtio_blk3_base.?});
+        try beginNode(allocator, &struct_buf, node_name);
+        try propString(allocator, &struct_buf, &strings, "compatible", "virtio,mmio");
+        try propReg64(allocator, &struct_buf, &strings, "reg", cfg.virtio_blk3_base.?, cfg.virtio_blk3_size);
+        try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_blk3_irq.?, 4);
+        try endNode(allocator, &struct_buf);
+    }
+
     if (cfg.virtio_console_base != null and cfg.virtio_console_irq != null) {
         var node_name_buf: [64]u8 = undefined;
         const node_name = try std.fmt.bufPrint(&node_name_buf, "virtio_console@{x}", .{cfg.virtio_console_base.?});
@@ -190,7 +209,24 @@ pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
         try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_rng_irq.?, 4);
         try endNode(allocator, &struct_buf);
     }
-
+    if (cfg.virtio_net_base != null and cfg.virtio_net_irq != null) {
+        var node_name_buf: [64]u8 = undefined;
+        const node_name = try std.fmt.bufPrint(&node_name_buf, "virtio_net@{x}", .{cfg.virtio_net_base.?});
+        try beginNode(allocator, &struct_buf, node_name);
+        try propString(allocator, &struct_buf, &strings, "compatible", "virtio,mmio");
+        try propReg64(allocator, &struct_buf, &strings, "reg", cfg.virtio_net_base.?, cfg.virtio_net_size);
+        try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_net_irq.?, 4);
+        try endNode(allocator, &struct_buf);
+    }
+    if (cfg.virtio_fs_base != null and cfg.virtio_fs_irq != null) {
+        var node_name_buf: [64]u8 = undefined;
+        const node_name = try std.fmt.bufPrint(&node_name_buf, "virtio_fs@{x}", .{cfg.virtio_fs_base.?});
+        try beginNode(allocator, &struct_buf, node_name);
+        try propString(allocator, &struct_buf, &strings, "compatible", "virtio,mmio");
+        try propReg64(allocator, &struct_buf, &strings, "reg", cfg.virtio_fs_base.?, cfg.virtio_fs_size);
+        try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_fs_irq.?, 4);
+        try endNode(allocator, &struct_buf);
+    }
     try endNode(allocator, &struct_buf);
     try endStruct(allocator, &struct_buf);
 
