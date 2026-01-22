@@ -1,16 +1,47 @@
+//! VM State Management Module
+//!
+//! This module handles the lifecycle of VMs: creating, deleting, and tracking their status.
+//! It manages the on-disk representation of VMs in the data directory.
+//!
+//! ## VM Storage
+//! Each VM is stored as a directory under `{data_dir}/vms/{name}/` containing:
+//! - `m80.conf`: VM configuration file (see config.zig)
+//! - `status`: Simple text file containing "running\n" or "stopped\n"
+//!
+//! ## Security
+//! - VM names are validated to prevent path traversal attacks
+//! - Deletion uses safe path validation to prevent symlink escape attacks
+//! - All paths are verified to be within the expected data root
+//!
+//! ## Thread Safety
+//! Status updates use a "last writer wins" model. If multiple processes
+//! update status simultaneously, the last write will be preserved.
+
 const std = @import("std");
 const paths = @import("paths.zig");
 const config = @import("config.zig");
 const errors = @import("errors.zig");
 const path_util = @import("../util/path.zig");
 
-pub const VmStatus = enum { stopped, running };
+/// Represents the current execution state of a VM.
+/// This is persisted in the `status` file in the VM directory.
+pub const VmStatus = enum {
+  /// VM is not running (default state)
+  stopped,
+  /// VM is currently executing
+  running,
+};
 
+/// Record returned by listVms() containing basic VM info.
+/// The name field is allocator-owned and must be freed by the caller.
 pub const VmRecord = struct {
+  /// VM name (allocator-owned, caller must free)
   name: []const u8,
+  /// Current status from the status file
   status: VmStatus,
 };
 
+/// Converts a VmStatus enum to the string written to the status file.
 fn statusLine(status: VmStatus) []const u8 {
   return switch (status) {
     .stopped => "stopped\n",
@@ -18,13 +49,24 @@ fn statusLine(status: VmStatus) []const u8 {
   };
 }
 
+/// Writes the status to the VM's status file atomically.
+/// Uses write-to-temp-then-rename pattern to prevent partial writes.
 fn writeStatusFile(vm_dir: std.fs.Dir, status: VmStatus) !void {
-  // Status is a simple sentinel file; last writer wins.
-  var sf = try vm_dir.createFile("status", .{ .truncate = true });
-  defer sf.close();
+  const tmp_name = "status.tmp";
+  const final_name = "status";
+
+  // Write to temporary file first
+  var sf = try vm_dir.createFile(tmp_name, .{ .truncate = true });
+  errdefer vm_dir.deleteFile(tmp_name) catch {};
   try sf.writeAll(statusLine(status));
+  sf.close();
+
+  // Atomic rename (POSIX rename() and Windows MoveFileEx are atomic)
+  try vm_dir.rename(tmp_name, final_name);
 }
 
+/// Creates the base data directories if they don't exist.
+/// Creates: {data_dir}/ and {data_dir}/vms/
 fn ensureBaseDirs(allocator: std.mem.Allocator) !void {
   const base = try paths.dataDir(allocator);
   defer allocator.free(base);
@@ -37,40 +79,80 @@ fn ensureBaseDirs(allocator: std.mem.Allocator) !void {
   try cwd.makePath(vms);
 }
 
+/// Creates a new VM with the given name.
+///
+/// This function:
+/// 1. Validates the VM name (must be alphanumeric with _/- only)
+/// 2. Creates the VM directory at {data_dir}/vms/{name}/
+/// 3. Writes a default m80.conf configuration file
+/// 4. Creates a status file with "stopped" state
+///
+/// After initVm, the user should edit m80.conf to set kernel_path, initrd_path, etc.
+///
+/// Parameters:
+///   - allocator: Memory allocator for path operations
+///   - name: VM name (must pass paths.validateVmName)
+///
+/// Errors:
+///   - M80Error.InvalidArgs: Invalid VM name (contains special chars, etc.)
+///   - M80Error.AlreadyExists: A VM with this name already exists
 pub fn initVm(allocator: std.mem.Allocator, name: []const u8) !void {
+  // Ensure the base data directories exist
   try ensureBaseDirs(allocator);
 
+  // Build the path to the VM directory
   const dir_path = paths.vmDir(allocator, name) catch return errors.M80Error.InvalidArgs;
   defer allocator.free(dir_path);
 
   var cwd = std.fs.cwd();
 
-  // if exists, error
+  // Check if VM already exists - return error if so
   if (cwd.openDir(dir_path, .{})) |d| {
     var h = d;
     h.close();
     return errors.M80Error.AlreadyExists;
   } else |_| {}
 
+  // Create the VM directory
   try cwd.makePath(dir_path);
 
   var vm_dir = try cwd.openDir(dir_path, .{});
   defer vm_dir.close();
 
+  // Write default configuration file
   const cfg = try config.defaultConfig(allocator, name);
   defer allocator.free(cfg.name);
 
   try config.writeConfigFile(vm_dir, cfg);
 
-  // status file (stopped)
+  // Create status file with initial "stopped" state
   try writeStatusFile(vm_dir, .stopped);
 }
 
+/// Deletes a VM and all its associated files.
+///
+/// This function:
+/// 1. Validates the VM name
+/// 2. Verifies the VM directory exists
+/// 3. Safely deletes the entire VM directory tree
+///
+/// Security: Uses safe deletion that validates the path is:
+/// - Within the data root directory
+/// - At least 2 levels deep (prevents deleting the data root itself)
+/// - Not escaping via symlinks
+///
+/// Parameters:
+///   - allocator: Memory allocator for path operations
+///   - name: VM name to delete
+///
+/// Errors:
+///   - M80Error.InvalidArgs: Invalid VM name or path traversal attempt
+///   - M80Error.NotFound: No VM with this name exists
 pub fn deleteVm(allocator: std.mem.Allocator, name: []const u8) !void {
   const dir_path = paths.vmDir(allocator, name) catch return errors.M80Error.InvalidArgs;
   defer allocator.free(dir_path);
 
-  // Avoid deleting a missing VM directory; map to NotFound early.
+  // Verify VM exists before attempting deletion
   if (std.fs.cwd().openDir(dir_path, .{})) |dir| {
     var d = dir;
     d.close();
@@ -78,12 +160,13 @@ pub fn deleteVm(allocator: std.mem.Allocator, name: []const u8) !void {
     return errors.M80Error.NotFound;
   }
 
-  // Get the data root for validation
+  // Get the data root for path validation
   const data_root = paths.dataDir(allocator) catch return errors.M80Error.InvalidArgs;
   defer allocator.free(data_root);
 
-  // Use safe deletion with path validation
+  // Use safe deletion with path validation to prevent symlink escape attacks.
   // Requires path to be at least 2 levels deep within data root
+  // (e.g., can delete vms/myvm but not vms/ itself)
   path_util.safeDeleteTree(allocator, dir_path, data_root) catch |e| switch (e) {
     path_util.PathError.PathNotWithinRoot,
     path_util.PathError.PathTraversal,
@@ -95,6 +178,18 @@ pub fn deleteVm(allocator: std.mem.Allocator, name: []const u8) !void {
   };
 }
 
+/// Updates the status file for a VM.
+///
+/// Called by the CLI after start/stop operations to persist the new state.
+///
+/// Parameters:
+///   - allocator: Memory allocator for path operations
+///   - name: VM name
+///   - status: New status to write (.running or .stopped)
+///
+/// Errors:
+///   - M80Error.InvalidArgs: Invalid VM name
+///   - M80Error.NotFound: VM doesn't exist
 pub fn setStatus(allocator: std.mem.Allocator, name: []const u8, status: VmStatus) !void {
   const dir_path = paths.vmDir(allocator, name) catch return errors.M80Error.InvalidArgs;
   defer allocator.free(dir_path);
@@ -106,6 +201,15 @@ pub fn setStatus(allocator: std.mem.Allocator, name: []const u8, status: VmStatu
   try writeStatusFile(vm_dir, status);
 }
 
+/// Reads the current status of a VM from its status file.
+///
+/// Gracefully handles missing or malformed files by defaulting to .stopped.
+/// This is intentional - a missing status file means the VM hasn't been started.
+///
+/// Parameters:
+///   - vm_dir: Open directory handle to the VM's directory
+///
+/// Returns: VmStatus (.running or .stopped)
 pub fn getStatus(vm_dir: std.fs.Dir) !VmStatus {
   // Missing or malformed status file defaults to stopped.
   var f = vm_dir.openFile("status", .{}) catch return .stopped;
@@ -118,6 +222,23 @@ pub fn getStatus(vm_dir: std.fs.Dir) !VmStatus {
   return .stopped;
 }
 
+/// Lists all VMs in the data directory with their current status.
+///
+/// Scans the {data_dir}/vms/ directory for subdirectories and reads
+/// each VM's status file.
+///
+/// Returns: Slice of VmRecord structs. Caller owns the memory:
+///   - Each VmRecord.name must be freed
+///   - The slice itself must be freed
+///
+/// Example cleanup:
+/// ```zig
+/// const vms = try listVms(allocator);
+/// defer {
+///     for (vms) |r| allocator.free(r.name);
+///     allocator.free(vms);
+/// }
+/// ```
 pub fn listVms(allocator: std.mem.Allocator) ![]VmRecord {
   try ensureBaseDirs(allocator);
 
@@ -153,6 +274,12 @@ pub fn listVms(allocator: std.mem.Allocator) ![]VmRecord {
 
   return try out.toOwnedSlice(allocator);
 }
+
+// =============================================================================
+// TESTS
+// =============================================================================
+// Tests use the "state:" prefix to identify which module they belong to.
+// Most tests create VMs with random names to avoid collisions.
 
 test "state: status transitions" {
   var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -457,4 +584,28 @@ test "state: initVm rejects invalid name" {
   const allocator = gpa.allocator();
 
   try std.testing.expectError(errors.M80Error.InvalidArgs, initVm(allocator, "../evil"));
+}
+
+test "state: path traversal patterns rejected" {
+  const allocator = std.testing.allocator;
+
+  // Various path traversal attempts
+  const invalid_names = [_][]const u8{
+    "../etc/passwd",
+    "..\\windows\\system32",
+    "foo/../../../etc",
+    "..",
+    ".",
+    "/absolute/path",
+    "name/with/slashes",
+    "name\\with\\backslashes",
+    "",
+    "name with spaces",
+    "name\x00null",
+  };
+
+  for (invalid_names) |name| {
+    try std.testing.expectError(errors.M80Error.InvalidArgs, initVm(allocator, name));
+    try std.testing.expectError(errors.M80Error.InvalidArgs, deleteVm(allocator, name));
+  }
 }

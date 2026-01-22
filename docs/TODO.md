@@ -37,12 +37,12 @@ Goal: improve clarity (docs/comments), refactor complex areas into smaller units
 - [ ] **Security hardening coverage**
   - [x] Path safety (symlink escape + safe delete)
   - [x] ACL hardening (skip symlinks + configurable modes)
-  - [ ] Windows ACL hardening implementation
+  - [x] Windows ACL hardening implementation
 
 - [ ] **VM backend config validation**
   - [x] POSIX/HVF missing kernel/initrd loader errors + unset no-op tests
   - [x] Windows image load oversized/null memory cases
-  - [ ] Cross-backend start/stop validation parity
+  - [x] Cross-backend start/stop validation parity
 
 ## Progress log
 
@@ -68,7 +68,13 @@ Goal: improve clarity (docs/comments), refactor complex areas into smaller units
 - [x] Added additional unit tests across dns parsing, virtio-fs traversal, and config optional paths
 - [x] Added DNS resolver integration tests (UDP responder + policy allow/deny)
 - [x] Added virtio-fs readdir success path and IO error mapping tests
+- [x] Implemented Windows ACL hardening (owner-only DACL) with Windows-gated test
+- [x] Added start/stop parity guards/tests across backends (AlreadyRunning)
+- [x] Ran `zig build test` after ACL/parity changes (178 passed, 7 skipped)
 - [x] Added safeDeleteTree tests and symlink escape validation
 - [x] Implemented ACL config support (follow_symlinks, fail_fast, custom modes) with tests
 - [x] Extended VM backend config tests (POSIX/HVF missing paths; Windows oversized/null image)
 - [x] Latest `zig build test`: 176 passed, 5 skipped, 0 failed
+- [x] Added HVF arm64 DTB builder + MMU preconfig + guest memory map (via hv_vm_map)
+- [x] Added arm64 boot layout + page table builder + tests
+- [x] Latest `zig build test`: 198 passed, 6 skipped, 0 failed

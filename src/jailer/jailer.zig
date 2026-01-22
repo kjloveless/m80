@@ -1,3 +1,37 @@
+//! Security Jailer Module
+//!
+//! The jailer provides defense-in-depth security for VM processes by:
+//! - Dropping privileges from root to a less-privileged user
+//! - Setting resource limits (max files, processes, memory)
+//! - Optionally chrooting to restrict filesystem access
+//! - Hardening directory permissions
+//!
+//! ## Why Jailing Matters
+//! Even with hardware virtualization, bugs in the hypervisor or host kernel
+//! could allow guest escape. The jailer ensures that even if escape occurs,
+//! the attacker has limited capabilities (no root, restricted resources).
+//!
+//! ## Privilege Drop Order
+//! POSIX requires a specific order for dropping privileges:
+//! 1. setgroups(0, NULL) - Drop supplementary groups
+//! 2. setgid(gid) - Set group ID
+//! 3. setuid(uid) - Set user ID (cannot be undone)
+//!
+//! The uid must be set LAST because once set, you can't regain root to
+//! complete the other steps.
+//!
+//! ## Resource Limits (setrlimit)
+//! - RLIMIT_NOFILE: Max open file descriptors (default: 1024)
+//! - RLIMIT_NPROC: Max processes/threads (default: 64)
+//! - RLIMIT_AS: Max address space (optional)
+//! - RLIMIT_CORE: Max core dump size (default: 0 = disabled)
+//! - RLIMIT_CPU: Max CPU time in seconds (optional)
+//!
+//! ## Platform Support
+//! - Linux: Full support (chroot, setuid, setrlimit)
+//! - macOS: Partial support (setuid, setrlimit, no chroot)
+//! - Windows: Stub (different privilege model)
+
 const std = @import("std");
 const builtin = @import("builtin");
 const paths = @import("../core/paths.zig");
@@ -289,7 +323,10 @@ pub fn getEffectiveGid() u32 {
     return std.posix.getegid();
 }
 
-// Tests
+// =============================================================================
+// TESTS
+// =============================================================================
+
 test "jailer: init and deinit" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

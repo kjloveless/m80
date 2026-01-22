@@ -1,3 +1,24 @@
+//! Logging Utility
+//!
+//! Provides structured logging with configurable severity levels.
+//! Output is written to stderr with timestamps for debugging.
+//!
+//! ## Log Levels
+//! Levels are ordered by severity (lowest to highest):
+//! - `debug`: Verbose debugging information
+//! - `info`: General operational messages
+//! - `warn`: Warning conditions that may need attention
+//! - `err`: Error conditions that affect operation
+//!
+//! Messages are only printed if their level is >= the current threshold.
+//!
+//! ## Configuration
+//! Set `M80_LOG_LEVEL` environment variable: debug, info, warn, error
+//! Default level is `info`.
+//!
+//! ## Output Format
+//! [timestamp_ms] LEVEL message
+
 const std = @import("std");
 
 pub const Level = enum {
@@ -70,6 +91,10 @@ pub fn warn(comptime fmt: []const u8, args: anytype) void {
 pub fn err(comptime fmt: []const u8, args: anytype) void {
   log(.err, fmt, args);
 }
+
+// =============================================================================
+// TESTS
+// =============================================================================
 
 test "log: enabled respects level ordering" {
   const saved = level;

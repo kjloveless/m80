@@ -1,3 +1,27 @@
+//! Secure Path Validation
+//!
+//! This module provides utilities for safely validating and manipulating
+//! filesystem paths. It's critical for preventing path traversal attacks
+//! that could allow VM operations outside designated directories.
+//!
+//! ## Security Features
+//! - **Path Traversal Detection**: Rejects `..` in paths
+//! - **Symlink Escape Detection**: Prevents symlinks pointing outside allowed roots
+//! - **Depth Validation**: Ensures paths are sufficiently nested (prevents deleting root)
+//! - **Root Containment**: Validates paths are within allowed directories
+//!
+//! ## Key Functions
+//! - `validateSafePath`: Full validation with all checks
+//! - `containsTraversal`: Quick check for `..` components
+//! - `isWithinRoot`: Check if path starts with root prefix
+//! - `safeDeleteTree`: Delete directory only if it passes validation
+//!
+//! ## Path Canonicalization
+//! Paths are canonicalized (resolved) before validation:
+//! - `.` components are removed
+//! - `..` components are resolved
+//! - Symlinks in intermediate directories are resolved
+
 const std = @import("std");
 const builtin = @import("builtin");
 const windows = std.os.windows;
@@ -324,7 +348,10 @@ pub fn isWithinRoot(path: []const u8, root: []const u8) bool {
     return false;
 }
 
-// Tests
+// =============================================================================
+// TESTS
+// =============================================================================
+
 test "path: validateSafePath rejects traversal" {
     const allocator = std.testing.allocator;
 

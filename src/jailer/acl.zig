@@ -1,5 +1,28 @@
+//! Access Control List (ACL) Module
+//!
+//! This module handles filesystem permission hardening for VM directories.
+//! It ensures that VM data is only accessible by the owner, protecting
+//! sensitive information like disk images and configuration files.
+//!
+//! ## POSIX Implementation
+//! Uses chmod to set restrictive permissions:
+//! - Directories: 0700 (rwx------) - owner only
+//! - Files: 0600 (rw-------) - owner only
+//!
+//! ## Windows Implementation
+//! Uses Windows Security APIs to set owner-only DACLs:
+//! - GetNamedSecurityInfoW: Read current owner
+//! - SetEntriesInAclW: Build new ACL with owner-only access
+//! - SetNamedSecurityInfoW: Apply the ACL
+//!
+//! ## Security Notes
+//! - Symlinks are NOT followed by default to prevent escape attacks
+//! - Special files (devices, sockets) are skipped
+//! - Recursive traversal hardens all contents
+
 const std = @import("std");
 const builtin = @import("builtin");
+const windows = std.os.windows;
 
 pub const AclError = error{
     PermissionDenied,
@@ -19,7 +42,7 @@ pub const PosixMode = struct {
 /// On Windows: sets DACL for owner-only access
 pub fn hardenVmDirectory(allocator: std.mem.Allocator, path: []const u8) AclError!void {
     if (builtin.os.tag == .windows) {
-        return hardenVmDirectoryWindows(allocator, path);
+        return hardenVmDirectoryWindowsWithConfig(allocator, path, .{});
     } else {
         return hardenVmDirectoryPosix(allocator, path);
     }
@@ -114,35 +137,13 @@ fn setFilePermissionsWithMode(path: []const u8, mode: ?std.posix.mode_t) !void {
 
 /// Windows implementation of directory hardening
 fn hardenVmDirectoryWindows(allocator: std.mem.Allocator, path: []const u8) AclError!void {
-    _ = allocator;
-    _ = path;
-
-    // Windows ACL implementation
-    // Uses SetSecurityInfo to set DACL with owner-only permissions
-    // This is a placeholder - full implementation requires Windows API calls
-
-    if (builtin.os.tag != .windows) return;
-
-    // TODO: Implement Windows-specific ACL hardening
-    // 1. Get current owner SID
-    // 2. Create new DACL with only owner having full control
-    // 3. Apply to directory and all contents recursively
-    //
-    // Would use:
-    // - GetSecurityInfo to get owner
-    // - SetEntriesInAcl to create new DACL
-    // - SetSecurityInfo to apply
-
-    return;
+    return hardenVmDirectoryWindowsWithConfig(allocator, path, .{});
 }
 
 /// Sets owner-only access on a single file (Windows)
 fn setFileOwnerOnly(path: []const u8) AclError!void {
-    _ = path;
     if (builtin.os.tag != .windows) return;
-
-    // Placeholder for Windows implementation
-    return;
+    try applyOwnerOnlyAcl(std.heap.page_allocator, path, false);
 }
 
 /// Verifies that a path has proper restrictive permissions
@@ -179,10 +180,49 @@ fn verifyHardenedPermissionsPosix(path: []const u8) AclError!bool {
 }
 
 fn verifyHardenedPermissionsWindows(path: []const u8) AclError!bool {
-    _ = path;
     if (builtin.os.tag != .windows) return true;
 
-    // Placeholder - would verify DACL contains only owner ACE
+    const allocator = std.heap.page_allocator;
+    const wide = try utf16ZFromUtf8Alloc(allocator, path);
+    defer allocator.free(wide);
+
+    var owner: PSID = null;
+    var dacl: PACL = null;
+    var sec_desc: PSECURITY_DESCRIPTOR = null;
+
+    const err = GetNamedSecurityInfoW(
+        wide.ptr,
+        SE_OBJECT_TYPE.SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner,
+        null,
+        &dacl,
+        null,
+        &sec_desc,
+    );
+    if (err != 0) return mapWindowsAclError(err);
+    defer _ = LocalFree(sec_desc);
+
+    if (owner == null or dacl == null) return false;
+
+    const acl: *const ACL = @ptrCast(@alignCast(dacl.?));
+    if (acl.AceCount == 0) return false;
+
+    var i: u16 = 0;
+    while (i < acl.AceCount) : (i += 1) {
+        var ace_ptr: ?*anyopaque = null;
+        const ok = GetAce(dacl, i, &ace_ptr);
+        if (ok == 0 or ace_ptr == null) return false;
+
+        const header: *const ACE_HEADER = @ptrCast(@alignCast(ace_ptr.?));
+        if (header.AceType != ACCESS_ALLOWED_ACE_TYPE) return false;
+        if ((header.AceFlags & INHERITANCE_FLAGS_MASK) != 0) return false;
+
+        const allowed: *const ACCESS_ALLOWED_ACE = @ptrCast(@alignCast(ace_ptr.?));
+        if (allowed.Mask != FILE_ALL_ACCESS) return false;
+        const ace_sid: PSID = @ptrCast(@constCast(&allowed.SidStart));
+        if (EqualSid(owner.?, ace_sid) == 0) return false;
+    }
     return true;
 }
 
@@ -205,7 +245,7 @@ pub fn hardenVmDirectoryWithConfig(
     config: HardenConfig,
 ) AclError!void {
     if (builtin.os.tag == .windows) {
-        return hardenVmDirectoryWindows(allocator, path);
+        return hardenVmDirectoryWindowsWithConfig(allocator, path, config);
     }
     return hardenVmDirectoryPosixWithConfig(allocator, path, config);
 }
@@ -272,7 +312,273 @@ fn hardenDirectoryContentsRecursiveWithConfig(
     }
 }
 
-// Tests
+// ---- Windows ACL helpers ----
+const DWORD = windows.DWORD;
+const BOOL = windows.BOOL;
+const LPWSTR = windows.LPWSTR;
+const PSID = ?*anyopaque;
+const PACL = ?*anyopaque;
+const PSECURITY_DESCRIPTOR = ?*anyopaque;
+
+const SE_OBJECT_TYPE = enum(u32) {
+    SE_FILE_OBJECT = 1,
+};
+
+const ACCESS_MODE = enum(u32) {
+    NOT_USED_ACCESS = 0,
+    GRANT_ACCESS = 1,
+    SET_ACCESS = 2,
+    DENY_ACCESS = 3,
+    REVOKE_ACCESS = 4,
+    SET_AUDIT_SUCCESS = 5,
+    SET_AUDIT_FAILURE = 6,
+};
+
+const TRUSTEE_FORM = enum(u32) {
+    TRUSTEE_IS_SID = 0,
+};
+
+const TRUSTEE_TYPE = enum(u32) {
+    TRUSTEE_IS_USER = 1,
+};
+
+const MULTIPLE_TRUSTEE_OPERATION = enum(u32) {
+    NO_MULTIPLE_TRUSTEE = 0,
+};
+
+const TRUSTEE_W = extern struct {
+    pMultipleTrustee: ?*anyopaque,
+    MultipleTrusteeOperation: MULTIPLE_TRUSTEE_OPERATION,
+    TrusteeForm: TRUSTEE_FORM,
+    TrusteeType: TRUSTEE_TYPE,
+    ptstrName: ?*anyopaque,
+};
+
+const EXPLICIT_ACCESSW = extern struct {
+    grfAccessPermissions: DWORD,
+    grfAccessMode: ACCESS_MODE,
+    grfInheritance: DWORD,
+    Trustee: TRUSTEE_W,
+};
+
+const ACL = extern struct {
+    AclRevision: u8,
+    Sbz1: u8,
+    AclSize: u16,
+    AceCount: u16,
+    Sbz2: u16,
+};
+
+const ACE_HEADER = extern struct {
+    AceType: u8,
+    AceFlags: u8,
+    AceSize: u16,
+};
+
+const ACCESS_ALLOWED_ACE = extern struct {
+    Header: ACE_HEADER,
+    Mask: DWORD,
+    SidStart: DWORD,
+};
+
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x0;
+const INHERITED_ACE: u8 = 0x10;
+const INHERITANCE_FLAGS_MASK: u8 = 0x1F;
+
+const SECURITY_INFORMATION = u32;
+const OWNER_SECURITY_INFORMATION: SECURITY_INFORMATION = 0x00000001;
+const DACL_SECURITY_INFORMATION: SECURITY_INFORMATION = 0x00000004;
+const PROTECTED_DACL_SECURITY_INFORMATION: SECURITY_INFORMATION = 0x80000000;
+
+const ERROR_ACCESS_DENIED: DWORD = 5;
+const ERROR_FILE_NOT_FOUND: DWORD = 2;
+const ERROR_PATH_NOT_FOUND: DWORD = 3;
+
+const FILE_ALL_ACCESS: DWORD = 0x1F01FF;
+const SUB_CONTAINERS_AND_OBJECTS_INHERIT: DWORD = 0x3;
+
+extern "advapi32" fn GetNamedSecurityInfoW(
+    pObjectName: LPWSTR,
+    ObjectType: SE_OBJECT_TYPE,
+    SecurityInfo: SECURITY_INFORMATION,
+    ppsidOwner: *PSID,
+    ppsidGroup: ?*PSID,
+    ppDacl: *PACL,
+    ppSacl: ?*PACL,
+    ppSecurityDescriptor: *PSECURITY_DESCRIPTOR,
+) callconv(windows.WINAPI) DWORD;
+
+extern "advapi32" fn SetNamedSecurityInfoW(
+    pObjectName: LPWSTR,
+    ObjectType: SE_OBJECT_TYPE,
+    SecurityInfo: SECURITY_INFORMATION,
+    psidOwner: PSID,
+    psidGroup: PSID,
+    pDacl: PACL,
+    pSacl: PACL,
+) callconv(windows.WINAPI) DWORD;
+
+extern "advapi32" fn SetEntriesInAclW(
+    cCountOfExplicitEntries: DWORD,
+    pListOfExplicitEntries: *const EXPLICIT_ACCESSW,
+    OldAcl: PACL,
+    NewAcl: *PACL,
+) callconv(windows.WINAPI) DWORD;
+
+extern "advapi32" fn GetAce(
+    pAcl: PACL,
+    dwAceIndex: DWORD,
+    pAce: *?*anyopaque,
+) callconv(windows.WINAPI) BOOL;
+
+extern "advapi32" fn EqualSid(
+    pSid1: PSID,
+    pSid2: PSID,
+) callconv(windows.WINAPI) BOOL;
+
+extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(windows.WINAPI) ?*anyopaque;
+
+fn utf16ZFromUtf8Alloc(allocator: std.mem.Allocator, path: []const u8) AclError![:0]u16 {
+    const utf16 = std.unicode.utf8ToUtf16LeAlloc(allocator, path) catch |e| switch (e) {
+        error.OutOfMemory => return AclError.OutOfMemory,
+        else => return AclError.InvalidPath,
+    };
+    defer allocator.free(utf16);
+
+    const out = allocator.alloc(u16, utf16.len + 1) catch return AclError.OutOfMemory;
+    @memcpy(out[0..utf16.len], utf16);
+    out[utf16.len] = 0;
+    return out[0..utf16.len :0];
+}
+
+fn mapWindowsAclError(err: DWORD) AclError {
+    switch (err) {
+        ERROR_ACCESS_DENIED => return AclError.PermissionDenied,
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => return AclError.InvalidPath,
+        else => return AclError.SystemError,
+    }
+}
+
+fn applyOwnerOnlyAcl(allocator: std.mem.Allocator, path: []const u8, inherit: bool) AclError!void {
+    const wide = try utf16ZFromUtf8Alloc(allocator, path);
+    defer allocator.free(wide);
+
+    var owner: PSID = null;
+    var sec_desc: PSECURITY_DESCRIPTOR = null;
+    var ignored_dacl: PACL = null;
+
+    const err_owner = GetNamedSecurityInfoW(
+        wide.ptr,
+        SE_OBJECT_TYPE.SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION,
+        &owner,
+        null,
+        &ignored_dacl,
+        null,
+        &sec_desc,
+    );
+    if (err_owner != 0) return mapWindowsAclError(err_owner);
+    defer _ = LocalFree(sec_desc);
+    if (owner == null) return AclError.SystemError;
+
+    var explicit = EXPLICIT_ACCESSW{
+        .grfAccessPermissions = FILE_ALL_ACCESS,
+        .grfAccessMode = .SET_ACCESS,
+        .grfInheritance = if (inherit) SUB_CONTAINERS_AND_OBJECTS_INHERIT else 0,
+        .Trustee = .{
+            .pMultipleTrustee = null,
+            .MultipleTrusteeOperation = .NO_MULTIPLE_TRUSTEE,
+            .TrusteeForm = .TRUSTEE_IS_SID,
+            .TrusteeType = .TRUSTEE_IS_USER,
+            .ptstrName = owner,
+        },
+    };
+
+    var new_acl: PACL = null;
+    const err_acl = SetEntriesInAclW(1, &explicit, null, &new_acl);
+    if (err_acl != 0) return mapWindowsAclError(err_acl);
+    defer _ = LocalFree(new_acl);
+
+    const sec_info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    const err_set = SetNamedSecurityInfoW(
+        wide.ptr,
+        SE_OBJECT_TYPE.SE_FILE_OBJECT,
+        sec_info,
+        null,
+        null,
+        new_acl,
+        null,
+    );
+    if (err_set != 0) return mapWindowsAclError(err_set);
+}
+
+fn hardenVmDirectoryWindowsWithConfig(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    config: HardenConfig,
+) AclError!void {
+    if (builtin.os.tag != .windows) return;
+
+    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |e| switch (e) {
+        error.AccessDenied => return AclError.PermissionDenied,
+        error.FileNotFound => return AclError.InvalidPath,
+        else => return AclError.SystemError,
+    };
+    defer dir.close();
+
+    applyOwnerOnlyAcl(allocator, path, true) catch |err| {
+        if (config.fail_fast) return err;
+    };
+
+    try hardenDirectoryContentsRecursiveWindows(allocator, dir, path, config);
+}
+
+fn hardenDirectoryContentsRecursiveWindows(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    base_path: []const u8,
+    config: HardenConfig,
+) AclError!void {
+    var iterator = dir.iterate();
+    while (iterator.next() catch return AclError.SystemError) |entry| {
+        const entry_path = std.fs.path.join(allocator, &[_][]const u8{ base_path, entry.name }) catch return AclError.OutOfMemory;
+        defer allocator.free(entry_path);
+
+        switch (entry.kind) {
+            .directory => {
+                applyOwnerOnlyAcl(allocator, entry_path, true) catch |err| {
+                    if (config.fail_fast) return err;
+                };
+
+                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch |e| switch (e) {
+                    error.AccessDenied => return if (config.fail_fast) AclError.PermissionDenied else continue,
+                    else => return if (config.fail_fast) AclError.SystemError else continue,
+                };
+                defer subdir.close();
+                try hardenDirectoryContentsRecursiveWindows(allocator, subdir, entry_path, config);
+            },
+            .file => {
+                applyOwnerOnlyAcl(allocator, entry_path, false) catch |err| {
+                    if (config.fail_fast) return err;
+                };
+            },
+            .sym_link => {
+                if (config.follow_symlinks) {
+                    applyOwnerOnlyAcl(allocator, entry_path, false) catch |err| {
+                        if (config.fail_fast) return err;
+                    };
+                }
+                continue;
+            },
+            else => continue,
+        }
+    }
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
 test "acl: verifyHardenedPermissionsPosix" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -297,6 +603,30 @@ test "acl: verifyHardenedPermissionsPosix" {
 
     const is_hardened = try verifyHardenedPermissionsPosix(path);
     try std.testing.expect(is_hardened);
+}
+
+test "acl: hardenVmDirectory windows owner-only" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("vm");
+    {
+        var f = try tmp.dir.createFile("vm/file.txt", .{});
+        defer f.close();
+        try f.writeAll("x");
+    }
+
+    const vm_path = try tmp.dir.realpathAlloc(allocator, "vm");
+    defer allocator.free(vm_path);
+
+    try hardenVmDirectory(allocator, vm_path);
+
+    const ok = try verifyHardenedPermissions(vm_path);
+    try std.testing.expect(ok);
 }
 
 test "acl: hardenVmDirectory creates restrictive permissions" {

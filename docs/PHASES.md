@@ -55,10 +55,14 @@ Principles:
 - Windows kernel/initrd file loading into guest memory wired (done)
 - WHP vCPU run loop with exit handling (CPUID + IO port) wired (done)
 - Serial IO (COM1) read/write handling + shared IoExit scaffolding across backends (done)
-- HVF backend selected and stubbed for macOS (done)
-- HVF vCPU + layout stubs wired (done)
+- HVF backend wired with real VM create/map + vCPU run loop (arm64 + x86) (done)
+- HVF arm64 register setup + DTB builder + MMU preconfig + guest memory mapping (done)
+- HVF arm64 PL011 MMIO + GIC SPI wiring for serial (done)
 - POSIX backend stubs + vCPU/layout parity (done)
 - Platform-specific backend smoke tests added (done)
+- HVF/KVM IO exit decoding into IoExit (done)
+- Boot state computation + cmdline/stack prep + Windows register init wired (partial)
+- HVF arm64 boot-to-serial test gated by env vars (done)
 
 ### Exit Criteria
 - VM boots reliably on Windows and POSIX
@@ -69,13 +73,13 @@ Principles:
 - Current backends are still stubbed; Phase 1 “done” items reflect scaffolding, not full boot.
 
 ### Testing Notes (2026-01-19)
-- `zig build test`: 176 passed, 5 skipped, 0 failed.
+- `zig build test`: 200 passed, 8 skipped, 0 failed (re-verified).
 - Skips are OS/integration gated (HVF/POSIX/WHP integration).
 
 ### Remaining (Phase 1)
-- Implement register setup + real boot flow (entry point, cmdline, stack)
-- Decode real HVF/KVM exit structs into IoExit (current mapping is stubbed)
-- Verify deterministic start/stop on real WHP/HVF backends
+- Wire real guest RAM mapping + vCPU create/run loop for KVM (beyond stubs)
+- Finalize kernel/initrd loading into KVM guest memory
+- Verify deterministic start/stop on real WHP/HVF backends with real boot payloads
 
 ---
 

@@ -1,3 +1,31 @@
+//! macOS Sandbox Profile Builder
+//!
+//! This module implements process sandboxing using macOS's sandbox-exec
+//! (Seatbelt) facility. It builds a declarative sandbox profile that
+//! restricts what the VMM process can do.
+//!
+//! ## How macOS Sandbox Works
+//! macOS sandboxing uses a Scheme-like DSL to declare allowed operations:
+//! - `(version 1)` - Profile format version
+//! - `(deny default)` - Deny everything not explicitly allowed
+//! - `(allow ...)` - Permit specific operations
+//!
+//! The profile is compiled and applied via `sandbox_init()`, which is
+//! a private API looked up dynamically at runtime.
+//!
+//! ## VMM Profile Permissions
+//! The VMM profile allows only what's needed for hypervisor operation:
+//! - `hv-create`: Create Hypervisor Framework VMs
+//! - `mach-vm*`: Virtual memory operations for guest RAM
+//! - `mach-lookup`: Access Mach services
+//! - File read for kernel/initrd images
+//! - Optional network access
+//! - Explicitly denies `process-exec` and `process-fork`
+//!
+//! ## Platform Support
+//! This module only functions on macOS. On other platforms, all
+//! functions are no-ops.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("../util/log.zig");
@@ -14,6 +42,7 @@ pub const VmmSandboxOptions = struct {
     allow_write_vm_dir: bool = false,
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
+    disk_path: ?[]const u8 = null,
     allow_network: bool = false,
 };
 
@@ -60,6 +89,9 @@ pub const SandboxProfile = struct {
         }
         if (options.initrd_path) |initrd| {
             try w.print("(allow file-read* (literal \"{s}\"))\n", .{initrd});
+        }
+        if (options.disk_path) |disk| {
+            try w.print("(allow file-read* (literal \"{s}\"))\n", .{disk});
         }
 
         try w.writeAll("\n(allow file-read* (subpath \"/System/Library/Frameworks\"))\n");
@@ -141,6 +173,10 @@ pub fn isSandboxAvailable() bool {
     const ptr = @extern(?*const fn () void, .{ .name = "sandbox_init" });
     return ptr != null;
 }
+
+// =============================================================================
+// TESTS
+// =============================================================================
 
 test "sandbox_darwin: SandboxProfile buildVmmProfile" {
     const allocator = std.testing.allocator;

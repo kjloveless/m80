@@ -1,3 +1,26 @@
+//! Filesystem Mount Configuration
+//!
+//! This module manages shared filesystem mounts between the host and guest.
+//! It validates mount configurations, enforces allowed root directories,
+//! and controls read/write access permissions.
+//!
+//! ## Mount Configuration
+//! Each mount has:
+//! - `tag`: Identifier visible inside the guest for mounting
+//! - `host_path`: Directory on the host to share
+//! - `guest_path`: Suggested mount point inside the guest
+//! - `access`: Read-only (ro) or read-write (rw)
+//! - `mount_type`: Sharing protocol (virtio_fs or plan9/9p)
+//!
+//! ## Security Features
+//! - **Allowed Roots**: Only host paths within configured roots can be shared
+//! - **Path Traversal Protection**: Rejects paths containing ".."
+//! - **Write Control**: Read-only mounts block all write operations
+//!
+//! ## Mount String Format
+//! Mounts can be parsed from strings: `tag:host_path:guest_path:access:type`
+//! Example: `shared:/home/user/data:/mnt/data:ro:virtiofs`
+
 const std = @import("std");
 const path_util = @import("../util/path.zig");
 
@@ -304,7 +327,10 @@ pub fn formatMountConfig(allocator: std.mem.Allocator, config: *const MountConfi
     );
 }
 
-// Tests
+// =============================================================================
+// TESTS
+// =============================================================================
+
 test "mounts: MountAccess fromString/toString" {
     try std.testing.expectEqual(MountAccess.read_only, MountAccess.fromString("ro").?);
     try std.testing.expectEqual(MountAccess.read_only, MountAccess.fromString("read_only").?);

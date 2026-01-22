@@ -1,3 +1,35 @@
+//! Windows Job Object Sandbox
+//!
+//! This module implements process sandboxing using Windows Job Objects.
+//! Job Objects are a Windows kernel feature that groups processes and
+//! applies resource limits and restrictions to the group.
+//!
+//! ## How Job Objects Work
+//! A Job Object is created, configured with limits, then processes are
+//! assigned to it. Once assigned, the limits apply to all processes in
+//! the job. Key Win32 APIs used:
+//! - `CreateJobObjectW`: Create a new job object
+//! - `SetInformationJobObject`: Configure limits and restrictions
+//! - `AssignProcessToJobObject`: Add a process to the job
+//!
+//! ## Limit Types
+//! Extended Limits (JOBOBJECT_EXTENDED_LIMIT_INFORMATION):
+//! - `ActiveProcessLimit`: Max concurrent processes (default: 1)
+//! - `ProcessMemoryLimit`: Per-process memory cap
+//! - `JobMemoryLimit`: Total memory for all processes in job
+//! - `KillOnJobClose`: Terminate all processes when job handle closed
+//! - `DieOnUnhandledException`: Don't show error dialogs
+//!
+//! UI Restrictions (JOBOBJECT_BASIC_UI_RESTRICTIONS):
+//! - Desktop: Prevent creating/switching desktops
+//! - Clipboard: Block read/write clipboard access
+//! - GlobalAtoms: Prevent adding global atoms
+//! - Handles: Restrict USER handle inheritance
+//!
+//! ## Platform Support
+//! This module only functions on Windows. On other platforms, all
+//! functions are no-ops.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("../util/log.zig");
@@ -279,6 +311,10 @@ pub fn isJobObjectAvailable() bool {
     if (builtin.os.tag != .windows) return false;
     return true;
 }
+
+// =============================================================================
+// TESTS
+// =============================================================================
 
 test "sandbox_windows: JobLimits defaults" {
     const limits = JobLimits{};

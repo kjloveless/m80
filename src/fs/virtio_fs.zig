@@ -1,3 +1,35 @@
+//! VirtIO-FS Device Emulation
+//!
+//! This module implements a VirtIO filesystem device that uses the FUSE
+//! protocol to share host directories with the guest VM. The guest kernel
+//! sends FUSE requests, and this module handles them by performing
+//! corresponding operations on the host filesystem.
+//!
+//! ## FUSE Protocol Overview
+//! FUSE (Filesystem in Userspace) uses a request/response protocol:
+//! - Guest sends `FuseInHeader` + operation-specific payload
+//! - Host responds with `FuseOutHeader` + response data
+//! - Each request has a unique ID for matching responses
+//!
+//! ## Supported Operations
+//! - INIT: Protocol version negotiation
+//! - LOOKUP: Resolve file/directory by name
+//! - GETATTR: Get file attributes (stat)
+//! - OPEN/RELEASE: Open and close files
+//! - READ/WRITE: Read and write file data
+//! - OPENDIR/READDIR/RELEASEDIR: Directory listing
+//! - DESTROY: Cleanup on unmount
+//!
+//! ## Node and Handle Management
+//! - Nodes: Map inode numbers to host paths (allocated on LOOKUP)
+//! - Handles: Track open files/directories (allocated on OPEN/OPENDIR)
+//! - Node ID 1 is reserved for root in FUSE; we start at 2
+//!
+//! ## Security
+//! - Path traversal ("..") is rejected in LOOKUP
+//! - Mount permissions are checked via MountManager
+//! - Invalid handles return EBADF (-9)
+
 const std = @import("std");
 const mounts = @import("mounts.zig");
 const path_util = @import("../util/path.zig");
@@ -836,6 +868,10 @@ fn statToFuseAttr(nodeid: u64, stat: *const std.fs.File.Stat) FuseAttr {
         .padding = 0,
     };
 }
+
+// =============================================================================
+// TESTS
+// =============================================================================
 
 test "virtio_fs: FuseOpcode fromInt" {
     try std.testing.expectEqual(FuseOpcode.FUSE_INIT, FuseOpcode.fromInt(26));

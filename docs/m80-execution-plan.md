@@ -37,19 +37,22 @@
 - Serial IO (COM1) read/write handling + shared IoExit scaffolding across backends (done)
 - HVF backend selected and stubbed for macOS (done)
 - HVF vCPU + layout stubs wired (done)
+- HVF arm64 register setup + DTB builder + MMU preconfig + guest memory mapping (done)
 - POSIX backend stubs + vCPU/layout parity (done)
 - Platform-specific backend smoke tests added (done)
+- HVF/KVM IO exit decoding into IoExit (done)
+- Boot state computation + cmdline/stack prep + Windows register init wired (partial)
 
 **Remaining**
-- Implement register setup + real boot flow (entry point, cmdline, stack)
-- Decode real HVF/KVM exit structs into IoExit (current mapping is stubbed)
+- Wire real guest RAM mapping + vCPU create/run loop for HVF/KVM (beyond stubs)
+- Finalize kernel/initrd loading into HVF/KVM guest memory (Windows wired; HVF/KVM pending)
 - Verify deterministic start/stop on real WHP/HVF backends
 
 **Notes**
 - Current Phase 1 “done” items reflect scaffolding; full boot is still pending.
 
 ## Testing Notes (2026-01-19)
-- `zig build test`: 176 passed, 5 skipped, 0 failed.
+- `zig build test`: 198 passed, 6 skipped, 0 failed (re-verified).
 - Skips are OS/integration gated (HVF/POSIX/WHP integration).
 
 ---

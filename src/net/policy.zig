@@ -1,3 +1,27 @@
+//! Network Policy Engine
+//!
+//! This module implements network access control for VMs. It defines rules
+//! for which domains and IP addresses the guest can connect to, providing
+//! defense-in-depth even if the hypervisor is compromised.
+//!
+//! ## Network Modes
+//! - `locked_down`: No network access allowed (default, most secure)
+//! - `allowlist`: Only explicitly allowed domains/IPs can be accessed
+//! - `open`: Full network access (requires M80_ALLOW_OPEN_NETWORK env var)
+//!
+//! ## Domain Rules
+//! Domain rules support wildcards: `*.example.com` matches `sub.example.com`
+//! but not `example.com` itself. Rules can also specify port ranges.
+//!
+//! ## IP Rules (CIDR)
+//! IP rules use CIDR notation: `10.0.0.0/8` matches the entire 10.x.x.x range.
+//! A plain IP like `192.168.1.1` is treated as `/32` (single host).
+//!
+//! ## DNS Resolution Cache
+//! When a domain is resolved via DNS, the resulting IP is cached with TTL.
+//! This allows the allowlist to work even after DNS resolution, since the
+//! guest may connect directly to the IP after lookup.
+
 const std = @import("std");
 
 /// Network operation modes
@@ -140,6 +164,8 @@ pub const NetworkPolicy = struct {
     inspect_tls_sni: bool = false,
     /// Maximum TTL for DNS cache entries (caps server-provided TTL)
     max_dns_ttl_seconds: u32 = 300,
+    /// Maximum number of entries in DNS resolution cache (prevents memory exhaustion)
+    max_dns_cache_entries: usize = 1024,
 
     pub fn init(allocator: std.mem.Allocator) NetworkPolicy {
         return .{
@@ -261,11 +287,38 @@ pub const NetworkPolicy = struct {
         }
     }
 
-    /// Adds a resolved IP to the cache
-  pub fn addResolvedIp(self: *NetworkPolicy, domain: []const u8, ip: [4]u8, ttl: u32) !void {
-    // TTL is capped to avoid unbounded cache lifetimes.
-    const capped_ttl = @min(ttl, self.max_dns_ttl_seconds);
-    const expires_at = std.time.timestamp() + @as(i64, capped_ttl);
+    /// Adds a resolved IP to the cache.
+    /// Deduplicates entries with same domain+IP, evicts expired entries,
+    /// and enforces max_dns_cache_entries limit.
+    pub fn addResolvedIp(self: *NetworkPolicy, domain: []const u8, ip: [4]u8, ttl: u32) !void {
+        const capped_ttl = @min(ttl, self.max_dns_ttl_seconds);
+        const now = std.time.timestamp();
+        const expires_at = now + @as(i64, capped_ttl);
+
+        // Check for existing entry with same domain+IP and update expiry
+        for (self.resolved_ips.items) |*entry| {
+            if (std.mem.eql(u8, entry.domain, domain) and std.mem.eql(u8, &entry.address, &ip)) {
+                entry.expires_at = expires_at;
+                return;
+            }
+        }
+
+        // Evict expired entries before adding
+        self.cleanupExpiredEntries();
+
+        // If still at limit, evict the entry with earliest expiry
+        if (self.resolved_ips.items.len >= self.max_dns_cache_entries) {
+            var oldest_idx: usize = 0;
+            var oldest_expires: i64 = std.math.maxInt(i64);
+            for (self.resolved_ips.items, 0..) |entry, i| {
+                if (entry.expires_at < oldest_expires) {
+                    oldest_expires = entry.expires_at;
+                    oldest_idx = i;
+                }
+            }
+            self.allocator.free(self.resolved_ips.items[oldest_idx].domain);
+            _ = self.resolved_ips.swapRemove(oldest_idx);
+        }
 
         const owned_domain = try self.allocator.dupe(u8, domain);
         try self.resolved_ips.append(self.allocator, .{
@@ -368,7 +421,10 @@ pub fn parseCidr(cidr_str: []const u8) ?IpRule {
     return IpRule{ .address = ip, .prefix_len = prefix_len };
 }
 
-// Tests
+// =============================================================================
+// TESTS
+// =============================================================================
+
 test "policy: NetworkMode fromString/toString" {
     try std.testing.expectEqual(NetworkMode.locked_down, NetworkMode.fromString("locked_down").?);
     try std.testing.expectEqual(NetworkMode.allowlist, NetworkMode.fromString("allowlist").?);
@@ -621,4 +677,35 @@ test "policy: locked_down denies domain and ip" {
 
     try std.testing.expect(!policy.isDomainAllowed("example.com"));
     try std.testing.expect(!policy.isIpAllowed([4]u8{ 1, 2, 3, 4 }));
+}
+
+test "policy: addResolvedIp deduplicates same domain and ip" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+
+    try policy.addResolvedIp("example.com", [4]u8{ 1, 2, 3, 4 }, 60);
+    try policy.addResolvedIp("example.com", [4]u8{ 1, 2, 3, 4 }, 120);
+
+    // Should still be only 1 entry, not 2
+    try std.testing.expectEqual(@as(usize, 1), policy.resolved_ips.items.len);
+}
+
+test "policy: addResolvedIp enforces cache limit" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+    policy.max_dns_cache_entries = 3;
+
+    try policy.addResolvedIp("a.com", [4]u8{ 1, 0, 0, 1 }, 60);
+    try policy.addResolvedIp("b.com", [4]u8{ 2, 0, 0, 2 }, 60);
+    try policy.addResolvedIp("c.com", [4]u8{ 3, 0, 0, 3 }, 60);
+
+    try std.testing.expectEqual(@as(usize, 3), policy.resolved_ips.items.len);
+
+    // Adding a 4th should evict one
+    try policy.addResolvedIp("d.com", [4]u8{ 4, 0, 0, 4 }, 60);
+    try std.testing.expectEqual(@as(usize, 3), policy.resolved_ips.items.len);
 }

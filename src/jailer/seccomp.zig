@@ -1,3 +1,28 @@
+//! Seccomp (Secure Computing) Module
+//!
+//! This module implements syscall filtering using Linux's seccomp-bpf.
+//! It restricts which syscalls the VM process can make, reducing the
+//! attack surface if the guest escapes the hypervisor.
+//!
+//! ## How Seccomp Works
+//! Seccomp uses BPF (Berkeley Packet Filter) programs to filter syscalls:
+//! 1. Process installs a BPF filter via seccomp()
+//! 2. On each syscall, the kernel runs the BPF program
+//! 3. BPF returns an action: ALLOW, ERRNO, KILL, etc.
+//!
+//! ## VMM Allowlist
+//! The vmm_allowlist contains only syscalls needed for VM operation:
+//! - Memory: mmap, munmap, mprotect, brk
+//! - I/O: read, write, close, ioctl
+//! - Events: epoll_*, eventfd2, timerfd_*
+//! - Misc: futex, clock_gettime, exit, exit_group
+//!
+//! This is a MINIMAL set - anything not in the list is blocked.
+//!
+//! ## Linux-Only
+//! Seccomp is a Linux-specific feature. On other platforms, these
+//! functions are no-ops.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("../util/log.zig");
@@ -194,6 +219,10 @@ pub fn isSeccompAvailable() bool {
     const result = std.os.linux.prctl(@enumFromInt(PR_GET_SECCOMP), .{ 0, 0, 0, 0 });
     return @as(isize, @bitCast(result)) >= 0;
 }
+
+// =============================================================================
+// TESTS
+// =============================================================================
 
 test "seccomp: BpfInstruction creation" {
     const load = BpfInstruction.loadSyscallNr();

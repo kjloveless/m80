@@ -1,3 +1,30 @@
+//! Pure Zig DNS Resolver
+//!
+//! This module implements DNS resolution without using libc, giving full
+//! control over DNS queries and allowing policy enforcement at the DNS level.
+//!
+//! ## DNS Protocol Overview
+//! DNS uses a simple request/response protocol over UDP (port 53):
+//! 1. Client builds a query with header + question section
+//! 2. Server responds with header + question + answer sections
+//! 3. Answers contain resource records (A, AAAA, CNAME, etc.)
+//!
+//! ## Wire Format
+//! - `DnsHeader`: 12-byte fixed header with ID, flags, and section counts
+//! - QNAME: Domain name as length-prefixed labels (e.g., \x07example\x03com\x00)
+//! - Compression: Names can use pointers (0xC0xx) to avoid repetition
+//!
+//! ## Policy Integration
+//! The resolver integrates with NetworkPolicy to:
+//! - Block DNS queries for disallowed domains (before any network traffic)
+//! - Cache resolved IPs into the policy for subsequent connection checks
+//!
+//! ## Limitations
+//! This is a minimal implementation:
+//! - Only A records (IPv4) are parsed
+//! - No EDNS support (512-byte limit)
+//! - No TCP fallback for truncated responses
+
 const std = @import("std");
 const builtin = @import("builtin");
 const policy = @import("policy.zig");
@@ -301,6 +328,10 @@ pub fn resolveWithPolicy(
         net_policy.addResolvedIp(domain, record.ip, record.ttl) catch continue;
     }
 }
+
+// =============================================================================
+// TESTS
+// =============================================================================
 
 test "dns: DnsHeader init" {
     const header = DnsHeader.init(0x1234);
