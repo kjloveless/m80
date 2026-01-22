@@ -57,6 +57,9 @@ pub const DtbConfig = struct {
     virtio_console_base: ?u64 = null,
     virtio_console_size: u64 = 0x1000,
     virtio_console_irq: ?u32 = null,
+    virtio_rng_base: ?u64 = null,
+    virtio_rng_size: u64 = 0x1000,
+    virtio_rng_irq: ?u32 = null,
 };
 
 pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
@@ -142,10 +145,11 @@ pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
     try endNode(allocator, &struct_buf);
 
     try beginNode(allocator, &struct_buf, "pl011@9000000");
-    try propString(allocator, &struct_buf, &strings, "compatible", "arm,pl011");
+    try propStrings(allocator, &struct_buf, &strings, "compatible", &.{ "arm,pl011", "arm,primecell" });
     try propReg64(allocator, &struct_buf, &strings, "reg", 0x09000000, 0x1000);
     try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.uart_irq, 4);
     try propU32(allocator, &struct_buf, &strings, "clock-frequency", 24_000_000);
+    try propString(allocator, &struct_buf, &strings, "status", "okay");
     try endNode(allocator, &struct_buf);
 
     if (cfg.virtio_blk_base != null and cfg.virtio_blk_irq != null) {
@@ -175,6 +179,15 @@ pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
         try propString(allocator, &struct_buf, &strings, "compatible", "virtio,mmio");
         try propReg64(allocator, &struct_buf, &strings, "reg", cfg.virtio_console_base.?, cfg.virtio_console_size);
         try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_console_irq.?, 4);
+        try endNode(allocator, &struct_buf);
+    }
+    if (cfg.virtio_rng_base != null and cfg.virtio_rng_irq != null) {
+        var node_name_buf: [64]u8 = undefined;
+        const node_name = try std.fmt.bufPrint(&node_name_buf, "virtio_rng@{x}", .{cfg.virtio_rng_base.?});
+        try beginNode(allocator, &struct_buf, node_name);
+        try propString(allocator, &struct_buf, &strings, "compatible", "virtio,mmio");
+        try propReg64(allocator, &struct_buf, &strings, "reg", cfg.virtio_rng_base.?, cfg.virtio_rng_size);
+        try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_rng_irq.?, 4);
         try endNode(allocator, &struct_buf);
     }
 
@@ -299,6 +312,20 @@ fn propU32x3(
     writeBeU32(tmp[0..4], v0);
     writeBeU32(tmp[4..8], v1);
     writeBeU32(tmp[8..12], v2);
+    try propRaw(allocator, buf, strings, name, &tmp);
+}
+
+fn propU32x2(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    strings: *std.ArrayList(u8),
+    name: []const u8,
+    v0: u32,
+    v1: u32,
+) !void {
+    var tmp: [8]u8 = undefined;
+    writeBeU32(tmp[0..4], v0);
+    writeBeU32(tmp[4..8], v1);
     try propRaw(allocator, buf, strings, name, &tmp);
 }
 

@@ -6,7 +6,7 @@
 //! ## Supported Commands
 //! - `init <name>`: Create a new VM with the given name (creates directory and default config)
 //! - `start <name>`: Start an existing VM (loads config, sets up jailer, launches hypervisor)
-//! - `start-deb`: Start the Debian NoCloud dev VM (auto-configures "deb" if missing)
+//! - `console <name>`: Attach to a running VM console (raw TTY, Unix socket)
 //! - `stop <name>`: Stop a running VM
 //! - `delete <name>`: Remove a VM and its associated files
 //! - `ps`: List all VMs and their current status (running/stopped)
@@ -35,9 +35,70 @@ const core = @import("core.zig");
 const errors = core.errors;
 const state = core.state;
 const log = @import("util/log.zig");
+const c = if (builtin.os.tag == .windows)
+    struct {}
+else
+    @cImport({
+        @cInclude("termios.h");
+    });
 
 const Vm = @import("vm/vm.zig").Vm;
 const Jailer = @import("jailer/jailer.zig").Jailer;
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+const RawTty = struct {
+    fd: std.posix.fd_t,
+    prev: std.posix.termios,
+};
+
+fn enableRawStdin() ?RawTty {
+    if (builtin.os.tag == .windows) return null;
+    const fd = std.fs.File.stdin().handle;
+    if (!std.posix.isatty(fd)) return null;
+    const prev = std.posix.tcgetattr(fd) catch return null;
+    var raw = prev;
+    raw.iflag.IGNBRK = false;
+    raw.iflag.BRKINT = false;
+    raw.iflag.PARMRK = false;
+    raw.iflag.ISTRIP = false;
+    raw.iflag.INLCR = false;
+    raw.iflag.IGNCR = false;
+    raw.iflag.ICRNL = false;
+    raw.iflag.IXON = false;
+    if (@hasField(@TypeOf(raw.iflag), "IXOFF")) raw.iflag.IXOFF = false;
+    if (@hasField(@TypeOf(raw.iflag), "IXANY")) raw.iflag.IXANY = false;
+
+    raw.oflag.OPOST = false;
+    if (@hasField(@TypeOf(raw.oflag), "ONLCR")) raw.oflag.ONLCR = false;
+
+    raw.lflag.ECHO = false;
+    raw.lflag.ECHONL = false;
+    raw.lflag.ICANON = false;
+    raw.lflag.ISIG = false;
+    raw.lflag.IEXTEN = false;
+
+    raw.cflag.CREAD = true;
+    raw.cflag.CSIZE = .CS8;
+    raw.cc[@intCast(c.VMIN)] = 1;
+    raw.cc[@intCast(c.VTIME)] = 0;
+    std.posix.tcsetattr(fd, .FLUSH, raw) catch return null;
+    return .{ .fd = fd, .prev = prev };
+}
+
+fn restoreRawStdin(raw: RawTty) void {
+    std.posix.tcsetattr(raw.fd, .FLUSH, raw.prev) catch {};
+}
+
+fn setEnvFlag(allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+    if (builtin.os.tag == .windows) return;
+    const name_z = try allocator.dupeZ(u8, name);
+    defer allocator.free(name_z);
+    const value_z = try allocator.dupeZ(u8, value);
+    defer allocator.free(value_z);
+    _ = setenv(name_z, value_z, 1);
+}
 
 /// Writes the help text to the provided writer.
 /// This is separated from printHelp() so tests can capture the output.
@@ -52,7 +113,7 @@ pub fn writeHelp(writer: anytype) !void {
         \\usage:
         \\  m80 init <name>
         \\  m80 start <name>
-        \\  m80 start-deb
+        \\  m80 console <name>
         \\  m80 stop <name>
         \\  m80 delete <name>
         \\  m80 ps
@@ -93,6 +154,53 @@ fn fileSizeIfExists(path_opt: ?[]const u8) ?u64 {
         return stat.size;
     } else |_| {
         return null;
+    }
+}
+
+fn vmConsoleSocketPath(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const dir_path = try core.paths.vmDir(allocator, name);
+    defer allocator.free(dir_path);
+    return try std.fs.path.join(allocator, &[_][]const u8{ dir_path, "console.sock" });
+}
+
+fn readVmPid(vm_dir: std.fs.Dir) ?i32 {
+    var file = vm_dir.openFile("pid", .{}) catch return null;
+    defer file.close();
+    var buf: [32]u8 = undefined;
+    const n = file.readAll(&buf) catch return null;
+    const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(i32, trimmed, 10) catch null;
+}
+
+fn writeVmPid(vm_dir: std.fs.Dir, pid: i32) !void {
+    var file = try vm_dir.createFile("pid", .{ .truncate = true });
+    defer file.close();
+    var buf: [32]u8 = undefined;
+    const pid_str = try std.fmt.bufPrint(&buf, "{d}\n", .{pid});
+    try file.writeAll(pid_str);
+}
+
+fn clearVmPid(vm_dir: std.fs.Dir) void {
+    vm_dir.deleteFile("pid") catch {};
+}
+
+fn isPidAlive(pid: i32) bool {
+    if (builtin.os.tag == .windows) return false;
+    if (pid <= 0) return false;
+    std.posix.kill(pid, 0) catch |e| switch (e) {
+        error.ProcessNotFound => return false,
+        else => return true,
+    };
+    return true;
+}
+
+fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = try std.posix.write(fd, bytes[offset..]);
+        if (written == 0) return error.BrokenPipe;
+        offset += written;
     }
 }
 
@@ -226,41 +334,73 @@ fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
 
     const cwd_path = try cwd.realpathAlloc(allocator, ".");
     defer allocator.free(cwd_path);
-    const kernel_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "debian-trixie-arm64-linux" });
+    const kernel_path = try std.fs.path.join(
+        allocator,
+        &[_][]const u8{ cwd_path, "images", "fc-ubuntu-5.10-with-rng-vmlinux.bin" },
+    );
     defer allocator.free(kernel_path);
-    const initrd_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "debian-trixie-arm64-initrd.gz" });
-    defer allocator.free(initrd_path);
     const disk_path = try std.fs.path.join(
         allocator,
-        &[_][]const u8{ cwd_path, "images", "debian-12-nocloud-arm64-20250316-2053.raw" },
+        &[_][]const u8{ cwd_path, "images", "debian-12-nocloud-arm64-rootfs.ext4" },
     );
     defer allocator.free(disk_path);
     const seed_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "debian-nocloud-seed.iso" });
     defer allocator.free(seed_path);
 
+    if (cfg_mut.kernel_path) |path| {
+        if (!std.mem.eql(u8, path, kernel_path)) {
+            allocator.free(path);
+            cfg_mut.kernel_path = null;
+        }
+    }
     if (cfg_mut.kernel_path == null) {
         cfg_mut.kernel_path = try allocator.dupe(u8, kernel_path);
     }
-    if (cfg_mut.initrd_path == null) {
-        cfg_mut.initrd_path = try allocator.dupe(u8, initrd_path);
+    if (cfg_mut.disk_path) |path| {
+        if (!std.mem.eql(u8, path, disk_path)) {
+            allocator.free(path);
+            cfg_mut.disk_path = null;
+        }
     }
     if (cfg_mut.disk_path == null) {
         cfg_mut.disk_path = try allocator.dupe(u8, disk_path);
     }
+    cfg_mut.disk_readonly = false;
     if (cfg_mut.seed_path == null) {
         cfg_mut.seed_path = try allocator.dupe(u8, seed_path);
+    }
+    if (cfg_mut.initrd_path) |path| {
+        allocator.free(path);
+        cfg_mut.initrd_path = null;
+    }
+    if (cfg_mut.kernel_cmdline != null) {
+        const cmdline = cfg_mut.kernel_cmdline.?;
+        const has_vda1 = std.mem.indexOf(u8, cmdline, "root=/dev/vda1") != null;
+        const missing_root = std.mem.indexOf(u8, cmdline, "root=/dev/vda") == null or has_vda1;
+        const missing_bootcon = std.mem.indexOf(u8, cmdline, "keep_bootcon") == null;
+        const missing_devtmpfs = std.mem.indexOf(u8, cmdline, "devtmpfs.mount=1") == null;
+        const missing_hvc0 = std.mem.indexOf(u8, cmdline, "console=hvc0") == null;
+        const missing_mask = std.mem.indexOf(u8, cmdline, "systemd.mask=boot-efi.mount") == null;
+        const has_show_status_yes = std.mem.indexOf(u8, cmdline, "systemd.show_status=yes") != null;
+        const has_random_seed_mask = std.mem.indexOf(u8, cmdline, "systemd.mask=systemd-random-seed.service") != null;
+        const has_resolved_mask = std.mem.indexOf(u8, cmdline, "systemd.mask=systemd-resolved.service") != null;
+        const has_ttyama = std.mem.indexOf(u8, cmdline, "console=ttyAMA0") != null;
+        if (missing_root or missing_bootcon or missing_devtmpfs or missing_hvc0 or missing_mask or has_show_status_yes or has_random_seed_mask or has_resolved_mask or has_ttyama) {
+            allocator.free(cfg_mut.kernel_cmdline.?);
+            cfg_mut.kernel_cmdline = null;
+        }
     }
     if (cfg_mut.kernel_cmdline == null) {
         cfg_mut.kernel_cmdline = try allocator.dupe(
             u8,
-            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=3 systemd.show_status=no systemd.log_level=warning fsck.mode=skip fsck.repair=no",
+            "earlycon=pl011,0x09000000 keep_bootcon console=hvc0 root=/dev/vda rootwait rootfstype=ext4 rw devtmpfs.mount=1 systemd.mask=boot-efi.mount systemd.mask=systemd-boot-update.service loglevel=7 systemd.show_status=no systemd.log_level=info fsck.mode=skip fsck.repair=no",
         );
     }
 
     try core.config.writeConfigFile(vm_dir, cfg_mut);
 }
 
-fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bool) !void {
+fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bool, attach: bool) !void {
     if (ensure_deb) {
         try ensureDebVmConfig(allocator);
     }
@@ -278,6 +418,14 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     var cwd = std.fs.cwd();
     var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
     defer vm_dir.close();
+
+    const st = core.state.getStatus(vm_dir) catch .stopped;
+    if (st == .running) {
+        errors.die(
+            "vm already running: {s}\nuse `m80 stop {s}` to stop it",
+            .{ name, name },
+        );
+    }
 
     const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| {
         errors.die("invalid config: {s}", .{@errorName(e)});
@@ -305,6 +453,11 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
         error.NotFound => errors.die("vm not found: {s}\n", .{name}),
         else => return e,
     };
+    if (!attach) {
+        std.debug.print("vm started: {s}\n", .{name});
+        return;
+    }
+
     installSignalHandlers() catch |e| {
         errors.die("start failed: {s}", .{@errorName(e)});
     };
@@ -425,11 +578,6 @@ pub fn main() !void {
         return;
     }
 
-    if (std.mem.eql(u8, cmd, "start-deb")) {
-        try startVmCommand(allocator, "deb", true);
-        return;
-    }
-
     // ===== COMMANDS REQUIRING A VM NAME =====
     // All remaining commands (init, start, stop, delete, inspect) require a VM name.
     if (args.len < 3) {
@@ -471,15 +619,150 @@ pub fn main() !void {
     }
 
     // ===== START COMMAND =====
-    // Starts a VM with the following steps:
-    // 1. Initialize the Jailer (security sandbox) and drop privileges
-    // 2. Initialize the VM with platform-specific hypervisor backend
-    // 3. Load and validate the configuration from m80.conf
-    // 4. Resolve relative paths (kernel, initrd) to absolute paths
-    // 5. Launch the VM via the hypervisor
-    // 6. Update status file to "running"
+    // Starts a VM in the background by spawning `m80 run <name>`.
     if (std.mem.eql(u8, cmd, "start")) {
-        try startVmCommand(allocator, name, false);
+        const ensure = std.mem.eql(u8, name, "deb");
+        if (ensure) {
+            try ensureDebVmConfig(allocator);
+        }
+
+        const dir_path = try core.paths.vmDir(allocator, name);
+        defer allocator.free(dir_path);
+
+        var cwd = std.fs.cwd();
+        var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+        defer vm_dir.close();
+
+        if (readVmPid(vm_dir)) |pid| {
+            if (isPidAlive(pid)) {
+                errors.die("vm already running: {s}", .{name});
+            }
+            clearVmPid(vm_dir);
+            state.setStatus(allocator, name, .stopped) catch {};
+        }
+
+        const socket_path = try vmConsoleSocketPath(allocator, name);
+        defer allocator.free(socket_path);
+        std.fs.cwd().deleteFile(socket_path) catch {};
+
+        const exe_path = try std.fs.selfExePathAlloc(allocator);
+        defer allocator.free(exe_path);
+
+        var argv = [_][]const u8{ exe_path, "run", name };
+        var child = std.process.Child.init(&argv, allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        if (builtin.os.tag != .windows) {
+            child.pgid = 0;
+        }
+
+        var env_map = try std.process.getEnvMap(allocator);
+        defer env_map.deinit();
+        try env_map.put("M80_CONSOLE_SOCKET", socket_path);
+        try env_map.put("M80_VIRTIO_CONSOLE", "1");
+        child.env_map = &env_map;
+
+        try child.spawn();
+        if (builtin.os.tag != .windows) {
+            try writeVmPid(vm_dir, @intCast(child.id));
+        }
+
+        var started = false;
+        var i: usize = 0;
+        while (i < 20) : (i += 1) {
+            const st = core.state.getStatus(vm_dir) catch .stopped;
+            if (st == .running) {
+                started = true;
+                break;
+            }
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+        if (started) {
+            std.debug.print("vm started: {s}\n", .{name});
+        } else {
+            std.debug.print("vm starting: {s}\n", .{name});
+        }
+        return;
+    }
+
+    // ===== RUN COMMAND (internal) =====
+    // Runs the VM in the foreground; used by `start` to detach.
+    if (std.mem.eql(u8, cmd, "run")) {
+        const ensure = std.mem.eql(u8, name, "deb");
+        if (std.process.getEnvVarOwned(allocator, "M80_CONSOLE_SOCKET") catch null == null) {
+            const socket_path = try vmConsoleSocketPath(allocator, name);
+            defer allocator.free(socket_path);
+            setEnvFlag(allocator, "M80_CONSOLE_SOCKET", socket_path) catch {};
+        }
+        try startVmCommand(allocator, name, ensure, true);
+        return;
+    }
+
+    // ===== CONSOLE COMMAND =====
+    // Attaches to a running VM's console via Unix socket.
+    if (std.mem.eql(u8, cmd, "console")) {
+        var cwd = std.fs.cwd();
+        const dir_path = try core.paths.vmDir(allocator, name);
+        defer allocator.free(dir_path);
+        var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+        defer vm_dir.close();
+
+        if (readVmPid(vm_dir)) |pid| {
+            if (!isPidAlive(pid)) {
+                clearVmPid(vm_dir);
+                state.setStatus(allocator, name, .stopped) catch {};
+                errors.die("vm not running: {s}\nrun `m80 start {s}` first", .{ name, name });
+            }
+        } else {
+            errors.die("vm not running: {s}\nrun `m80 start {s}` first", .{ name, name });
+        }
+
+        const socket_path = try vmConsoleSocketPath(allocator, name);
+        defer allocator.free(socket_path);
+
+        const raw = enableRawStdin();
+        defer if (raw) |tty_state| restoreRawStdin(tty_state);
+
+        var stream = std.net.connectUnixSocket(socket_path) catch |e| {
+            errors.die("console connect failed: {s}\ncheck that the VM is running and console.sock exists", .{@errorName(e)});
+        };
+        defer stream.close();
+
+        const socket_fd = stream.handle;
+        const stdin_fd = std.fs.File.stdin().handle;
+        const stdout_fd = std.fs.File.stdout().handle;
+        var buf: [1024]u8 = undefined;
+        var detached = false;
+        while (true) {
+            var fds = [_]std.posix.pollfd{
+                .{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = socket_fd, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const ready = std.posix.poll(fds[0..], -1) catch break;
+            if (ready <= 0) continue;
+            if ((fds[0].revents & std.posix.POLL.IN) != 0) {
+                const n = std.posix.read(stdin_fd, &buf) catch break;
+                if (n <= 0) break;
+                const chunk = buf[0..@intCast(n)];
+                if (std.mem.indexOfScalar(u8, chunk, 0x04)) |eof_index| {
+                    if (eof_index > 0) {
+                        writeAllFd(socket_fd, chunk[0..eof_index]) catch break;
+                    }
+                    detached = true;
+                    break;
+                }
+                writeAllFd(socket_fd, chunk) catch break;
+            }
+            if ((fds[1].revents & std.posix.POLL.IN) != 0) {
+                const n = std.posix.read(socket_fd, &buf) catch break;
+                if (n <= 0) break;
+                writeAllFd(stdout_fd, buf[0..@intCast(n)]) catch break;
+            }
+        }
+        if (detached) {
+            std.debug.print("(detached from console)\n", .{});
+        }
         return;
     }
 
@@ -487,19 +770,43 @@ pub fn main() !void {
     // Stops a running VM by signaling the hypervisor to terminate.
     // Updates the status file to "stopped" after successful shutdown.
     if (std.mem.eql(u8, cmd, "stop")) {
-        // Initialize Jailer and VM (needed to access hypervisor APIs)
-        var jailer = try Jailer.init(allocator);
-        defer jailer.deinit();
+        const dir_path = try core.paths.vmDir(allocator, name);
+        defer allocator.free(dir_path);
 
-        var vm = try Vm.init(allocator, &jailer);
-        defer vm.deinit();
+        var cwd = std.fs.cwd();
+        var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+        defer vm_dir.close();
 
-        // Send stop signal to the hypervisor
-        vm.stop() catch |e| {
-            errors.die("stop failed: {s}", .{@errorName(e)});
-        };
+        if (readVmPid(vm_dir)) |pid| {
+            if (builtin.os.tag != .windows) {
+                std.posix.kill(pid, std.posix.SIG.TERM) catch |e| switch (e) {
+                    error.ProcessNotFound => {},
+                    else => errors.die("stop failed: {s}", .{@errorName(e)}),
+                };
 
-        // Update status file to reflect stopped state
+                var i: usize = 0;
+                while (i < 50) : (i += 1) {
+                    if (!isPidAlive(pid)) break;
+                    std.Thread.sleep(100 * std.time.ns_per_ms);
+                }
+                if (isPidAlive(pid)) {
+                    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                }
+            }
+            clearVmPid(vm_dir);
+        } else {
+            // Fallback to in-process stop (legacy behavior).
+            var jailer = try Jailer.init(allocator);
+            defer jailer.deinit();
+
+            var vm = try Vm.init(allocator, &jailer);
+            defer vm.deinit();
+
+            vm.stop() catch |e| {
+                errors.die("stop failed: {s}", .{@errorName(e)});
+            };
+        }
+
         state.setStatus(allocator, name, .stopped) catch |e| switch (e) {
             error.InvalidArgs => errors.die("invalid vm name: {s}", .{name}),
             error.NotFound => errors.die("vm not found: {s}", .{name}),

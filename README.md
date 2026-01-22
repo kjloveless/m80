@@ -86,7 +86,7 @@ Common keys:
 Example (arm64 + initramfs):
 
 ```
-kernel_path=images/linux
+kernel_path=images/fc-ubuntu-5.10-with-rng-vmlinux.bin
 initrd_path=images/initrd.gz
 kernel_cmdline=console=ttyAMA0,115200
 ```
@@ -94,8 +94,8 @@ kernel_cmdline=console=ttyAMA0,115200
 Example (arm64 + rootfs + NoCloud seed):
 
 ```
-kernel_path=images/linux
-disk_path=images/debian-12-nocloud-arm64.raw
+kernel_path=images/fc-ubuntu-5.10-with-rng-vmlinux.bin
+disk_path=images/debian-12-nocloud-arm64-rootfs.ext4
 seed_path=images/debian-nocloud-seed.iso
 kernel_cmdline=earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw
 ```
@@ -103,8 +103,17 @@ kernel_cmdline=earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/
 Shortcut (Debian NoCloud dev VM):
 
 ```
-m80 start-deb
+m80 start deb
 ```
+
+Interactive console (raw TTY, virtio console enabled):
+
+```
+m80 console deb
+```
+
+Note: `start` runs the VM in the background. `console` attaches to the running VM.
+If the VM isn't running, start it first.
 
 ## HVF arm64 Boot Smoke Test
 
@@ -156,7 +165,7 @@ The login integration test boots the Firecracker kernel + rootfs from `images/`
 and feeds the hvc0 console with `M80_SERIAL_IN` data.
 
 Required env vars:
-- `M80_TEST_KERNEL`: Firecracker kernel (`images/fc-aarch64-vmlinux.bin`)
+- `M80_TEST_KERNEL`: Firecracker kernel with virtio-rng (`images/fc-ubuntu-5.10-with-rng-vmlinux.bin`)
 - `M80_TEST_DISK`: Firecracker rootfs (`images/fc-aarch64-rootfs.ext4`)
 - `M80_TEST_LOGIN_INPUT`: bytes to send (e.g., `root\nroot\n`)
 - `M80_TEST_LOGIN_EXPECT`: substring expected in output (e.g., `root@`)
@@ -164,7 +173,7 @@ Required env vars:
 Example:
 
 ```
-M80_TEST_KERNEL=images/fc-aarch64-vmlinux.bin \
+M80_TEST_KERNEL=images/fc-ubuntu-5.10-with-rng-vmlinux.bin \
 M80_TEST_DISK=images/fc-aarch64-rootfs.ext4 \
 M80_TEST_LOGIN_INPUT=$'root\nroot\n' \
 M80_TEST_LOGIN_EXPECT="root@" \

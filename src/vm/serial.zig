@@ -21,6 +21,101 @@
 //! This is useful for testing automated interactions.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+const console_backlog_limit: usize = 64 * 1024;
+var console_fd: ?std.posix.fd_t = null;
+var console_mutex: std.Thread.Mutex = .{};
+var console_backlog: std.ArrayListUnmanaged(u8) = .{};
+
+fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
+  var offset: usize = 0;
+  while (offset < bytes.len) {
+    const written = try std.posix.write(fd, bytes[offset..]);
+    if (written == 0) return error.BrokenPipe;
+    offset += written;
+  }
+}
+
+pub fn setConsoleFd(fd: std.posix.fd_t) void {
+  console_mutex.lock();
+  defer console_mutex.unlock();
+  console_fd = fd;
+}
+
+pub fn clearConsoleFd() void {
+  console_mutex.lock();
+  defer console_mutex.unlock();
+  console_fd = null;
+}
+
+pub fn clearConsoleBacklog() void {
+  console_mutex.lock();
+  defer console_mutex.unlock();
+  console_backlog.deinit(std.heap.page_allocator);
+  console_backlog = .{};
+}
+
+fn appendConsoleBacklog(bytes: []const u8) void {
+  if (bytes.len == 0) return;
+  console_mutex.lock();
+  defer console_mutex.unlock();
+  console_backlog.appendSlice(std.heap.page_allocator, bytes) catch return;
+  if (console_backlog.items.len > console_backlog_limit) {
+    const start = console_backlog.items.len - console_backlog_limit;
+    const remaining = console_backlog.items[start..];
+    std.mem.copyForwards(u8, console_backlog.items[0..remaining.len], remaining);
+    console_backlog.items.len = remaining.len;
+  }
+}
+
+pub fn writeConsoleBacklog(fd: std.posix.fd_t) !void {
+  console_mutex.lock();
+  defer console_mutex.unlock();
+  if (console_backlog.items.len == 0) return;
+  var out: [1024]u8 = undefined;
+  var out_len: usize = 0;
+  var i: usize = 0;
+  while (i < console_backlog.items.len) : (i += 1) {
+    const b = console_backlog.items[i];
+    if (b == '\r' and (i + 1 >= console_backlog.items.len or console_backlog.items[i + 1] != '\n')) {
+      if (out_len + 2 > out.len) {
+        try writeAllFd(fd, out[0..out_len]);
+        out_len = 0;
+      }
+      out[out_len] = '\r';
+      out[out_len + 1] = '\n';
+      out_len += 2;
+      continue;
+    }
+    if (out_len + 1 > out.len) {
+      try writeAllFd(fd, out[0..out_len]);
+      out_len = 0;
+    }
+    out[out_len] = b;
+    out_len += 1;
+  }
+  if (out_len > 0) {
+    try writeAllFd(fd, out[0..out_len]);
+  }
+}
+
+fn writeToConsole(size: usize, rax: u64) bool {
+  console_mutex.lock();
+  defer console_mutex.unlock();
+  const fd = console_fd orelse return false;
+  var bytes: [8]u8 = undefined;
+  std.mem.writeInt(u64, &bytes, rax, .little);
+  const chunk = bytes[0..size];
+  writeAllFd(fd, chunk) catch |e| switch (e) {
+    error.BrokenPipe, error.ConnectionResetByPeer => {
+      console_fd = null;
+      return false;
+    },
+    else => return false,
+  };
+  return true;
+}
 
 /// Serial port emulation state.
 /// Handles reads/writes to COM1 ports (0x3F8-0x3FF).
@@ -100,11 +195,18 @@ pub const SerialIo = struct {
   /// Writes serial output to the host's stdout.
   /// Called when guest writes to port 0x3F8 (COM1 data register).
   pub fn writeToStdout(size: usize, rax: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, rax, .little);
+    appendConsoleBacklog(bytes[0..size]);
+
+    const wrote_console = writeToConsole(size, rax);
     var buf: [256]u8 = undefined;
-    var fw = std.fs.File.stdout().writer(&buf);
-    const w = &fw.interface;
-    writeFromRax(w, size, rax) catch return;
-    w.flush() catch {};
+    if (!wrote_console) {
+      var fw = std.fs.File.stdout().writer(&buf);
+      const w = &fw.interface;
+      writeFromRax(w, size, rax) catch return;
+      w.flush() catch {};
+    }
     writeToCaptureFile(size, rax);
   }
 
@@ -257,6 +359,24 @@ test "serial: readPort reflects data ready" {
 
   const lsr_empty = serial.readPort(0x3FD, 1);
   try std.testing.expect((lsr_empty & 0x01) == 0);
+}
+
+test "serial: writeToStdout prefers console fd" {
+  if (builtin.os.tag == .windows) return error.SkipZigTest;
+  const fds = try std.posix.pipe();
+  defer {
+    std.posix.close(fds[0]);
+    std.posix.close(fds[1]);
+    clearConsoleFd();
+  }
+
+  setConsoleFd(fds[1]);
+  SerialIo.writeToStdout(3, 0x00636261); // "abc"
+
+  var buf: [8]u8 = undefined;
+  const n = try std.posix.read(fds[0], &buf);
+  try std.testing.expectEqual(@as(usize, 3), n);
+  try std.testing.expectEqualStrings("abc", buf[0..3]);
 }
 
 test "serial: readPort masks to width" {

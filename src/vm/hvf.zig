@@ -106,6 +106,9 @@ const virtio_blk_queue_max: u16 = 128;
 const virtio_console_mmio_base: u64 = 0x0a001000;
 const virtio_console_mmio_size: u64 = 0x1000;
 const virtio_console_queue_max: u16 = 128;
+const virtio_rng_mmio_base: u64 = 0x0a003000;
+const virtio_rng_mmio_size: u64 = 0x1000;
+const virtio_rng_queue_max: u16 = 128;
 
 fn virtioBlkMmioBase(index: usize) u64 {
     return virtio_blk_mmio_bases[index];
@@ -908,6 +911,9 @@ var simulate_io = std.atomic.Value(bool).init(false);
 var serial_io = SerialIo{};
 var serial_input_thread: ?std.Thread = null;
 var serial_input_running = std.atomic.Value(bool).init(false);
+var console_socket_thread: ?std.Thread = null;
+var console_socket_running = std.atomic.Value(bool).init(false);
+var console_socket_path: ?[]u8 = null;
 
 const VirtioConsoleInput = struct {
     buf: std.ArrayListUnmanaged(u8) = .{},
@@ -921,8 +927,10 @@ var gic_enabled = false;
 var gic_uart_intid: ?u32 = null;
 var gic_virtio_blk_intid: [virtio_blk_device_count]?u32 = .{ null, null };
 var gic_virtio_console_intid: ?u32 = null;
+var gic_virtio_rng_intid: ?u32 = null;
 var virtio_blk_irq_level: [virtio_blk_device_count]bool = .{ false, false };
 var virtio_console_irq_level = false;
+var virtio_rng_irq_level = false;
 
 const VirtioBlkQueue = struct {
     num: u16 = 0,
@@ -976,6 +984,30 @@ const VirtioConsoleState = struct {
 
 var virtio_console_state = VirtioConsoleState{};
 
+const VirtioRngQueue = struct {
+    num: u16 = 0,
+    ready: bool = false,
+    desc_addr: u64 = 0,
+    avail_addr: u64 = 0,
+    used_addr: u64 = 0,
+    last_avail_idx: u16 = 0,
+    used_idx: u16 = 0,
+};
+
+const VirtioRngState = struct {
+    enabled: bool = false,
+    status: u32 = 0,
+    status_last: u32 = 0,
+    device_features_sel: u32 = 0,
+    driver_features_sel: u32 = 0,
+    driver_features: [2]u32 = .{ 0, 0 },
+    interrupt_status: u32 = 0,
+    queue_sel: u16 = 0,
+    queue: VirtioRngQueue = .{},
+};
+
+var virtio_rng_state = VirtioRngState{};
+
 fn resetPl011State() void {
     pl011_state = .{};
     if (serial_io.hasData()) {
@@ -1009,6 +1041,19 @@ fn updateVirtioConsoleInterrupt() void {
     }
     gic_bindings.setSpi(intid, level) catch |e| {
         log.warn("hvf gic set virtio-console spi failed: {s}", .{@errorName(e)});
+    };
+}
+
+fn updateVirtioRngInterrupt() void {
+    if (!gic_enabled) return;
+    const intid = gic_virtio_rng_intid orelse return;
+    const level = virtio_rng_state.interrupt_status != 0;
+    if (level != virtio_rng_irq_level) {
+        virtio_rng_irq_level = level;
+        log.debug("hvf virtio-rng irq level={s} intid={d}", .{ if (level) "high" else "low", intid });
+    }
+    gic_bindings.setSpi(intid, level) catch |e| {
+        log.warn("hvf gic set virtio-rng spi failed: {s}", .{@errorName(e)});
     };
 }
 
@@ -1503,6 +1548,8 @@ const Pl011State = struct {
 
 var pl011_state = Pl011State{};
 var pl011_seen = std.atomic.Value(bool).init(false);
+var virtio_console_seen = std.atomic.Value(bool).init(false);
+var virtio_rng_seen = std.atomic.Value(bool).init(false);
 
 fn arm64RegFromIndex(index: u5) !arm64_bindings.Reg {
     return switch (index) {
@@ -1618,6 +1665,7 @@ const virtio_mmio_magic: u32 = 0x74726976; // "virt"
 const virtio_mmio_version: u32 = 2;
 const virtio_mmio_device_id_blk: u32 = 2;
 const virtio_mmio_device_id_console: u32 = 3;
+const virtio_mmio_device_id_rng: u32 = 4;
 const virtio_mmio_vendor_id: u32 = 0x4d3830; // "M80"
 const virtio_mmio_int_vring: u32 = 1 << 0;
 
@@ -1698,6 +1746,14 @@ fn virtioConsoleDeviceFeatures(sel: u32) u32 {
     return 0;
 }
 
+fn virtioRngDeviceFeatures(sel: u32) u32 {
+    switch (sel) {
+        0 => return 0,
+        1 => return virtio_f_version_1,
+        else => return 0,
+    }
+}
+
 fn resetVirtioBlkQueue(device: *VirtioBlkDevice) void {
     device.queue = .{};
     device.queue_sel = 0;
@@ -1727,11 +1783,24 @@ fn resetVirtioConsoleState() void {
     virtio_console_input.mutex.unlock();
 }
 
+fn resetVirtioRngState() void {
+    virtio_rng_state = .{};
+    gic_virtio_rng_intid = null;
+    virtio_rng_irq_level = false;
+}
+
 fn setupVirtioConsole(enabled: bool) void {
     resetVirtioConsoleState();
     if (!enabled) return;
     virtio_console_state.enabled = true;
     log.info("hvf virtio-console enabled", .{});
+}
+
+fn setupVirtioRng(enabled: bool) void {
+    resetVirtioRngState();
+    if (!enabled) return;
+    virtio_rng_state.enabled = true;
+    log.info("hvf virtio-rng enabled", .{});
 }
 
 fn virtioConsoleInputLen() usize {
@@ -2238,8 +2307,66 @@ fn processVirtioConsoleRxQueue() !void {
     }
 }
 
+fn processVirtioRngQueue() !void {
+    if (!virtio_rng_state.enabled) return;
+    const queue = &virtio_rng_state.queue;
+    if (!queue.ready or queue.num == 0) return;
+
+    var wrote_any = false;
+    const avail_idx = try readGuestU16(queue.avail_addr + 2);
+    while (queue.last_avail_idx != avail_idx) {
+        const ring_index = queue.last_avail_idx % queue.num;
+        const head = try readGuestU16(queue.avail_addr + 4 + @as(u64, ring_index) * 2);
+
+        var desc_index: u16 = head;
+        var desc_seen: u16 = 0;
+        var total_written: u32 = 0;
+
+        while (true) {
+            if (desc_index >= queue.num) return error.InvalidGuestLayout;
+            const desc_addr = queue.desc_addr + @as(u64, desc_index) * @sizeOf(VirtqDesc);
+            const desc = try readVirtqDesc(desc_addr);
+            if (desc.flags & virtq_desc_flag_indirect != 0) return error.NotSupported;
+            if ((desc.flags & virtq_desc_flag_write) == 0) return error.InvalidGuestLayout;
+
+            var remaining: u64 = desc.len;
+            var offset: u64 = 0;
+            var buf: [256]u8 = undefined;
+            while (remaining > 0) {
+                const chunk = @min(remaining, buf.len);
+                std.crypto.random.bytes(buf[0..@intCast(chunk)]);
+                try writeGuestBytes(desc.addr + offset, buf[0..@intCast(chunk)]);
+                total_written += @intCast(chunk);
+                remaining -= @as(u64, chunk);
+                offset += @as(u64, chunk);
+            }
+
+            if (desc.flags & virtq_desc_flag_next == 0) break;
+            desc_index = desc.next;
+            desc_seen += 1;
+            if (desc_seen > queue.num) return error.InvalidGuestLayout;
+        }
+
+        const used_slot = queue.used_idx % queue.num;
+        try writeGuestU32(queue.used_addr + 4 + @as(u64, used_slot) * 8, head);
+        try writeGuestU32(queue.used_addr + 4 + @as(u64, used_slot) * 8 + 4, total_written);
+        queue.used_idx +%= 1;
+        try writeGuestU16(queue.used_addr + 2, queue.used_idx);
+        queue.last_avail_idx +%= 1;
+        wrote_any = true;
+    }
+
+    if (wrote_any) {
+        virtio_rng_state.interrupt_status |= virtio_mmio_int_vring;
+        updateVirtioRngInterrupt();
+    }
+}
+
 fn handleVirtioConsoleMmio(offset: u64, is_write: bool, size: usize, value: u64) u64 {
     if (!virtio_console_state.enabled) return 0;
+    if (!virtio_console_seen.swap(true, .seq_cst)) {
+        log.info("hvf virtio-console mmio first access offset=0x{x} write={s}", .{ offset, if (is_write) "yes" else "no" });
+    }
     const width: usize = @min(size, 4);
     if (is_write) {
         const v32: u32 = @intCast(value & 0xFFFF_FFFF);
@@ -2409,6 +2536,126 @@ fn handleVirtioConsoleMmio(offset: u64, is_write: bool, size: usize, value: u64)
     };
 }
 
+fn handleVirtioRngMmio(offset: u64, is_write: bool, size: usize, value: u64) u64 {
+    if (!virtio_rng_state.enabled) return 0;
+    if (!virtio_rng_seen.swap(true, .seq_cst)) {
+        log.info("hvf virtio-rng mmio first access offset=0x{x} write={s}", .{ offset, if (is_write) "yes" else "no" });
+    }
+    const width: usize = @min(size, 4);
+    if (is_write) {
+        const v32: u32 = @intCast(value & 0xFFFF_FFFF);
+        switch (offset) {
+            virtio_mmio_reg_device_features_sel => virtio_rng_state.device_features_sel = v32,
+            virtio_mmio_reg_driver_features_sel => virtio_rng_state.driver_features_sel = v32,
+            virtio_mmio_reg_driver_features => {
+                const sel = virtio_rng_state.driver_features_sel;
+                if (sel < virtio_rng_state.driver_features.len) {
+                    virtio_rng_state.driver_features[sel] = v32;
+                }
+            },
+            virtio_mmio_reg_queue_sel => virtio_rng_state.queue_sel = @intCast(v32 & 0xFFFF),
+            virtio_mmio_reg_queue_num => {
+                const requested: u16 = @intCast(v32 & 0xFFFF);
+                virtio_rng_state.queue.num = @min(requested, virtio_rng_queue_max);
+            },
+            virtio_mmio_reg_queue_ready => {
+                virtio_rng_state.queue.ready = (v32 & 0x1) == 1;
+                log.info("hvf virtio-rng queue ready={s}", .{if (virtio_rng_state.queue.ready) "true" else "false"});
+            },
+            virtio_mmio_reg_queue_desc_low => {
+                virtio_rng_state.queue.desc_addr = (virtio_rng_state.queue.desc_addr & 0xFFFF_FFFF_0000_0000) | v32;
+            },
+            virtio_mmio_reg_queue_desc_high => {
+                virtio_rng_state.queue.desc_addr = (@as(u64, v32) << 32) | (virtio_rng_state.queue.desc_addr & 0xFFFF_FFFF);
+            },
+            virtio_mmio_reg_queue_driver_low => {
+                virtio_rng_state.queue.avail_addr = (virtio_rng_state.queue.avail_addr & 0xFFFF_FFFF_0000_0000) | v32;
+            },
+            virtio_mmio_reg_queue_driver_high => {
+                virtio_rng_state.queue.avail_addr = (@as(u64, v32) << 32) | (virtio_rng_state.queue.avail_addr & 0xFFFF_FFFF);
+            },
+            virtio_mmio_reg_queue_device_low => {
+                virtio_rng_state.queue.used_addr = (virtio_rng_state.queue.used_addr & 0xFFFF_FFFF_0000_0000) | v32;
+            },
+            virtio_mmio_reg_queue_device_high => {
+                virtio_rng_state.queue.used_addr = (@as(u64, v32) << 32) | (virtio_rng_state.queue.used_addr & 0xFFFF_FFFF);
+            },
+            virtio_mmio_reg_queue_notify => {
+                processVirtioRngQueue() catch |e| {
+                    log.warn("hvf virtio-rng queue notify failed: {s}", .{@errorName(e)});
+                };
+                log.debug("hvf virtio-rng queue notify", .{});
+            },
+            virtio_mmio_reg_interrupt_ack => {
+                virtio_rng_state.interrupt_status &= ~v32;
+                updateVirtioRngInterrupt();
+            },
+            virtio_mmio_reg_status => {
+                if (v32 == 0) {
+                    virtio_rng_state.status = 0;
+                    virtio_rng_state.queue = .{};
+                } else {
+                    virtio_rng_state.status = v32;
+                }
+                if (virtio_rng_state.status != virtio_rng_state.status_last) {
+                    log.info("hvf virtio-rng status=0x{x}", .{virtio_rng_state.status});
+                    virtio_rng_state.status_last = virtio_rng_state.status;
+                }
+            },
+            else => {},
+        }
+        return 0;
+    }
+
+    return switch (offset) {
+        virtio_mmio_reg_magic => virtio_mmio_magic,
+        virtio_mmio_reg_version => virtio_mmio_version,
+        virtio_mmio_reg_device_id => virtio_mmio_device_id_rng,
+        virtio_mmio_reg_vendor_id => virtio_mmio_vendor_id,
+        virtio_mmio_reg_device_features => virtioRngDeviceFeatures(virtio_rng_state.device_features_sel),
+        virtio_mmio_reg_device_features_sel => virtio_rng_state.device_features_sel,
+        virtio_mmio_reg_driver_features_sel => virtio_rng_state.driver_features_sel,
+        virtio_mmio_reg_driver_features => blk: {
+            const sel = virtio_rng_state.driver_features_sel;
+            if (sel < virtio_rng_state.driver_features.len) break :blk virtio_rng_state.driver_features[sel];
+            break :blk 0;
+        },
+        virtio_mmio_reg_queue_sel => virtio_rng_state.queue_sel,
+        virtio_mmio_reg_queue_num_max => virtio_rng_queue_max,
+        virtio_mmio_reg_queue_num => virtio_rng_state.queue.num,
+        virtio_mmio_reg_queue_ready => @intFromBool(virtio_rng_state.queue.ready),
+        virtio_mmio_reg_interrupt_status => virtio_rng_state.interrupt_status,
+        virtio_mmio_reg_status => virtio_rng_state.status,
+        virtio_mmio_reg_queue_desc_low => @as(u64, @intCast(virtio_rng_state.queue.desc_addr & 0xFFFF_FFFF)),
+        virtio_mmio_reg_queue_desc_high => @as(u64, @intCast(virtio_rng_state.queue.desc_addr >> 32)),
+        virtio_mmio_reg_queue_driver_low => @as(u64, @intCast(virtio_rng_state.queue.avail_addr & 0xFFFF_FFFF)),
+        virtio_mmio_reg_queue_driver_high => @as(u64, @intCast(virtio_rng_state.queue.avail_addr >> 32)),
+        virtio_mmio_reg_queue_device_low => @as(u64, @intCast(virtio_rng_state.queue.used_addr & 0xFFFF_FFFF)),
+        virtio_mmio_reg_queue_device_high => @as(u64, @intCast(virtio_rng_state.queue.used_addr >> 32)),
+        virtio_mmio_reg_config_generation => 0,
+        else => blk: {
+            if (offset >= virtio_mmio_reg_config) {
+                const config_offset = offset - virtio_mmio_reg_config;
+                if (config_offset < 4) {
+                    const max_bytes: u32 = 4096;
+                    var buf: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &buf, max_bytes, .little);
+                    const config_start: usize = @intCast(config_offset);
+                    const end = @min(config_start + width, buf.len);
+                    var val: u32 = 0;
+                    var shift: u6 = 0;
+                    var i: usize = config_start;
+                    while (i < end) : (i += 1) {
+                        val |= @as(u32, buf[i]) << @intCast(shift);
+                        shift += 8;
+                    }
+                    break :blk val;
+                }
+            }
+            break :blk 0;
+        },
+    };
+}
 fn serialInputLoop() void {
     const fd = std.fs.File.stdin().handle;
     var buf: [256]u8 = undefined;
@@ -2420,13 +2667,7 @@ fn serialInputLoop() void {
         const n = std.posix.read(fd, buf[0..]) catch continue;
         if (n <= 0) continue;
         const chunk = buf[0..@intCast(n)];
-        serial_io.append(std.heap.page_allocator, chunk);
-        if (virtio_console_state.enabled) {
-            appendVirtioConsoleInput(chunk);
-            processVirtioConsoleRxQueue() catch |e| {
-                log.warn("hvf virtio-console rx process failed: {s}", .{@errorName(e)});
-            };
-        }
+        appendSerialInput(chunk);
     }
 }
 
@@ -2453,6 +2694,101 @@ fn stopSerialInputThread() void {
 fn shouldEnableSerialStdin(allocator: std.mem.Allocator) bool {
     if (envFlagPresent(allocator, "M80_SERIAL_STDIN")) return true;
     return std.posix.isatty(std.fs.File.stdin().handle);
+}
+
+fn appendSerialInput(bytes: []const u8) void {
+    serial_io.append(std.heap.page_allocator, bytes);
+    if (virtio_console_state.enabled) {
+        appendVirtioConsoleInput(bytes);
+        processVirtioConsoleRxQueue() catch |e| {
+            log.warn("hvf virtio-console rx process failed: {s}", .{@errorName(e)});
+        };
+    }
+}
+
+fn consoleSocketLoop() void {
+    const path = console_socket_path orelse return;
+    std.fs.cwd().deleteFile(path) catch {};
+
+    const address = std.net.Address.initUnix(path) catch |e| {
+        log.warn("hvf console socket invalid path: {s}", .{@errorName(e)});
+        return;
+    };
+    var server = std.net.Address.listen(address, .{
+        .kernel_backlog = 4,
+        .reuse_address = false,
+        .force_nonblocking = true,
+    }) catch |e| {
+        log.warn("hvf console socket listen failed: {s}", .{@errorName(e)});
+        return;
+    };
+    defer {
+        server.deinit();
+        std.fs.cwd().deleteFile(path) catch {};
+    }
+
+    var buf: [512]u8 = undefined;
+    while (console_socket_running.load(.seq_cst)) {
+        const conn = server.accept() catch |e| switch (e) {
+            error.WouldBlock => {
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+                continue;
+            },
+            else => {
+                log.warn("hvf console socket accept failed: {s}", .{@errorName(e)});
+                break;
+            },
+        };
+        defer conn.stream.close();
+
+        serial.setConsoleFd(conn.stream.handle);
+        defer serial.clearConsoleFd();
+        serial.writeConsoleBacklog(conn.stream.handle) catch |e| {
+            log.warn("hvf console backlog send failed: {s}", .{@errorName(e)});
+        };
+
+        while (console_socket_running.load(.seq_cst)) {
+            var fds = [_]std.posix.pollfd{.{ .fd = conn.stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(fds[0..], 100) catch break;
+            if (ready == 0) continue;
+            if ((fds[0].revents & std.posix.POLL.IN) == 0) break;
+            const n = std.posix.read(conn.stream.handle, &buf) catch break;
+            if (n <= 0) break;
+            appendSerialInput(buf[0..@intCast(n)]);
+        }
+    }
+}
+
+fn startConsoleSocketServer(allocator: std.mem.Allocator) void {
+    if (console_socket_running.load(.seq_cst)) return;
+    const env = std.process.getEnvVarOwned(allocator, "M80_CONSOLE_SOCKET") catch null;
+    if (env == null) return;
+    console_socket_path = env;
+    console_socket_running.store(true, .seq_cst);
+    console_socket_thread = std.Thread.spawn(.{}, consoleSocketLoop, .{}) catch |e| {
+        console_socket_running.store(false, .seq_cst);
+        if (console_socket_path) |path| {
+            allocator.free(path);
+            console_socket_path = null;
+        }
+        log.warn("hvf console socket thread failed: {s}", .{@errorName(e)});
+        return;
+    };
+    log.info("hvf console socket enabled", .{});
+}
+
+fn stopConsoleSocketServer(allocator: std.mem.Allocator) void {
+    if (!console_socket_running.load(.seq_cst)) return;
+    console_socket_running.store(false, .seq_cst);
+    if (console_socket_thread) |thread| {
+        thread.join();
+        console_socket_thread = null;
+    }
+    serial.clearConsoleFd();
+    if (console_socket_path) |path| {
+        allocator.free(path);
+        console_socket_path = null;
+    }
 }
 
 fn advanceArmPc(vcpu: arm64_bindings.VcpuId, il: u64) !void {
@@ -2522,6 +2858,22 @@ fn handleArm64Mmio(vcpu: arm64_bindings.VcpuId, exit: HvfArmExitException) !bool
             _ = handleVirtioConsoleMmio(offset, true, size, value);
         } else {
             const value = handleVirtioConsoleMmio(offset, false, size, 0);
+            const mask: u64 = if (size >= 8)
+                std.math.maxInt(u64)
+            else
+                (@as(u64, 1) << @as(u6, @intCast(size * 8))) - 1;
+            try arm64WriteRegByIndex(vcpu, srt, value & mask);
+        }
+        try advanceArmPc(vcpu, il);
+        return true;
+    }
+    if (virtio_rng_state.enabled and addr >= virtio_rng_mmio_base and addr < virtio_rng_mmio_base + virtio_rng_mmio_size) {
+        const offset = addr - virtio_rng_mmio_base;
+        if (is_write) {
+            const value = try arm64ReadRegByIndex(vcpu, srt);
+            _ = handleVirtioRngMmio(offset, true, size, value);
+        } else {
+            const value = handleVirtioRngMmio(offset, false, size, 0);
             const mask: u64 = if (size >= 8)
                 std.math.maxInt(u64)
             else
@@ -3138,6 +3490,7 @@ pub fn start(cfg: config.VmConfig) !void {
     const enable_virtio_console = envFlagPresent(std.heap.page_allocator, "M80_VIRTIO_CONSOLE") or
         (cfg.kernel_cmdline != null and std.mem.indexOf(u8, cfg.kernel_cmdline.?, "hvc0") != null);
     setupVirtioConsole(enable_virtio_console);
+    setupVirtioRng(true);
     const cmdline = if (cfg.kernel_cmdline) |value| value else defaultCmdlineForConfig(cfg);
     var boot_state = if (builtin.cpu.arch == .aarch64)
         boot.computeBootStateWithBase(
@@ -3206,6 +3559,7 @@ pub fn start(cfg: config.VmConfig) !void {
         }
         gic_virtio_blk_intid = .{ virtio_blk0_intid, virtio_blk1_intid };
         var virtio_console_intid: ?u32 = null;
+        var virtio_rng_intid: ?u32 = null;
         if (enable_virtio_console) {
             const candidate = spi_base + pl011_irq_offset + 1;
             if (spi_count != 0 and candidate >= spi_base + spi_count) {
@@ -3214,10 +3568,19 @@ pub fn start(cfg: config.VmConfig) !void {
             virtio_console_intid = candidate;
             gic_virtio_console_intid = candidate;
         }
+        if (virtio_rng_state.enabled) {
+            const candidate = spi_base + pl011_irq_offset + 3;
+            if (spi_count != 0 and candidate >= spi_base + spi_count) {
+                log.warn("hvf virtio-rng irq out of range base={d} count={d}", .{ spi_base, spi_count });
+            }
+            virtio_rng_intid = candidate;
+            gic_virtio_rng_intid = candidate;
+        }
         const uart_irq = uart_intid - spi_base;
         const virtio_blk0_irq = if (virtio_blk0_intid) |intid| intid - spi_base else null;
         const virtio_blk1_irq = if (virtio_blk1_intid) |intid| intid - spi_base else null;
         const virtio_console_irq = if (virtio_console_intid) |intid| intid - spi_base else null;
+        const virtio_rng_irq = if (virtio_rng_intid) |intid| intid - spi_base else null;
         const initrd_start = if (initrd_size > 0) guestInitrdBase() else null;
         const initrd_end = if (initrd_size > 0) guestInitrdBase() + initrd_size else null;
         if (cfg.disk_path != null and virtio_blk0_irq != null) {
@@ -3238,6 +3601,12 @@ pub fn start(cfg: config.VmConfig) !void {
                 .{ virtio_console_mmio_base, virtio_console_irq.?, virtio_console_intid.? },
             );
         }
+        if (virtio_rng_state.enabled and virtio_rng_irq != null) {
+            log.info(
+                "hvf virtio-rng dtb base=0x{x} irq={d} intid={d}",
+                .{ virtio_rng_mmio_base, virtio_rng_irq.?, virtio_rng_intid.? },
+            );
+        }
         const dtb_blob = dtb.buildVirtDtb(std.heap.page_allocator, .{
             .memory_base = guestMemoryBase(),
             .memory_size = size_bytes_u64,
@@ -3253,6 +3622,8 @@ pub fn start(cfg: config.VmConfig) !void {
             .virtio_blk2_irq = virtio_blk1_irq,
             .virtio_console_base = if (enable_virtio_console) virtio_console_mmio_base else null,
             .virtio_console_irq = virtio_console_irq,
+            .virtio_rng_base = if (virtio_rng_state.enabled) virtio_rng_mmio_base else null,
+            .virtio_rng_irq = virtio_rng_irq,
         }) catch |e| {
             log.err("hvf buildVirtDtb failed: {s}", .{@errorName(e)});
             return e;
@@ -3327,6 +3698,8 @@ pub fn start(cfg: config.VmConfig) !void {
         setVirtioConsoleInputFromEnv(std.heap.page_allocator);
     }
     serial.setCaptureFromEnv(std.heap.page_allocator);
+    serial.clearConsoleBacklog();
+    startConsoleSocketServer(std.heap.page_allocator);
     if (shouldEnableSerialStdin(std.heap.page_allocator)) {
         startSerialInputThread();
     }
@@ -3350,6 +3723,7 @@ pub fn stop() !void {
     // Signal vCPU thread to stop
     vcpu_running.store(false, .seq_cst);
     stopSerialInputThread();
+    stopConsoleSocketServer(std.heap.page_allocator);
 
     if (builtin.os.tag == .macos) {
         if (builtin.cpu.arch == .aarch64) {
@@ -3376,9 +3750,11 @@ pub fn stop() !void {
     // Clean up serial I/O state
     serial_io.clear(std.heap.page_allocator);
     serial.clearCapture(std.heap.page_allocator);
+    serial.clearConsoleBacklog();
     pl011_state = .{};
     resetVirtioBlkState();
     resetVirtioConsoleState();
+    resetVirtioRngState();
 
     if (active_guest_memory) |buffer| {
         unmapActiveGuestMemory();
