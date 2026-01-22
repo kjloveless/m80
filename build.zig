@@ -36,6 +36,11 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .macos) {
         exe.linkFramework("Hypervisor");
+        exe.linkFramework("vmnet");
+        exe.addCSourceFile(.{
+            .file = b.path("src/net/vmnet_bridge.c"),
+            .flags = &[_][]const u8{ "-fblocks" },
+        });
     }
 
     b.installArtifact(exe);
@@ -65,6 +70,11 @@ pub fn build(b: *std.Build) void {
     });
     if (target.result.os.tag == .macos) {
         unit_tests.linkFramework("Hypervisor");
+        unit_tests.linkFramework("vmnet");
+        unit_tests.addCSourceFile(.{
+            .file = b.path("src/net/vmnet_bridge.c"),
+            .flags = &[_][]const u8{ "-fblocks" },
+        });
     }
     unit_tests.root_module.addAnonymousImport("build_script", .{
         .root_source_file = b.path("build.zig"),
@@ -76,12 +86,29 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 
     if (target.result.os.tag == .macos) {
-        const entitlements = b.path("entitlements/hvf-entitlements.xml");
+        var entitlements_name: []const u8 = "entitlements/hvf-entitlements.xml";
+        if (std.process.getEnvVarOwned(b.allocator, "M80_VMNET_ENTITLEMENTS") catch null) |value| {
+            defer b.allocator.free(value);
+            if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) {
+                entitlements_name = "entitlements/hvf-entitlements-vmnet.xml";
+            }
+        }
+        var codesign_identity: []const u8 = "-";
+        var codesign_identity_buf: ?[]u8 = null;
+        if (std.process.getEnvVarOwned(b.allocator, "M80_CODESIGN_IDENTITY") catch null) |value| {
+            if (value.len != 0) {
+                codesign_identity = value;
+                codesign_identity_buf = value;
+            } else {
+                b.allocator.free(value);
+            }
+        }
+        const entitlements = b.path(entitlements_name);
 
         const sign_exe = b.addSystemCommand(&[_][]const u8{
             "codesign",
             "--sign",
-            "-",
+            codesign_identity,
             "--entitlements",
         });
         sign_exe.addFileArg(entitlements);
@@ -92,7 +119,7 @@ pub fn build(b: *std.Build) void {
         const sign_installed = b.addSystemCommand(&[_][]const u8{
             "codesign",
             "--sign",
-            "-",
+            codesign_identity,
             "--entitlements",
         });
         sign_installed.addFileArg(entitlements);
@@ -103,7 +130,7 @@ pub fn build(b: *std.Build) void {
         const sign_tests = b.addSystemCommand(&[_][]const u8{
             "codesign",
             "--sign",
-            "-",
+            codesign_identity,
             "--entitlements",
         });
         sign_tests.addFileArg(entitlements);

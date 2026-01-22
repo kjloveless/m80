@@ -35,6 +35,7 @@ const core = @import("core.zig");
 const errors = core.errors;
 const state = core.state;
 const log = @import("util/log.zig");
+const mounts = @import("fs/mounts.zig");
 const c = if (builtin.os.tag == .windows)
     struct {}
 else
@@ -253,6 +254,7 @@ fn logStartPreflight(cfg: *const core.config.VmConfig) void {
     logPathAndSize("initrd", cfg.initrd_path);
     logPathAndSize("disk", cfg.disk_path);
     logPathAndSize("seed", cfg.seed_path);
+    logPathAndSize("data_disk", cfg.data_disk_path);
     if (cfg.kernel_cmdline) |cmdline| {
         log.debug("kernel_cmdline: {s}", .{cmdline});
     }
@@ -292,6 +294,10 @@ fn dieStartConfigError(err: core.config.StartConfigError, cfg: *const core.confi
             "seed_path not found: {s}. Check the path or remove seed_path.",
             .{optPath(cfg.seed_path)},
         ),
+        error.DataDiskNotFound => errors.die(
+            "data_disk_path not found: {s}. Check the path or remove data_disk_path.",
+            .{optPath(cfg.data_disk_path)},
+        ),
         error.KernelUnreadable => errors.die(
             "kernel_path not readable: {s}. Check permissions (chmod +r) or ownership.",
             .{optPath(cfg.kernel_path)},
@@ -307,6 +313,26 @@ fn dieStartConfigError(err: core.config.StartConfigError, cfg: *const core.confi
         error.SeedUnreadable => errors.die(
             "seed_path not readable: {s}. Check permissions (chmod +r) or ownership.",
             .{optPath(cfg.seed_path)},
+        ),
+        error.DataDiskUnreadable => errors.die(
+            "data_disk_path not readable: {s}. Check permissions (chmod +r) or ownership.",
+            .{optPath(cfg.data_disk_path)},
+        ),
+        error.OpenNetworkNotAllowed => errors.die(
+            "network_mode=open requires explicit opt-in. Run `export M80_ALLOW_OPEN_NETWORK=1` and retry.",
+            .{},
+        ),
+        error.MountRootsRequired => errors.die(
+            "mounts configured but mount_roots is empty. Set mount_roots=/allowed/path and retry.",
+            .{},
+        ),
+        error.MountTypeUnsupported => errors.die(
+            "mounts configured with unsupported type. Use mount_type=virtiofs.",
+            .{},
+        ),
+        error.MountCountUnsupported => errors.die(
+            "only one mount is supported right now. Remove extra mounts and retry.",
+            .{},
         ),
     }
 }
@@ -336,12 +362,17 @@ fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
     defer allocator.free(cwd_path);
     const kernel_path = try std.fs.path.join(
         allocator,
-        &[_][]const u8{ cwd_path, "images", "fc-ubuntu-5.10-with-rng-vmlinux.bin" },
+        &[_][]const u8{ cwd_path, "images", "debian-kernels", "boot", "vmlinuz-6.1.0-42-cloud-arm64" },
     );
     defer allocator.free(kernel_path);
+    const initrd_path = try std.fs.path.join(
+        allocator,
+        &[_][]const u8{ cwd_path, "images", "m80-initramfs.cpio.gz" },
+    );
+    defer allocator.free(initrd_path);
     const disk_path = try std.fs.path.join(
         allocator,
-        &[_][]const u8{ cwd_path, "images", "debian-12-nocloud-arm64-rootfs.ext4" },
+        &[_][]const u8{ cwd_path, "images", "debian-12-nocloud-arm64-20250703-2162.raw" },
     );
     defer allocator.free(disk_path);
     const seed_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "debian-nocloud-seed.iso" });
@@ -370,32 +401,58 @@ fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
         cfg_mut.seed_path = try allocator.dupe(u8, seed_path);
     }
     if (cfg_mut.initrd_path) |path| {
-        allocator.free(path);
-        cfg_mut.initrd_path = null;
-    }
-    if (cfg_mut.kernel_cmdline != null) {
-        const cmdline = cfg_mut.kernel_cmdline.?;
-        const has_vda1 = std.mem.indexOf(u8, cmdline, "root=/dev/vda1") != null;
-        const missing_root = std.mem.indexOf(u8, cmdline, "root=/dev/vda") == null or has_vda1;
-        const missing_bootcon = std.mem.indexOf(u8, cmdline, "keep_bootcon") == null;
-        const missing_devtmpfs = std.mem.indexOf(u8, cmdline, "devtmpfs.mount=1") == null;
-        const missing_hvc0 = std.mem.indexOf(u8, cmdline, "console=hvc0") == null;
-        const missing_mask = std.mem.indexOf(u8, cmdline, "systemd.mask=boot-efi.mount") == null;
-        const has_show_status_yes = std.mem.indexOf(u8, cmdline, "systemd.show_status=yes") != null;
-        const has_random_seed_mask = std.mem.indexOf(u8, cmdline, "systemd.mask=systemd-random-seed.service") != null;
-        const has_resolved_mask = std.mem.indexOf(u8, cmdline, "systemd.mask=systemd-resolved.service") != null;
-        const has_ttyama = std.mem.indexOf(u8, cmdline, "console=ttyAMA0") != null;
-        if (missing_root or missing_bootcon or missing_devtmpfs or missing_hvc0 or missing_mask or has_show_status_yes or has_random_seed_mask or has_resolved_mask or has_ttyama) {
-            allocator.free(cfg_mut.kernel_cmdline.?);
-            cfg_mut.kernel_cmdline = null;
+        if (!std.mem.eql(u8, path, initrd_path)) {
+            allocator.free(path);
+            cfg_mut.initrd_path = null;
         }
     }
-    if (cfg_mut.kernel_cmdline == null) {
-        cfg_mut.kernel_cmdline = try allocator.dupe(
-            u8,
-            "earlycon=pl011,0x09000000 keep_bootcon console=hvc0 root=/dev/vda rootwait rootfstype=ext4 rw devtmpfs.mount=1 systemd.mask=boot-efi.mount systemd.mask=systemd-boot-update.service loglevel=7 systemd.show_status=no systemd.log_level=info fsck.mode=skip fsck.repair=no",
-        );
+    if (cfg_mut.initrd_path == null) {
+        cfg_mut.initrd_path = try allocator.dupe(u8, initrd_path);
     }
+    if (cfg_mut.kernel_cmdline) |cmdline| {
+        allocator.free(cmdline);
+        cfg_mut.kernel_cmdline = null;
+    }
+    cfg_mut.kernel_cmdline = try allocator.dupe(
+        u8,
+        "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 root=/dev/vda1 rootwait rootfstype=ext4 rw devtmpfs.mount=1 systemd.mask=boot-efi.mount systemd.mask=systemd-boot-update.service loglevel=7 systemd.show_status=no systemd.log_level=info systemd.log_color=no fsck.mode=skip fsck.repair=no",
+    );
+
+    if (cfg_mut.mount_roots.len > 0) {
+        for (cfg_mut.mount_roots) |root| allocator.free(root);
+        allocator.free(cfg_mut.mount_roots);
+        cfg_mut.mount_roots = &[_][]const u8{};
+    }
+    if (cfg_mut.mounts.len > 0) {
+        for (cfg_mut.mounts) |mount_cfg| {
+            allocator.free(mount_cfg.tag);
+            allocator.free(mount_cfg.host_path);
+            allocator.free(mount_cfg.guest_path);
+        }
+        allocator.free(cfg_mut.mounts);
+        cfg_mut.mounts = &[_]mounts.MountConfig{};
+    }
+
+    const mount_root = std.fs.path.dirname(cwd_path) orelse cwd_path;
+    const mount_root_owned = try allocator.dupe(u8, mount_root);
+    const mount_host = try allocator.dupe(u8, cwd_path);
+    const mount_tag = try allocator.dupe(u8, "host");
+    const mount_guest = try allocator.dupe(u8, "/mnt/host");
+
+    const mount_roots_list = try allocator.alloc([]const u8, 1);
+    @constCast(mount_roots_list)[0] = mount_root_owned;
+    cfg_mut.mount_roots = mount_roots_list;
+
+    cfg_mut.mounts = try allocator.alloc(mounts.MountConfig, 1);
+    cfg_mut.mounts[0] = .{
+        .tag = mount_tag,
+        .host_path = mount_host,
+        .guest_path = mount_guest,
+        .access = .read_write,
+        .mount_type = .virtio_fs,
+        .max_file_size = 0,
+        .allow_exec = false,
+    };
 
     try core.config.writeConfigFile(vm_dir, cfg_mut);
 }
@@ -444,8 +501,20 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
         dieStartConfigError(e, &cfg_mut);
     };
 
-    vm.start(cfg_mut) catch |e| {
-        errors.die("start failed: {s}", .{@errorName(e)});
+    vm.start(cfg_mut) catch |e| switch (e) {
+        error.NetworkUnavailable => errors.die(
+            "network setup failed. Check com.apple.vm.networking entitlement, codesign output, and network_mode configuration.",
+            .{},
+        ),
+        error.MountsInvalid => errors.die(
+            "mounts rejected. Ensure mount_roots includes the host path and no path traversal is present.",
+            .{},
+        ),
+        error.MountsUnsupported => errors.die(
+            "mounts not supported in this configuration. Use a single virtiofs mount.",
+            .{},
+        ),
+        else => errors.die("start failed: {s}", .{@errorName(e)}),
     };
 
     state.setStatus(allocator, name, .running) catch |e| switch (e) {

@@ -29,8 +29,10 @@
 //! - `kernel_path`: path to Linux kernel image (required for start)
 //! - `initrd_path`: path to initial ramdisk (optional for start)
 //! - `disk_path`: path to rootfs block image (optional for start)
+//! - `data_disk_path`: path to an additional data disk image (optional)
 //! - `seed_path`: path to a cloud-init NoCloud seed image (optional)
 //! - `disk_readonly`: mount rootfs read-only (default: false)
+//! - `data_disk_readonly`: mount data disk read-only (default: false)
 //! - `kernel_cmdline`: optional kernel command line override
 //! - `network_mode`: locked_down|allowlist|open (default: locked_down)
 //! - `allowed_domains`: comma-separated domain allowlist
@@ -43,6 +45,7 @@
 const std = @import("std");
 const paths = @import("paths.zig");
 const net_policy = @import("../net/policy.zig");
+const mounts = @import("../fs/mounts.zig");
 
 /// Configuration for a virtual machine.
 /// This struct holds all settings needed to create and run a VM.
@@ -84,9 +87,23 @@ pub const VmConfig = struct {
     /// If true, attach the disk image as read-only.
     disk_readonly: bool = false,
 
+    /// Optional additional data disk image (ext4).
+    /// When set, it is attached as an extra virtio-blk device.
+    data_disk_path: ?[]const u8 = null,
+
+    /// If true, attach the data disk as read-only.
+    data_disk_readonly: bool = false,
+
     /// Optional kernel command line override.
     /// If unset, the backend uses its default command line.
     kernel_cmdline: ?[]const u8 = null,
+
+    /// Allowed host roots for mount sharing.
+    /// Required when mounts are configured.
+    mount_roots: []const []const u8 = &[_][]const u8{},
+
+    /// Mount configurations (virtio-fs/9p).
+    mounts: []mounts.MountConfig = &[_]mounts.MountConfig{},
 
     /// Network security mode controlling outbound connections.
     /// - locked_down: No network access (default, most secure)
@@ -180,6 +197,8 @@ pub const StartConfigError = error{
     DiskNotFound,
     /// seed_path file doesn't exist on disk
     SeedNotFound,
+    /// data_disk_path file doesn't exist on disk
+    DataDiskNotFound,
     /// kernel_path exists but can't be opened (permissions?)
     KernelUnreadable,
     /// initrd_path exists but can't be opened (permissions?)
@@ -188,6 +207,16 @@ pub const StartConfigError = error{
     DiskUnreadable,
     /// seed_path exists but can't be opened (permissions?)
     SeedUnreadable,
+    /// data_disk_path exists but can't be opened (permissions?)
+    DataDiskUnreadable,
+    /// network_mode=open requires explicit env opt-in
+    OpenNetworkNotAllowed,
+    /// mounts configured without mount_roots
+    MountRootsRequired,
+    /// unsupported mount type for this backend
+    MountTypeUnsupported,
+    /// too many mounts for current backend
+    MountCountUnsupported,
 };
 
 /// Creates a VmConfig with default values and the given name.
@@ -209,6 +238,8 @@ pub fn defaultConfig(allocator: std.mem.Allocator, name: []const u8) !VmConfig {
         .disk_path = null,
         .seed_path = null,
         .disk_readonly = false,
+        .data_disk_path = null,
+        .data_disk_readonly = false,
         .kernel_cmdline = null,
     };
 }
@@ -218,7 +249,7 @@ pub fn defaultConfig(allocator: std.mem.Allocator, name: []const u8) !VmConfig {
 ///
 /// Frees:
 ///   - name string
-    ///   - kernel_path, initrd_path, disk_path, seed_path (if set)
+///   - kernel_path, initrd_path, disk_path, seed_path, data_disk_path (if set)
 ///   - allowed_domains list and each domain string
 ///   - allowed_ips list and each IP string
 ///
@@ -234,6 +265,8 @@ pub fn freeConfig(allocator: std.mem.Allocator, cfg: *VmConfig) void {
     cfg.disk_path = null;
     if (cfg.seed_path) |path| allocator.free(path);
     cfg.seed_path = null;
+    if (cfg.data_disk_path) |path| allocator.free(path);
+    cfg.data_disk_path = null;
     if (cfg.kernel_cmdline) |value| allocator.free(value);
     cfg.kernel_cmdline = null;
 
@@ -246,6 +279,20 @@ pub fn freeConfig(allocator: std.mem.Allocator, cfg: *VmConfig) void {
     for (cfg.allowed_ips) |ip| allocator.free(ip);
     if (cfg.allowed_ips.len > 0) allocator.free(cfg.allowed_ips);
     cfg.allowed_ips = &[_][]const u8{};
+
+    // Free mount roots
+    for (cfg.mount_roots) |root| allocator.free(root);
+    if (cfg.mount_roots.len > 0) allocator.free(cfg.mount_roots);
+    cfg.mount_roots = &[_][]const u8{};
+
+    // Free mounts
+    for (cfg.mounts) |mount| {
+        allocator.free(mount.tag);
+        allocator.free(mount.host_path);
+        allocator.free(mount.guest_path);
+    }
+    if (cfg.mounts.len > 0) allocator.free(cfg.mounts);
+    cfg.mounts = &[_]mounts.MountConfig{};
 }
 
 /// Reads and parses an m80.conf file from the given directory.
@@ -343,6 +390,45 @@ pub fn resolveRelativePaths(
             cfg.seed_path = joined;
         }
     }
+    if (cfg.data_disk_path) |path| {
+        if (!std.fs.path.isAbsolute(path)) {
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, path });
+            allocator.free(path);
+            cfg.data_disk_path = joined;
+        }
+    }
+    if (cfg.mount_roots.len > 0) {
+        var needs_rewrite = false;
+        for (cfg.mount_roots) |root| {
+            if (!std.fs.path.isAbsolute(root)) {
+                needs_rewrite = true;
+                break;
+            }
+        }
+        if (needs_rewrite) {
+            const rewritten = try allocator.alloc([]const u8, cfg.mount_roots.len);
+            for (cfg.mount_roots, 0..) |root, i| {
+                if (!std.fs.path.isAbsolute(root)) {
+                    const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, root });
+                    allocator.free(root);
+                    rewritten[i] = joined;
+                } else {
+                    rewritten[i] = root;
+                }
+            }
+            allocator.free(cfg.mount_roots);
+            cfg.mount_roots = rewritten;
+        }
+    }
+    if (cfg.mounts.len > 0) {
+        for (cfg.mounts) |*mount_cfg| {
+            if (!std.fs.path.isAbsolute(mount_cfg.host_path)) {
+                const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, mount_cfg.host_path });
+                allocator.free(mount_cfg.host_path);
+                mount_cfg.host_path = joined;
+            }
+        }
+    }
 }
 
 /// Validates that required config fields are set for starting a VM.
@@ -359,6 +445,19 @@ pub fn validateStartConfig(cfg: *const VmConfig) StartConfigError!void {
   if (cfg.kernel_path == null) return error.MissingKernel;
   if (cfg.seed_path != null and cfg.disk_path == null) return error.SeedRequiresDisk;
   if (cfg.initrd_path == null and cfg.disk_path == null) return error.MissingRootfs;
+  if (cfg.mounts.len > 0 and cfg.mount_roots.len == 0) return error.MountRootsRequired;
+  if (cfg.mounts.len > 1) return error.MountCountUnsupported;
+  for (cfg.mounts) |mount_cfg| {
+    if (mount_cfg.mount_type != .virtio_fs) return error.MountTypeUnsupported;
+  }
+  if (cfg.network_mode == .open) {
+    const env_var = std.process.getEnvVarOwned(std.heap.page_allocator, "M80_ALLOW_OPEN_NETWORK") catch {
+      return error.OpenNetworkNotAllowed;
+    };
+    defer std.heap.page_allocator.free(env_var);
+    const allowed = std.mem.eql(u8, env_var, "1") or std.mem.eql(u8, env_var, "true");
+    if (!allowed) return error.OpenNetworkNotAllowed;
+  }
 }
 
 /// Validates that kernel/initrd files exist and are readable.
@@ -366,8 +465,8 @@ pub fn validateStartConfig(cfg: *const VmConfig) StartConfigError!void {
 ///
 /// Errors:
 ///   - MissingKernel/MissingRootfs/SeedRequiresDisk: Path not configured
-///   - KernelNotFound/InitrdNotFound/DiskNotFound/SeedNotFound: File doesn't exist
-///   - KernelUnreadable/InitrdUnreadable/DiskUnreadable/SeedUnreadable: File exists but can't be opened
+///   - KernelNotFound/InitrdNotFound/DiskNotFound/SeedNotFound/DataDiskNotFound: File doesn't exist
+///   - KernelUnreadable/InitrdUnreadable/DiskUnreadable/SeedUnreadable/DataDiskUnreadable: File exists but can't be opened
 pub fn validateStartFiles(cfg: *const VmConfig) StartConfigError!void {
   if (cfg.kernel_path) |path| {
     try checkReadableFile(path, .kernel);
@@ -389,10 +488,13 @@ pub fn validateStartFiles(cfg: *const VmConfig) StartConfigError!void {
   if (cfg.seed_path) |path| {
     try checkReadableFile(path, .seed);
   }
+  if (cfg.data_disk_path) |path| {
+    try checkReadableFile(path, .data_disk);
+  }
 }
 
 /// Used to provide specific error messages for kernel vs initrd file issues.
-const StartFileKind = enum { kernel, initrd, disk, seed };
+const StartFileKind = enum { kernel, initrd, disk, seed, data_disk };
 
 /// Checks if a file exists and is readable.
 /// Returns appropriate error based on file kind (kernel or initrd).
@@ -411,12 +513,14 @@ fn checkReadableFile(path: []const u8, kind: StartFileKind) StartConfigError!voi
             .initrd => error.InitrdNotFound,
             .disk => error.DiskNotFound,
             .seed => error.SeedNotFound,
+            .data_disk => error.DataDiskNotFound,
         },
         else => return switch (kind) {
             .kernel => error.KernelUnreadable,
             .initrd => error.InitrdUnreadable,
             .disk => error.DiskUnreadable,
             .seed => error.SeedUnreadable,
+            .data_disk => error.DataDiskUnreadable,
         },
     }
 }
@@ -471,6 +575,61 @@ fn replaceStringList(
     for (target.*) |item| allocator.free(item);
     if (target.*.len > 0) allocator.free(target.*);
     target.* = try parseCommaSeparated(allocator, value);
+}
+
+fn freeMountList(allocator: std.mem.Allocator, list: []mounts.MountConfig) void {
+    for (list) |mount| {
+        allocator.free(mount.tag);
+        allocator.free(mount.host_path);
+        allocator.free(mount.guest_path);
+    }
+    if (list.len > 0) allocator.free(list);
+}
+
+fn replaceMountList(
+    allocator: std.mem.Allocator,
+    target: *[]mounts.MountConfig,
+    value: []const u8,
+) !void {
+    freeMountList(allocator, target.*);
+    if (value.len == 0) {
+        target.* = &[_]mounts.MountConfig{};
+        return;
+    }
+
+    const parts = try parseCommaSeparated(allocator, value);
+    defer {
+        for (parts) |part| allocator.free(part);
+        if (parts.len > 0) allocator.free(parts);
+    }
+
+    const result = try allocator.alloc(mounts.MountConfig, parts.len);
+    var filled: usize = 0;
+    errdefer {
+        for (result[0..filled]) |mount| {
+            allocator.free(mount.tag);
+            allocator.free(mount.host_path);
+            allocator.free(mount.guest_path);
+        }
+        allocator.free(result);
+    }
+
+    var i: usize = 0;
+    while (i < parts.len) : (i += 1) {
+        const parsed = mounts.parseMountConfig(parts[i]) orelse return error.InvalidValue;
+        result[i] = .{
+            .tag = try allocator.dupe(u8, parsed.tag),
+            .host_path = try allocator.dupe(u8, parsed.host_path),
+            .guest_path = try allocator.dupe(u8, parsed.guest_path),
+            .access = parsed.access,
+            .mount_type = parsed.mount_type,
+            .max_file_size = parsed.max_file_size,
+            .allow_exec = parsed.allow_exec,
+        };
+        filled += 1;
+    }
+
+    target.* = result;
 }
 
 /// Sets an optional path field, freeing any previous value.
@@ -564,6 +723,14 @@ fn applyConfigEntry(
         cfg.disk_readonly = try parseBool(value);
         return;
     }
+    if (std.mem.eql(u8, key, "data_disk_path")) {
+        try setOptionalPath(allocator, &cfg.data_disk_path, value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "data_disk_readonly")) {
+        cfg.data_disk_readonly = try parseBool(value);
+        return;
+    }
 
     if (std.mem.eql(u8, key, "kernel_cmdline")) {
         try setOptionalString(allocator, &cfg.kernel_cmdline, value);
@@ -584,6 +751,16 @@ fn applyConfigEntry(
         try replaceStringList(allocator, &cfg.allowed_ips, value);
         return;
     }
+
+    if (std.mem.eql(u8, key, "mount_roots")) {
+        try replaceStringList(allocator, &cfg.mount_roots, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "mounts")) {
+        try replaceMountList(allocator, &cfg.mounts, value);
+        return;
+    }
 }
 
 /// Writes a VmConfig to m80.conf in the given directory.
@@ -594,9 +771,10 @@ fn applyConfigEntry(
 ///
 /// Writes all config fields including:
 ///   - name, ephemeral, memory_mb, cpu_cores
-///   - kernel_path, initrd_path, disk_path, seed_path, disk_readonly, kernel_cmdline (if set)
+///   - kernel_path, initrd_path, disk_path, seed_path, data_disk_path, disk_readonly, data_disk_readonly, kernel_cmdline (if set)
 ///   - network_mode
 ///   - allowed_domains, allowed_ips (if non-empty, as comma-separated)
+///   - mount_roots, mounts (if non-empty, as comma-separated)
 pub fn writeConfigFile(dir: std.fs.Dir, cfg: VmConfig) !void {
     var f = try dir.createFile("m80.conf", .{ .truncate = true });
     defer f.close();
@@ -621,8 +799,14 @@ pub fn writeConfigFile(dir: std.fs.Dir, cfg: VmConfig) !void {
     if (cfg.seed_path) |path| {
         try w.print("seed_path={s}\n", .{path});
     }
+    if (cfg.data_disk_path) |path| {
+        try w.print("data_disk_path={s}\n", .{path});
+    }
     if (cfg.disk_readonly) {
         try w.print("disk_readonly=true\n", .{});
+    }
+    if (cfg.data_disk_readonly) {
+        try w.print("data_disk_readonly=true\n", .{});
     }
     if (cfg.kernel_cmdline) |value| {
         try w.print("kernel_cmdline={s}\n", .{value});
@@ -643,6 +827,26 @@ pub fn writeConfigFile(dir: std.fs.Dir, cfg: VmConfig) !void {
         for (cfg.allowed_ips, 0..) |ip, i| {
             if (i > 0) try w.writeByte(',');
             try w.writeAll(ip);
+        }
+        try w.writeByte('\n');
+    }
+
+    if (cfg.mount_roots.len > 0) {
+        try w.writeAll("mount_roots=");
+        for (cfg.mount_roots, 0..) |root, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll(root);
+        }
+        try w.writeByte('\n');
+    }
+
+    if (cfg.mounts.len > 0) {
+        try w.writeAll("mounts=");
+        for (cfg.mounts, 0..) |mount_cfg, i| {
+            if (i > 0) try w.writeByte(',');
+            const formatted = try mounts.formatMountConfig(std.heap.page_allocator, &mount_cfg);
+            defer std.heap.page_allocator.free(formatted);
+            try w.writeAll(formatted);
         }
         try w.writeByte('\n');
     }
@@ -675,7 +879,9 @@ test "config: parse kernel/initrd paths and overrides" {
         "initrd_path=/images/initrd.img\n" ++
         "disk_path=/images/rootfs.ext4\n" ++
         "seed_path=/images/seed.iso\n" ++
+        "data_disk_path=/images/data.ext4\n" ++
         "disk_readonly=true\n" ++
+        "data_disk_readonly=true\n" ++
         "kernel_cmdline=console=ttyAMA0\n");
 
     const cfg = try readConfigFile(allocator, tmp.dir, "fallback");
@@ -690,8 +896,40 @@ test "config: parse kernel/initrd paths and overrides" {
     try std.testing.expectEqualStrings("/images/initrd.img", cfg_mut.initrd_path.?);
     try std.testing.expectEqualStrings("/images/rootfs.ext4", cfg_mut.disk_path.?);
     try std.testing.expectEqualStrings("/images/seed.iso", cfg_mut.seed_path.?);
+    try std.testing.expectEqualStrings("/images/data.ext4", cfg_mut.data_disk_path.?);
     try std.testing.expect(cfg_mut.disk_readonly);
+    try std.testing.expect(cfg_mut.data_disk_readonly);
     try std.testing.expectEqualStrings("console=ttyAMA0", cfg_mut.kernel_cmdline.?);
+}
+
+test "config: parse mounts and mount_roots" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
+    defer f.close();
+
+    try f.writeAll("name=testvm\n" ++
+        "mount_roots=/data,/shared\n" ++
+        "mounts=share:/data/project:/mnt/project:ro:virtiofs\n");
+
+    const cfg = try readConfigFile(allocator, tmp.dir, "fallback");
+    var cfg_mut = cfg;
+    defer freeConfig(allocator, &cfg_mut);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg_mut.mount_roots.len);
+    try std.testing.expectEqualStrings("/data", cfg_mut.mount_roots[0]);
+    try std.testing.expectEqualStrings("/shared", cfg_mut.mount_roots[1]);
+    try std.testing.expectEqual(@as(usize, 1), cfg_mut.mounts.len);
+    try std.testing.expectEqualStrings("share", cfg_mut.mounts[0].tag);
+    try std.testing.expectEqualStrings("/data/project", cfg_mut.mounts[0].host_path);
+    try std.testing.expectEqualStrings("/mnt/project", cfg_mut.mounts[0].guest_path);
+    try std.testing.expectEqual(mounts.MountAccess.read_only, cfg_mut.mounts[0].access);
+    try std.testing.expectEqual(mounts.MountType.virtio_fs, cfg_mut.mounts[0].mount_type);
 }
 
 test "config: rejects malformed lines and bad values" {
@@ -729,6 +967,15 @@ test "config: resolveRelativePaths joins vm dir" {
     cfg.initrd_path = try allocator.dupe(u8, "initrd.img");
     cfg.disk_path = try allocator.dupe(u8, "rootfs.ext4");
     cfg.seed_path = try allocator.dupe(u8, "seed.iso");
+    cfg.mount_roots = try parseCommaSeparated(allocator, "shared,root");
+    cfg.mounts = try allocator.alloc(mounts.MountConfig, 1);
+    cfg.mounts[0] = .{
+        .tag = try allocator.dupe(u8, "share"),
+        .host_path = try allocator.dupe(u8, "shared"),
+        .guest_path = try allocator.dupe(u8, "/mnt/share"),
+        .access = .read_only,
+        .mount_type = .virtio_fs,
+    };
 
     try resolveRelativePaths(allocator, "/vm/root", &cfg);
 
@@ -736,6 +983,9 @@ test "config: resolveRelativePaths joins vm dir" {
     try std.testing.expectEqualStrings("/vm/root/initrd.img", cfg.initrd_path.?);
     try std.testing.expectEqualStrings("/vm/root/rootfs.ext4", cfg.disk_path.?);
     try std.testing.expectEqualStrings("/vm/root/seed.iso", cfg.seed_path.?);
+    try std.testing.expectEqualStrings("/vm/root/shared", cfg.mount_roots[0]);
+    try std.testing.expectEqualStrings("/vm/root/root", cfg.mount_roots[1]);
+    try std.testing.expectEqualStrings("/vm/root/shared", cfg.mounts[0].host_path);
 }
 
 test "config: validateStartConfig requires kernel and rootfs" {
@@ -930,6 +1180,40 @@ test "config: validateStartConfig missing fields" {
     std.testing.allocator.free(cfg.initrd_path.?);
     cfg.initrd_path = null;
     cfg.disk_path = try std.testing.allocator.dupe(u8, "/rootfs.ext4");
+    try validateStartConfig(&cfg);
+}
+
+test "config: validateStartConfig requires mount_roots for mounts" {
+    var cfg = try defaultConfig(std.testing.allocator, "test");
+    defer freeConfig(std.testing.allocator, &cfg);
+    cfg.kernel_path = try std.testing.allocator.dupe(u8, "kernel");
+    cfg.disk_path = try std.testing.allocator.dupe(u8, "disk");
+    cfg.mounts = try std.testing.allocator.alloc(mounts.MountConfig, 1);
+    cfg.mounts[0] = .{
+        .tag = try std.testing.allocator.dupe(u8, "share"),
+        .host_path = try std.testing.allocator.dupe(u8, "/data"),
+        .guest_path = try std.testing.allocator.dupe(u8, "/mnt"),
+        .access = .read_only,
+        .mount_type = .virtio_fs,
+    };
+
+    try std.testing.expectError(error.MountRootsRequired, validateStartConfig(&cfg));
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+test "config: validateStartConfig requires open network opt-in" {
+    var cfg = try defaultConfig(std.testing.allocator, "test");
+    defer freeConfig(std.testing.allocator, &cfg);
+    cfg.network_mode = .open;
+    cfg.kernel_path = try std.testing.allocator.dupe(u8, "kernel");
+    cfg.disk_path = try std.testing.allocator.dupe(u8, "disk");
+
+    _ = setenv("M80_ALLOW_OPEN_NETWORK", "0", 1);
+    try std.testing.expectError(error.OpenNetworkNotAllowed, validateStartConfig(&cfg));
+
+    _ = setenv("M80_ALLOW_OPEN_NETWORK", "1", 1);
+    defer _ = setenv("M80_ALLOW_OPEN_NETWORK", "0", 1);
     try validateStartConfig(&cfg);
 }
 
