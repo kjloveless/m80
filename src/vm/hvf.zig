@@ -107,6 +107,17 @@ const virtio_console_mmio_base: u64 = 0x0a001000;
 const virtio_console_mmio_size: u64 = 0x1000;
 const virtio_console_queue_max: u16 = 128;
 
+fn virtioBlkMmioBase(index: usize) u64 {
+    return virtio_blk_mmio_bases[index];
+}
+
+fn virtioBlkIndexForAddr(addr: u64) ?usize {
+    for (virtio_blk_mmio_bases, 0..) |base, index| {
+        if (addr >= base and addr < base + virtio_blk_mmio_size) return index;
+    }
+    return null;
+}
+
 const GicLayout = struct {
     dist_base: u64,
     redist_base: u64,
@@ -1763,29 +1774,41 @@ fn setVirtioConsoleInputFromEnv(allocator: std.mem.Allocator) void {
 
 fn setupVirtioBlk(cfg: config.VmConfig) !void {
     resetVirtioBlkState();
-    const disk_path = cfg.disk_path orelse return;
+    if (cfg.disk_path) |disk_path| {
+        try setupVirtioBlkDevice(0, disk_path, cfg.disk_readonly);
+    }
+    if (cfg.seed_path) |seed_path| {
+        try setupVirtioBlkDevice(1, seed_path, true);
+    }
+}
 
-    const file = if (cfg.disk_readonly)
-        try std.fs.cwd().openFile(disk_path, .{ .mode = .read_only })
+fn setupVirtioBlkDevice(index: usize, path: []const u8, readonly: bool) !void {
+    if (index >= virtio_blk_devices.len) return error.InvalidGuestLayout;
+
+    const file = if (readonly)
+        try std.fs.cwd().openFile(path, .{ .mode = .read_only })
     else
-        try std.fs.cwd().openFile(disk_path, .{ .mode = .read_write });
+        try std.fs.cwd().openFile(path, .{ .mode = .read_write });
     errdefer file.close();
 
     const stat = try file.stat();
     const sectors = stat.size / 512;
     if (stat.size % 512 != 0) {
-        log.warn("hvf disk size not multiple of 512 bytes path={s} size={d}", .{ disk_path, stat.size });
+        log.warn("hvf virtio-blk[{d}] size not multiple of 512 bytes path={s} size={d}", .{ index, path, stat.size });
     }
 
-    virtio_blk_state.enabled = true;
-    virtio_blk_state.readonly = cfg.disk_readonly;
-    virtio_blk_state.capacity_sectors = sectors;
-    virtio_blk_state.file = file;
+    var device = &virtio_blk_devices[index];
+    device.* = .{};
+    device.enabled = true;
+    device.readonly = readonly;
+    device.capacity_sectors = sectors;
+    device.file = file;
 
-    log.info("hvf virtio-blk enabled path={s} sectors={d} ro={s}", .{
-        disk_path,
+    log.info("hvf virtio-blk[{d}] enabled path={s} sectors={d} ro={s}", .{
+        index,
+        path,
         sectors,
-        if (cfg.disk_readonly) "true" else "false",
+        if (readonly) "true" else "false",
     });
 }
 
@@ -1808,8 +1831,8 @@ fn readVirtioBlkReq(req_addr: u64) !VirtioBlkReq {
     return std.mem.bytesToValue(VirtioBlkReq, &buf);
 }
 
-fn processVirtioBlkRequest(head: u16) !u32 {
-    const queue = &virtio_blk_state.queue;
+fn processVirtioBlkRequest(device: *VirtioBlkDevice, head: u16) !u32 {
+    const queue = &device.queue;
     const queue_size = queue.num;
     if (queue_size == 0) return 0;
     if (head >= queue_size) return error.InvalidGuestLayout;
@@ -1860,7 +1883,7 @@ fn processVirtioBlkRequest(head: u16) !u32 {
     const disk_offset = req.sector * sector_size;
     const data_len: u64 = data_desc.len;
     var status: u8 = virtio_blk_s_ok;
-    const disk_len = virtio_blk_state.capacity_sectors * sector_size;
+    const disk_len = device.capacity_sectors * sector_size;
     if (disk_offset + data_len > disk_len) {
         status = virtio_blk_s_ioerr;
     }
@@ -1871,7 +1894,7 @@ fn processVirtioBlkRequest(head: u16) !u32 {
                 // status already set
             } else if ((data_desc.flags & virtq_desc_flag_write) == 0) {
                 status = virtio_blk_s_ioerr;
-            } else if (virtio_blk_state.file) |*file| {
+            } else if (device.file) |*file| {
                 var remaining = data_len;
                 var offset: u64 = 0;
                 var buf: [64 * 1024]u8 = undefined;
@@ -1901,11 +1924,11 @@ fn processVirtioBlkRequest(head: u16) !u32 {
         virtio_blk_t_out => {
             if (status != virtio_blk_s_ok) {
                 // status already set
-            } else if (virtio_blk_state.readonly) {
+            } else if (device.readonly) {
                 status = virtio_blk_s_ioerr;
             } else if ((data_desc.flags & virtq_desc_flag_write) != 0) {
                 status = virtio_blk_s_ioerr;
-            } else if (virtio_blk_state.file) |*file| {
+            } else if (device.file) |*file| {
                 var remaining = data_len;
                 var offset: u64 = 0;
                 var buf: [64 * 1024]u8 = undefined;
@@ -1935,8 +1958,8 @@ fn processVirtioBlkRequest(head: u16) !u32 {
     }
 
     try writeVirtioBlkStatus(status_desc.addr, status);
-    if (virtio_blk_log_remaining > 0) {
-        virtio_blk_log_remaining -= 1;
+    if (device.log_remaining > 0) {
+        device.log_remaining -= 1;
         log.info(
             "hvf virtio-blk req type={d} sector={d} len={d} status={d}",
             .{ req.@"type", req.sector, data_len, status },
@@ -1945,17 +1968,19 @@ fn processVirtioBlkRequest(head: u16) !u32 {
     return @intCast(data_len);
 }
 
-fn processVirtioBlkQueue() !void {
-    if (!virtio_blk_state.enabled) return;
-    const queue = &virtio_blk_state.queue;
+fn processVirtioBlkQueue(index: usize) !void {
+    if (index >= virtio_blk_devices.len) return;
+    const device = &virtio_blk_devices[index];
+    if (!device.enabled) return;
+    const queue = &device.queue;
     if (!queue.ready or queue.num == 0) return;
 
     const avail_idx = try readGuestU16(queue.avail_addr + 2);
     while (queue.last_avail_idx != avail_idx) {
         const ring_index = queue.last_avail_idx % queue.num;
         const head = try readGuestU16(queue.avail_addr + 4 + @as(u64, ring_index) * 2);
-        const used_len = processVirtioBlkRequest(head) catch |e| blk: {
-            log.warn("hvf virtio-blk request failed: {s}", .{@errorName(e)});
+        const used_len = processVirtioBlkRequest(device, head) catch |e| blk: {
+            log.warn("hvf virtio-blk[{d}] request failed: {s}", .{ index, @errorName(e) });
             break :blk 0;
         };
         const used_slot = queue.used_idx % queue.num;
@@ -1965,81 +1990,83 @@ fn processVirtioBlkQueue() !void {
         try writeGuestU16(queue.used_addr + 2, queue.used_idx);
         queue.last_avail_idx +%= 1;
     }
-    virtio_blk_state.interrupt_status |= virtio_mmio_int_vring;
-    updateVirtioBlkInterrupt();
+    device.interrupt_status |= virtio_mmio_int_vring;
+    updateVirtioBlkInterrupt(index);
 }
 
-fn handleVirtioBlkMmio(offset: u64, is_write: bool, size: usize, value: u64) u64 {
-    if (!virtio_blk_state.enabled) return 0;
+fn handleVirtioBlkMmio(index: usize, offset: u64, is_write: bool, size: usize, value: u64) u64 {
+    if (index >= virtio_blk_devices.len) return 0;
+    const device = &virtio_blk_devices[index];
+    if (!device.enabled) return 0;
     const width: usize = @min(size, 4);
     if (is_write) {
         const v32: u32 = @intCast(value & 0xFFFF_FFFF);
         switch (offset) {
-            virtio_mmio_reg_device_features_sel => virtio_blk_state.device_features_sel = v32,
-            virtio_mmio_reg_driver_features_sel => virtio_blk_state.driver_features_sel = v32,
+            virtio_mmio_reg_device_features_sel => device.device_features_sel = v32,
+            virtio_mmio_reg_driver_features_sel => device.driver_features_sel = v32,
             virtio_mmio_reg_driver_features => {
-                const sel = virtio_blk_state.driver_features_sel;
-                if (sel < virtio_blk_state.driver_features.len) {
-                    virtio_blk_state.driver_features[sel] = v32;
+                const sel = device.driver_features_sel;
+                if (sel < device.driver_features.len) {
+                    device.driver_features[sel] = v32;
                 }
             },
-            virtio_mmio_reg_queue_sel => virtio_blk_state.queue_sel = @intCast(v32 & 0xFFFF),
+            virtio_mmio_reg_queue_sel => device.queue_sel = @intCast(v32 & 0xFFFF),
             virtio_mmio_reg_queue_num => {
-                if (virtio_blk_state.queue_sel == 0) {
+                if (device.queue_sel == 0) {
                     const requested: u16 = @intCast(v32 & 0xFFFF);
-                    virtio_blk_state.queue.num = @min(requested, virtio_blk_queue_max);
+                    device.queue.num = @min(requested, virtio_blk_queue_max);
                 }
             },
             virtio_mmio_reg_queue_ready => {
-                if (virtio_blk_state.queue_sel == 0) {
-                    virtio_blk_state.queue.ready = (v32 & 0x1) == 1;
-                    log.info("hvf virtio-blk queue ready={s}", .{if (virtio_blk_state.queue.ready) "true" else "false"});
+                if (device.queue_sel == 0) {
+                    device.queue.ready = (v32 & 0x1) == 1;
+                    log.info("hvf virtio-blk[{d}] queue ready={s}", .{ index, if (device.queue.ready) "true" else "false" });
                 }
             },
-            virtio_mmio_reg_queue_desc_low => if (virtio_blk_state.queue_sel == 0) {
-                virtio_blk_state.queue.desc_addr = (virtio_blk_state.queue.desc_addr & 0xFFFF_FFFF_0000_0000) | v32;
+            virtio_mmio_reg_queue_desc_low => if (device.queue_sel == 0) {
+                device.queue.desc_addr = (device.queue.desc_addr & 0xFFFF_FFFF_0000_0000) | v32;
             },
-            virtio_mmio_reg_queue_desc_high => if (virtio_blk_state.queue_sel == 0) {
-                virtio_blk_state.queue.desc_addr = (@as(u64, v32) << 32) | (virtio_blk_state.queue.desc_addr & 0xFFFF_FFFF);
+            virtio_mmio_reg_queue_desc_high => if (device.queue_sel == 0) {
+                device.queue.desc_addr = (@as(u64, v32) << 32) | (device.queue.desc_addr & 0xFFFF_FFFF);
             },
-            virtio_mmio_reg_queue_driver_low => if (virtio_blk_state.queue_sel == 0) {
-                virtio_blk_state.queue.avail_addr = (virtio_blk_state.queue.avail_addr & 0xFFFF_FFFF_0000_0000) | v32;
+            virtio_mmio_reg_queue_driver_low => if (device.queue_sel == 0) {
+                device.queue.avail_addr = (device.queue.avail_addr & 0xFFFF_FFFF_0000_0000) | v32;
             },
-            virtio_mmio_reg_queue_driver_high => if (virtio_blk_state.queue_sel == 0) {
-                virtio_blk_state.queue.avail_addr = (@as(u64, v32) << 32) | (virtio_blk_state.queue.avail_addr & 0xFFFF_FFFF);
+            virtio_mmio_reg_queue_driver_high => if (device.queue_sel == 0) {
+                device.queue.avail_addr = (@as(u64, v32) << 32) | (device.queue.avail_addr & 0xFFFF_FFFF);
             },
-            virtio_mmio_reg_queue_device_low => if (virtio_blk_state.queue_sel == 0) {
-                virtio_blk_state.queue.used_addr = (virtio_blk_state.queue.used_addr & 0xFFFF_FFFF_0000_0000) | v32;
+            virtio_mmio_reg_queue_device_low => if (device.queue_sel == 0) {
+                device.queue.used_addr = (device.queue.used_addr & 0xFFFF_FFFF_0000_0000) | v32;
             },
-            virtio_mmio_reg_queue_device_high => if (virtio_blk_state.queue_sel == 0) {
-                virtio_blk_state.queue.used_addr = (@as(u64, v32) << 32) | (virtio_blk_state.queue.used_addr & 0xFFFF_FFFF);
+            virtio_mmio_reg_queue_device_high => if (device.queue_sel == 0) {
+                device.queue.used_addr = (@as(u64, v32) << 32) | (device.queue.used_addr & 0xFFFF_FFFF);
             },
             virtio_mmio_reg_queue_notify => {
                 const queue_index: u16 = @intCast(v32 & 0xFFFF);
                 if (queue_index == 0) {
-                    processVirtioBlkQueue() catch |e| {
-                        log.warn("hvf virtio-blk queue notify failed: {s}", .{@errorName(e)});
+                    processVirtioBlkQueue(index) catch |e| {
+                        log.warn("hvf virtio-blk[{d}] queue notify failed: {s}", .{ index, @errorName(e) });
                     };
-                    log.debug("hvf virtio-blk queue notify", .{});
+                    log.debug("hvf virtio-blk[{d}] queue notify", .{index});
                 } else {
-                    log.warn("hvf virtio-blk queue notify unsupported index={d}", .{queue_index});
+                    log.warn("hvf virtio-blk[{d}] queue notify unsupported index={d}", .{ index, queue_index });
                 }
             },
             virtio_mmio_reg_interrupt_ack => {
-                virtio_blk_state.interrupt_status &= ~v32;
-                updateVirtioBlkInterrupt();
-                log.debug("hvf virtio-blk interrupt ack=0x{x}", .{v32});
+                device.interrupt_status &= ~v32;
+                updateVirtioBlkInterrupt(index);
+                log.debug("hvf virtio-blk[{d}] interrupt ack=0x{x}", .{ index, v32 });
             },
             virtio_mmio_reg_status => {
                 if (v32 == 0) {
-                    virtio_blk_state.status = 0;
-                    resetVirtioBlkQueue();
+                    device.status = 0;
+                    resetVirtioBlkQueue(device);
                 } else {
-                    virtio_blk_state.status = v32;
+                    device.status = v32;
                 }
-                if (virtio_blk_state.status != virtio_blk_state.status_last) {
-                    log.info("hvf virtio-blk status=0x{x}", .{virtio_blk_state.status});
-                    virtio_blk_state.status_last = virtio_blk_state.status;
+                if (device.status != device.status_last) {
+                    log.info("hvf virtio-blk[{d}] status=0x{x}", .{ index, device.status });
+                    device.status_last = device.status;
                 }
             },
             else => {},
@@ -2052,33 +2079,33 @@ fn handleVirtioBlkMmio(offset: u64, is_write: bool, size: usize, value: u64) u64
         virtio_mmio_reg_version => return virtio_mmio_version,
         virtio_mmio_reg_device_id => return virtio_mmio_device_id_blk,
         virtio_mmio_reg_vendor_id => return virtio_mmio_vendor_id,
-        virtio_mmio_reg_device_features => return virtioBlkDeviceFeatures(virtio_blk_state.device_features_sel),
-        virtio_mmio_reg_device_features_sel => return virtio_blk_state.device_features_sel,
-        virtio_mmio_reg_driver_features_sel => return virtio_blk_state.driver_features_sel,
+        virtio_mmio_reg_device_features => return virtioBlkDeviceFeatures(device, device.device_features_sel),
+        virtio_mmio_reg_device_features_sel => return device.device_features_sel,
+        virtio_mmio_reg_driver_features_sel => return device.driver_features_sel,
         virtio_mmio_reg_driver_features => {
-            const sel = virtio_blk_state.driver_features_sel;
-            if (sel < virtio_blk_state.driver_features.len) return virtio_blk_state.driver_features[sel];
+            const sel = device.driver_features_sel;
+            if (sel < device.driver_features.len) return device.driver_features[sel];
             return 0;
         },
-        virtio_mmio_reg_queue_sel => return virtio_blk_state.queue_sel,
+        virtio_mmio_reg_queue_sel => return device.queue_sel,
         virtio_mmio_reg_queue_num_max => return virtio_blk_queue_max,
-        virtio_mmio_reg_queue_num => return virtio_blk_state.queue.num,
-        virtio_mmio_reg_queue_ready => return if (virtio_blk_state.queue.ready) 1 else 0,
-        virtio_mmio_reg_interrupt_status => return virtio_blk_state.interrupt_status,
-        virtio_mmio_reg_status => return virtio_blk_state.status,
-        virtio_mmio_reg_queue_desc_low => return @intCast(virtio_blk_state.queue.desc_addr & 0xFFFF_FFFF),
-        virtio_mmio_reg_queue_desc_high => return @intCast(virtio_blk_state.queue.desc_addr >> 32),
-        virtio_mmio_reg_queue_driver_low => return @intCast(virtio_blk_state.queue.avail_addr & 0xFFFF_FFFF),
-        virtio_mmio_reg_queue_driver_high => return @intCast(virtio_blk_state.queue.avail_addr >> 32),
-        virtio_mmio_reg_queue_device_low => return @intCast(virtio_blk_state.queue.used_addr & 0xFFFF_FFFF),
-        virtio_mmio_reg_queue_device_high => return @intCast(virtio_blk_state.queue.used_addr >> 32),
+        virtio_mmio_reg_queue_num => return device.queue.num,
+        virtio_mmio_reg_queue_ready => return if (device.queue.ready) 1 else 0,
+        virtio_mmio_reg_interrupt_status => return device.interrupt_status,
+        virtio_mmio_reg_status => return device.status,
+        virtio_mmio_reg_queue_desc_low => return @intCast(device.queue.desc_addr & 0xFFFF_FFFF),
+        virtio_mmio_reg_queue_desc_high => return @intCast(device.queue.desc_addr >> 32),
+        virtio_mmio_reg_queue_driver_low => return @intCast(device.queue.avail_addr & 0xFFFF_FFFF),
+        virtio_mmio_reg_queue_driver_high => return @intCast(device.queue.avail_addr >> 32),
+        virtio_mmio_reg_queue_device_low => return @intCast(device.queue.used_addr & 0xFFFF_FFFF),
+        virtio_mmio_reg_queue_device_high => return @intCast(device.queue.used_addr >> 32),
         virtio_mmio_reg_config_generation => return 0,
         else => {
             if (offset >= virtio_mmio_reg_config) {
                 const config_offset = offset - virtio_mmio_reg_config;
                 if (config_offset < 8) {
                     var buf: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &buf, virtio_blk_state.capacity_sectors, .little);
+                    std.mem.writeInt(u64, &buf, device.capacity_sectors, .little);
                     const config_start: usize = @intCast(config_offset);
                     const end = @min(config_start + width, buf.len);
                     var val: u32 = 0;
@@ -2471,13 +2498,14 @@ fn handleArm64Mmio(vcpu: arm64_bindings.VcpuId, exit: HvfArmExitException) !bool
         try advanceArmPc(vcpu, il);
         return true;
     }
-    if (virtio_blk_state.enabled and addr >= virtio_blk_mmio_base and addr < virtio_blk_mmio_base + virtio_blk_mmio_size) {
-        const offset = addr - virtio_blk_mmio_base;
+    if (virtioBlkIndexForAddr(addr)) |index| {
+        if (!virtio_blk_devices[index].enabled) return false;
+        const offset = addr - virtioBlkMmioBase(index);
         if (is_write) {
             const value = try arm64ReadRegByIndex(vcpu, srt);
-            _ = handleVirtioBlkMmio(offset, true, size, value);
+            _ = handleVirtioBlkMmio(index, offset, true, size, value);
         } else {
-            const value = handleVirtioBlkMmio(offset, false, size, 0);
+            const value = handleVirtioBlkMmio(index, offset, false, size, 0);
             const mask: u64 = if (size >= 8)
                 std.math.maxInt(u64)
             else
@@ -3160,15 +3188,23 @@ pub fn start(cfg: config.VmConfig) !void {
             log.warn("hvf gic spi range unavailable; using default base=32: {s}", .{@errorName(e)});
         };
         const uart_intid = spi_base + pl011_irq_offset;
-        var virtio_blk_intid: ?u32 = null;
+        var virtio_blk0_intid: ?u32 = null;
+        var virtio_blk1_intid: ?u32 = null;
         if (cfg.disk_path != null) {
             const candidate = spi_base;
             if (spi_count != 0 and candidate >= spi_base + spi_count) {
-                log.warn("hvf virtio-blk irq out of range base={d} count={d}", .{ spi_base, spi_count });
+                log.warn("hvf virtio-blk0 irq out of range base={d} count={d}", .{ spi_base, spi_count });
             }
-            virtio_blk_intid = candidate;
-            gic_virtio_blk_intid = candidate;
+            virtio_blk0_intid = candidate;
         }
+        if (cfg.seed_path != null) {
+            const candidate = spi_base + pl011_irq_offset + 2;
+            if (spi_count != 0 and candidate >= spi_base + spi_count) {
+                log.warn("hvf virtio-blk1 irq out of range base={d} count={d}", .{ spi_base, spi_count });
+            }
+            virtio_blk1_intid = candidate;
+        }
+        gic_virtio_blk_intid = .{ virtio_blk0_intid, virtio_blk1_intid };
         var virtio_console_intid: ?u32 = null;
         if (enable_virtio_console) {
             const candidate = spi_base + pl011_irq_offset + 1;
@@ -3179,14 +3215,21 @@ pub fn start(cfg: config.VmConfig) !void {
             gic_virtio_console_intid = candidate;
         }
         const uart_irq = uart_intid - spi_base;
-        const virtio_blk_irq = if (virtio_blk_intid) |intid| intid - spi_base else null;
+        const virtio_blk0_irq = if (virtio_blk0_intid) |intid| intid - spi_base else null;
+        const virtio_blk1_irq = if (virtio_blk1_intid) |intid| intid - spi_base else null;
         const virtio_console_irq = if (virtio_console_intid) |intid| intid - spi_base else null;
         const initrd_start = if (initrd_size > 0) guestInitrdBase() else null;
         const initrd_end = if (initrd_size > 0) guestInitrdBase() + initrd_size else null;
-        if (cfg.disk_path != null and virtio_blk_irq != null) {
+        if (cfg.disk_path != null and virtio_blk0_irq != null) {
             log.info(
-                "hvf virtio-blk dtb base=0x{x} irq={d} intid={d}",
-                .{ virtio_blk_mmio_base, virtio_blk_irq.?, virtio_blk_intid.? },
+                "hvf virtio-blk[0] dtb base=0x{x} irq={d} intid={d}",
+                .{ virtioBlkMmioBase(0), virtio_blk0_irq.?, virtio_blk0_intid.? },
+            );
+        }
+        if (cfg.seed_path != null and virtio_blk1_irq != null) {
+            log.info(
+                "hvf virtio-blk[1] dtb base=0x{x} irq={d} intid={d}",
+                .{ virtioBlkMmioBase(1), virtio_blk1_irq.?, virtio_blk1_intid.? },
             );
         }
         if (enable_virtio_console and virtio_console_irq != null) {
@@ -3204,8 +3247,10 @@ pub fn start(cfg: config.VmConfig) !void {
             .uart_irq = uart_irq,
             .initrd_start = initrd_start,
             .initrd_end = initrd_end,
-            .virtio_blk_base = if (cfg.disk_path != null) virtio_blk_mmio_base else null,
-            .virtio_blk_irq = virtio_blk_irq,
+            .virtio_blk_base = if (cfg.disk_path != null) virtioBlkMmioBase(0) else null,
+            .virtio_blk_irq = virtio_blk0_irq,
+            .virtio_blk2_base = if (cfg.seed_path != null) virtioBlkMmioBase(1) else null,
+            .virtio_blk2_irq = virtio_blk1_irq,
             .virtio_console_base = if (enable_virtio_console) virtio_console_mmio_base else null,
             .virtio_console_irq = virtio_console_irq,
         }) catch |e| {
@@ -3353,7 +3398,7 @@ pub fn stop() !void {
     clearActiveGuestMemory();
     gic_enabled = false;
     gic_uart_intid = null;
-    gic_virtio_blk_intid = null;
+    gic_virtio_blk_intid = .{ null, null };
     gic_virtio_console_intid = null;
     gic_layout = null;
 }

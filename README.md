@@ -78,6 +78,9 @@ zig build test
 Common keys:
 - `kernel_path`: Linux kernel image path
 - `initrd_path`: initrd/initramfs path
+- `disk_path`: rootfs block image path (virtio-blk)
+- `seed_path`: cloud-init NoCloud seed image (attached as secondary read-only disk)
+- `disk_readonly`: attach `disk_path` read-only (default: false)
 - `kernel_cmdline`: optional kernel command line override
 
 Example (arm64 + initramfs):
@@ -86,6 +89,21 @@ Example (arm64 + initramfs):
 kernel_path=images/linux
 initrd_path=images/initrd.gz
 kernel_cmdline=console=ttyAMA0,115200
+```
+
+Example (arm64 + rootfs + NoCloud seed):
+
+```
+kernel_path=images/linux
+disk_path=images/debian-12-nocloud-arm64.raw
+seed_path=images/debian-nocloud-seed.iso
+kernel_cmdline=earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw
+```
+
+Shortcut (Debian NoCloud dev VM):
+
+```
+m80 start-deb
 ```
 
 ## HVF arm64 Boot Smoke Test

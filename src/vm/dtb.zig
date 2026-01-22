@@ -51,6 +51,9 @@ pub const DtbConfig = struct {
     virtio_blk_base: ?u64 = null,
     virtio_blk_size: u64 = 0x1000,
     virtio_blk_irq: ?u32 = null,
+    virtio_blk2_base: ?u64 = null,
+    virtio_blk2_size: u64 = 0x1000,
+    virtio_blk2_irq: ?u32 = null,
     virtio_console_base: ?u64 = null,
     virtio_console_size: u64 = 0x1000,
     virtio_console_irq: ?u32 = null,
@@ -152,6 +155,16 @@ pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
         try propString(allocator, &struct_buf, &strings, "compatible", "virtio,mmio");
         try propReg64(allocator, &struct_buf, &strings, "reg", cfg.virtio_blk_base.?, cfg.virtio_blk_size);
         try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_blk_irq.?, 4);
+        try endNode(allocator, &struct_buf);
+    }
+
+    if (cfg.virtio_blk2_base != null and cfg.virtio_blk2_irq != null) {
+        var node_name_buf: [64]u8 = undefined;
+        const node_name = try std.fmt.bufPrint(&node_name_buf, "virtio_blk@{x}", .{cfg.virtio_blk2_base.?});
+        try beginNode(allocator, &struct_buf, node_name);
+        try propString(allocator, &struct_buf, &strings, "compatible", "virtio,mmio");
+        try propReg64(allocator, &struct_buf, &strings, "reg", cfg.virtio_blk2_base.?, cfg.virtio_blk2_size);
+        try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_blk2_irq.?, 4);
         try endNode(allocator, &struct_buf);
     }
 

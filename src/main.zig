@@ -6,6 +6,7 @@
 //! ## Supported Commands
 //! - `init <name>`: Create a new VM with the given name (creates directory and default config)
 //! - `start <name>`: Start an existing VM (loads config, sets up jailer, launches hypervisor)
+//! - `start-deb`: Start the Debian NoCloud dev VM (auto-configures "deb" if missing)
 //! - `stop <name>`: Stop a running VM
 //! - `delete <name>`: Remove a VM and its associated files
 //! - `ps`: List all VMs and their current status (running/stopped)
@@ -51,6 +52,7 @@ pub fn writeHelp(writer: anytype) !void {
         \\usage:
         \\  m80 init <name>
         \\  m80 start <name>
+        \\  m80 start-deb
         \\  m80 stop <name>
         \\  m80 delete <name>
         \\  m80 ps
@@ -129,6 +131,7 @@ fn logPathAndSize(label: []const u8, path_opt: ?[]const u8) void {
 ///   - kernel: Path to the Linux kernel image and its file size
 ///   - initrd: Path to the initial ramdisk and its file size
 ///   - disk: Path to the rootfs disk image and its file size
+///   - seed: Path to the cloud-init seed image and its file size
 ///   - kernel_cmdline: Optional kernel command line override
 ///
 /// Parameters:
@@ -141,9 +144,182 @@ fn logStartPreflight(cfg: *const core.config.VmConfig) void {
     logPathAndSize("kernel", cfg.kernel_path);
     logPathAndSize("initrd", cfg.initrd_path);
     logPathAndSize("disk", cfg.disk_path);
+    logPathAndSize("seed", cfg.seed_path);
     if (cfg.kernel_cmdline) |cmdline| {
         log.debug("kernel_cmdline: {s}", .{cmdline});
     }
+}
+
+fn optPath(path: ?[]const u8) []const u8 {
+    return path orelse "<unset>";
+}
+
+fn dieStartConfigError(err: core.config.StartConfigError, cfg: *const core.config.VmConfig) noreturn {
+    switch (err) {
+        error.MissingKernel => errors.die(
+            "kernel_path not set in m80.conf. Set kernel_path=/path/to/Image and retry.",
+            .{},
+        ),
+        error.MissingRootfs => errors.die(
+            "initrd_path or disk_path required. Set initrd_path=/path/to/initrd.gz or disk_path=/path/to/rootfs.raw and retry.",
+            .{},
+        ),
+        error.SeedRequiresDisk => errors.die(
+            "seed_path requires disk_path. Set disk_path or remove seed_path.",
+            .{},
+        ),
+        error.KernelNotFound => errors.die(
+            "kernel_path not found: {s}. Check the path or download a kernel.",
+            .{optPath(cfg.kernel_path)},
+        ),
+        error.InitrdNotFound => errors.die(
+            "initrd_path not found: {s}. Check the path or provide a valid initrd.",
+            .{optPath(cfg.initrd_path)},
+        ),
+        error.DiskNotFound => errors.die(
+            "disk_path not found: {s}. Check the path or provide a valid rootfs image.",
+            .{optPath(cfg.disk_path)},
+        ),
+        error.SeedNotFound => errors.die(
+            "seed_path not found: {s}. Check the path or remove seed_path.",
+            .{optPath(cfg.seed_path)},
+        ),
+        error.KernelUnreadable => errors.die(
+            "kernel_path not readable: {s}. Check permissions (chmod +r) or ownership.",
+            .{optPath(cfg.kernel_path)},
+        ),
+        error.InitrdUnreadable => errors.die(
+            "initrd_path not readable: {s}. Check permissions (chmod +r) or ownership.",
+            .{optPath(cfg.initrd_path)},
+        ),
+        error.DiskUnreadable => errors.die(
+            "disk_path not readable: {s}. Check permissions (chmod +r) or ownership.",
+            .{optPath(cfg.disk_path)},
+        ),
+        error.SeedUnreadable => errors.die(
+            "seed_path not readable: {s}. Check permissions (chmod +r) or ownership.",
+            .{optPath(cfg.seed_path)},
+        ),
+    }
+}
+
+fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
+    const name = "deb";
+    state.initVm(allocator, name) catch |e| switch (e) {
+        error.AlreadyExists => {},
+        error.InvalidArgs => errors.die("invalid vm name: {s}", .{name}),
+        else => return e,
+    };
+
+    const dir_path = try core.paths.vmDir(allocator, name);
+    defer allocator.free(dir_path);
+
+    var cwd = std.fs.cwd();
+    var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+    defer vm_dir.close();
+
+    const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| {
+        errors.die("invalid config: {s}", .{@errorName(e)});
+    };
+    var cfg_mut = cfg;
+    defer core.config.freeConfig(allocator, &cfg_mut);
+
+    const cwd_path = try cwd.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd_path);
+    const kernel_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "debian-trixie-arm64-linux" });
+    defer allocator.free(kernel_path);
+    const initrd_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "debian-trixie-arm64-initrd.gz" });
+    defer allocator.free(initrd_path);
+    const disk_path = try std.fs.path.join(
+        allocator,
+        &[_][]const u8{ cwd_path, "images", "debian-12-nocloud-arm64-20250316-2053.raw" },
+    );
+    defer allocator.free(disk_path);
+    const seed_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "debian-nocloud-seed.iso" });
+    defer allocator.free(seed_path);
+
+    if (cfg_mut.kernel_path == null) {
+        cfg_mut.kernel_path = try allocator.dupe(u8, kernel_path);
+    }
+    if (cfg_mut.initrd_path == null) {
+        cfg_mut.initrd_path = try allocator.dupe(u8, initrd_path);
+    }
+    if (cfg_mut.disk_path == null) {
+        cfg_mut.disk_path = try allocator.dupe(u8, disk_path);
+    }
+    if (cfg_mut.seed_path == null) {
+        cfg_mut.seed_path = try allocator.dupe(u8, seed_path);
+    }
+    if (cfg_mut.kernel_cmdline == null) {
+        cfg_mut.kernel_cmdline = try allocator.dupe(
+            u8,
+            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=3 systemd.show_status=no systemd.log_level=warning fsck.mode=skip fsck.repair=no",
+        );
+    }
+
+    try core.config.writeConfigFile(vm_dir, cfg_mut);
+}
+
+fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bool) !void {
+    if (ensure_deb) {
+        try ensureDebVmConfig(allocator);
+    }
+    var jailer = try Jailer.init(allocator);
+    defer jailer.deinit();
+
+    try jailer.prepare();
+
+    var vm = try Vm.init(allocator, &jailer);
+    defer vm.deinit();
+
+    const dir_path = try core.paths.vmDir(allocator, name);
+    defer allocator.free(dir_path);
+
+    var cwd = std.fs.cwd();
+    var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+    defer vm_dir.close();
+
+    const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| {
+        errors.die("invalid config: {s}", .{@errorName(e)});
+    };
+    var cfg_mut = cfg;
+    defer core.config.freeConfig(allocator, &cfg_mut);
+
+    try core.config.resolveRelativePaths(allocator, dir_path, &cfg_mut);
+
+    logStartPreflight(&cfg_mut);
+
+    core.config.validateStartConfig(&cfg_mut) catch |e| {
+        dieStartConfigError(e, &cfg_mut);
+    };
+    core.config.validateStartFiles(&cfg_mut) catch |e| {
+        dieStartConfigError(e, &cfg_mut);
+    };
+
+    vm.start(cfg_mut) catch |e| {
+        errors.die("start failed: {s}", .{@errorName(e)});
+    };
+
+    state.setStatus(allocator, name, .running) catch |e| switch (e) {
+        error.InvalidArgs => errors.die("invalid vm name: {s}\n", .{name}),
+        error.NotFound => errors.die("vm not found: {s}\n", .{name}),
+        else => return e,
+    };
+    installSignalHandlers() catch |e| {
+        errors.die("start failed: {s}", .{@errorName(e)});
+    };
+    std.debug.print("vm running (Ctrl+C to stop)\n", .{});
+    waitForStopSignal();
+
+    vm.stop() catch |e| {
+        errors.die("stop failed: {s}", .{@errorName(e)});
+    };
+    state.setStatus(allocator, name, .stopped) catch |e| switch (e) {
+        error.InvalidArgs => errors.die("invalid vm name: {s}\n", .{name}),
+        error.NotFound => errors.die("vm not found: {s}\n", .{name}),
+        else => return e,
+    };
+    std.debug.print("stopped vm: {s}\n", .{name});
 }
 
 var stop_requested = std.atomic.Value(bool).init(false);
@@ -249,6 +425,11 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "start-deb")) {
+        try startVmCommand(allocator, "deb", true);
+        return;
+    }
+
     // ===== COMMANDS REQUIRING A VM NAME =====
     // All remaining commands (init, start, stop, delete, inspect) require a VM name.
     if (args.len < 3) {
@@ -298,79 +479,7 @@ pub fn main() !void {
     // 5. Launch the VM via the hypervisor
     // 6. Update status file to "running"
     if (std.mem.eql(u8, cmd, "start")) {
-        // Step 1: Initialize Jailer - handles privilege dropping, resource limits,
-        // and platform-specific sandboxing (seccomp on Linux, sandbox on macOS, etc.)
-        var jailer = try Jailer.init(allocator);
-        defer jailer.deinit();
-
-        // Prepare the security sandbox (drop privileges, set resource limits)
-        try jailer.prepare();
-
-        // Step 2: Initialize VM - selects the appropriate hypervisor backend:
-        // - Windows: Windows Hypervisor Platform (WHP)
-        // - macOS: Hypervisor Framework (HVF)
-        // - Linux: Kernel-based Virtual Machine (KVM)
-        var vm = try Vm.init(allocator, &jailer);
-        defer vm.deinit();
-
-        // Step 3: Load configuration from the VM's directory
-        const dir_path = try core.paths.vmDir(allocator, name);
-        defer allocator.free(dir_path);
-
-        var cwd = std.fs.cwd();
-        var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
-        defer vm_dir.close();
-
-        // Parse m80.conf file (key=value format)
-        const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| {
-            errors.die("invalid config: {s}", .{@errorName(e)});
-        };
-        var cfg_mut = cfg;
-        defer core.config.freeConfig(allocator, &cfg_mut);
-
-        // Step 4: Convert relative paths in config to absolute paths.
-        // This allows m80.conf to use paths like "kernel.img" instead of full paths.
-        try core.config.resolveRelativePaths(allocator, dir_path, &cfg_mut);
-
-        // Log configuration details at debug level (for troubleshooting)
-        logStartPreflight(&cfg_mut);
-
-        // Step 5: Validate configuration - check required fields are set
-        core.config.validateStartConfig(&cfg_mut) catch |e| {
-            errors.die("invalid config for start: {s}", .{@errorName(e)});
-        };
-        // Validate that referenced files (kernel, initrd) actually exist
-        core.config.validateStartFiles(&cfg_mut) catch |e| {
-            errors.die("invalid config for start: {s}", .{@errorName(e)});
-        };
-
-        // Step 6: Launch the VM via the platform hypervisor
-        vm.start(cfg_mut) catch |e| {
-            errors.die("start failed: {s}", .{@errorName(e)});
-        };
-
-        // Step 7: Update status file to reflect running state
-        state.setStatus(allocator, name, .running) catch |e| switch (e) {
-            error.InvalidArgs => errors.die("invalid vm name: {s}\n", .{name}),
-            error.NotFound => errors.die("vm not found: {s}\n", .{name}),
-            else => return e,
-        };
-        // Firecracker-style: block in foreground until SIGINT/SIGTERM.
-        installSignalHandlers() catch |e| {
-            errors.die("start failed: {s}", .{@errorName(e)});
-        };
-        std.debug.print("vm running (Ctrl+C to stop)\n", .{});
-        waitForStopSignal();
-
-        vm.stop() catch |e| {
-            errors.die("stop failed: {s}", .{@errorName(e)});
-        };
-        state.setStatus(allocator, name, .stopped) catch |e| switch (e) {
-            error.InvalidArgs => errors.die("invalid vm name: {s}\n", .{name}),
-            error.NotFound => errors.die("vm not found: {s}\n", .{name}),
-            else => return e,
-        };
-        std.debug.print("stopped vm: {s}\n", .{name});
+        try startVmCommand(allocator, name, false);
         return;
     }
 

@@ -14,6 +14,7 @@
 //! initrd_path=/path/to/initrd.img
 //! kernel_cmdline=console=ttyAMA0 root=/dev/vda
 //! disk_path=/path/to/rootfs.ext4
+//! seed_path=/path/to/cloud-init.iso
 //! disk_readonly=false
 //! network_mode=allowlist
 //! allowed_domains=example.com,api.example.com
@@ -28,6 +29,7 @@
 //! - `kernel_path`: path to Linux kernel image (required for start)
 //! - `initrd_path`: path to initial ramdisk (optional for start)
 //! - `disk_path`: path to rootfs block image (optional for start)
+//! - `seed_path`: path to a cloud-init NoCloud seed image (optional)
 //! - `disk_readonly`: mount rootfs read-only (default: false)
 //! - `kernel_cmdline`: optional kernel command line override
 //! - `network_mode`: locked_down|allowlist|open (default: locked_down)
@@ -74,6 +76,10 @@ pub const VmConfig = struct {
     /// Path to a root filesystem disk image (ext4).
     /// Optional for starting the VM. When set, root=/dev/vda should be used.
     disk_path: ?[]const u8 = null,
+
+    /// Optional cloud-init NoCloud seed image (ISO or raw).
+    /// When set, it is attached as a secondary read-only disk.
+    seed_path: ?[]const u8 = null,
 
     /// If true, attach the disk image as read-only.
     disk_readonly: bool = false,
@@ -164,18 +170,24 @@ pub const StartConfigError = error{
     MissingKernel,
     /// No root filesystem configured (initrd_path or disk_path required)
     MissingRootfs,
+    /// seed_path requires disk_path (seed without rootfs doesn't make sense)
+    SeedRequiresDisk,
     /// kernel_path file doesn't exist on disk
     KernelNotFound,
     /// initrd_path file doesn't exist on disk
     InitrdNotFound,
     /// disk_path file doesn't exist on disk
     DiskNotFound,
+    /// seed_path file doesn't exist on disk
+    SeedNotFound,
     /// kernel_path exists but can't be opened (permissions?)
     KernelUnreadable,
     /// initrd_path exists but can't be opened (permissions?)
     InitrdUnreadable,
     /// disk_path exists but can't be opened (permissions?)
     DiskUnreadable,
+    /// seed_path exists but can't be opened (permissions?)
+    SeedUnreadable,
 };
 
 /// Creates a VmConfig with default values and the given name.
@@ -195,6 +207,7 @@ pub fn defaultConfig(allocator: std.mem.Allocator, name: []const u8) !VmConfig {
         .kernel_path = null,
         .initrd_path = null,
         .disk_path = null,
+        .seed_path = null,
         .disk_readonly = false,
         .kernel_cmdline = null,
     };
@@ -205,7 +218,7 @@ pub fn defaultConfig(allocator: std.mem.Allocator, name: []const u8) !VmConfig {
 ///
 /// Frees:
 ///   - name string
-    ///   - kernel_path, initrd_path, disk_path (if set)
+    ///   - kernel_path, initrd_path, disk_path, seed_path (if set)
 ///   - allowed_domains list and each domain string
 ///   - allowed_ips list and each IP string
 ///
@@ -219,6 +232,8 @@ pub fn freeConfig(allocator: std.mem.Allocator, cfg: *VmConfig) void {
     cfg.initrd_path = null;
     if (cfg.disk_path) |path| allocator.free(path);
     cfg.disk_path = null;
+    if (cfg.seed_path) |path| allocator.free(path);
+    cfg.seed_path = null;
     if (cfg.kernel_cmdline) |value| allocator.free(value);
     cfg.kernel_cmdline = null;
 
@@ -321,6 +336,13 @@ pub fn resolveRelativePaths(
             cfg.disk_path = joined;
         }
     }
+    if (cfg.seed_path) |path| {
+        if (!std.fs.path.isAbsolute(path)) {
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, path });
+            allocator.free(path);
+            cfg.seed_path = joined;
+        }
+    }
 }
 
 /// Validates that required config fields are set for starting a VM.
@@ -329,11 +351,13 @@ pub fn resolveRelativePaths(
 /// Required fields for start:
 ///   - kernel_path: Must be set (not null)
 ///   - initrd_path or disk_path: Must be set
+///   - seed_path requires disk_path
 ///
 /// Errors:
 ///   - MissingKernel: kernel_path is null
 pub fn validateStartConfig(cfg: *const VmConfig) StartConfigError!void {
   if (cfg.kernel_path == null) return error.MissingKernel;
+  if (cfg.seed_path != null and cfg.disk_path == null) return error.SeedRequiresDisk;
   if (cfg.initrd_path == null and cfg.disk_path == null) return error.MissingRootfs;
 }
 
@@ -341,14 +365,17 @@ pub fn validateStartConfig(cfg: *const VmConfig) StartConfigError!void {
 /// Call this after validateStartConfig() to verify the files are present.
 ///
 /// Errors:
-///   - MissingKernel/MissingRootfs: Path not configured
-///   - KernelNotFound/InitrdNotFound/DiskNotFound: File doesn't exist
-///   - KernelUnreadable/InitrdUnreadable/DiskUnreadable: File exists but can't be opened
+///   - MissingKernel/MissingRootfs/SeedRequiresDisk: Path not configured
+///   - KernelNotFound/InitrdNotFound/DiskNotFound/SeedNotFound: File doesn't exist
+///   - KernelUnreadable/InitrdUnreadable/DiskUnreadable/SeedUnreadable: File exists but can't be opened
 pub fn validateStartFiles(cfg: *const VmConfig) StartConfigError!void {
   if (cfg.kernel_path) |path| {
     try checkReadableFile(path, .kernel);
   } else {
     return error.MissingKernel;
+  }
+  if (cfg.seed_path != null and cfg.disk_path == null) {
+    return error.SeedRequiresDisk;
   }
   if (cfg.initrd_path == null and cfg.disk_path == null) {
     return error.MissingRootfs;
@@ -359,10 +386,13 @@ pub fn validateStartFiles(cfg: *const VmConfig) StartConfigError!void {
   if (cfg.disk_path) |path| {
     try checkReadableFile(path, .disk);
   }
+  if (cfg.seed_path) |path| {
+    try checkReadableFile(path, .seed);
+  }
 }
 
 /// Used to provide specific error messages for kernel vs initrd file issues.
-const StartFileKind = enum { kernel, initrd, disk };
+const StartFileKind = enum { kernel, initrd, disk, seed };
 
 /// Checks if a file exists and is readable.
 /// Returns appropriate error based on file kind (kernel or initrd).
@@ -380,11 +410,13 @@ fn checkReadableFile(path: []const u8, kind: StartFileKind) StartConfigError!voi
             .kernel => error.KernelNotFound,
             .initrd => error.InitrdNotFound,
             .disk => error.DiskNotFound,
+            .seed => error.SeedNotFound,
         },
         else => return switch (kind) {
             .kernel => error.KernelUnreadable,
             .initrd => error.InitrdUnreadable,
             .disk => error.DiskUnreadable,
+            .seed => error.SeedUnreadable,
         },
     }
 }
@@ -524,6 +556,10 @@ fn applyConfigEntry(
         try setOptionalPath(allocator, &cfg.disk_path, value);
         return;
     }
+    if (std.mem.eql(u8, key, "seed_path")) {
+        try setOptionalPath(allocator, &cfg.seed_path, value);
+        return;
+    }
     if (std.mem.eql(u8, key, "disk_readonly")) {
         cfg.disk_readonly = try parseBool(value);
         return;
@@ -558,7 +594,7 @@ fn applyConfigEntry(
 ///
 /// Writes all config fields including:
 ///   - name, ephemeral, memory_mb, cpu_cores
-///   - kernel_path, initrd_path, disk_path, disk_readonly, kernel_cmdline (if set)
+///   - kernel_path, initrd_path, disk_path, seed_path, disk_readonly, kernel_cmdline (if set)
 ///   - network_mode
 ///   - allowed_domains, allowed_ips (if non-empty, as comma-separated)
 pub fn writeConfigFile(dir: std.fs.Dir, cfg: VmConfig) !void {
@@ -581,6 +617,9 @@ pub fn writeConfigFile(dir: std.fs.Dir, cfg: VmConfig) !void {
     }
     if (cfg.disk_path) |path| {
         try w.print("disk_path={s}\n", .{path});
+    }
+    if (cfg.seed_path) |path| {
+        try w.print("seed_path={s}\n", .{path});
     }
     if (cfg.disk_readonly) {
         try w.print("disk_readonly=true\n", .{});
@@ -635,6 +674,7 @@ test "config: parse kernel/initrd paths and overrides" {
         "kernel_path=/kernels/vmlinuz\n" ++
         "initrd_path=/images/initrd.img\n" ++
         "disk_path=/images/rootfs.ext4\n" ++
+        "seed_path=/images/seed.iso\n" ++
         "disk_readonly=true\n" ++
         "kernel_cmdline=console=ttyAMA0\n");
 
@@ -649,6 +689,7 @@ test "config: parse kernel/initrd paths and overrides" {
     try std.testing.expectEqualStrings("/kernels/vmlinuz", cfg_mut.kernel_path.?);
     try std.testing.expectEqualStrings("/images/initrd.img", cfg_mut.initrd_path.?);
     try std.testing.expectEqualStrings("/images/rootfs.ext4", cfg_mut.disk_path.?);
+    try std.testing.expectEqualStrings("/images/seed.iso", cfg_mut.seed_path.?);
     try std.testing.expect(cfg_mut.disk_readonly);
     try std.testing.expectEqualStrings("console=ttyAMA0", cfg_mut.kernel_cmdline.?);
 }
@@ -687,12 +728,14 @@ test "config: resolveRelativePaths joins vm dir" {
     cfg.kernel_path = try allocator.dupe(u8, "kernel/bzImage");
     cfg.initrd_path = try allocator.dupe(u8, "initrd.img");
     cfg.disk_path = try allocator.dupe(u8, "rootfs.ext4");
+    cfg.seed_path = try allocator.dupe(u8, "seed.iso");
 
     try resolveRelativePaths(allocator, "/vm/root", &cfg);
 
     try std.testing.expectEqualStrings("/vm/root/kernel/bzImage", cfg.kernel_path.?);
     try std.testing.expectEqualStrings("/vm/root/initrd.img", cfg.initrd_path.?);
     try std.testing.expectEqualStrings("/vm/root/rootfs.ext4", cfg.disk_path.?);
+    try std.testing.expectEqualStrings("/vm/root/seed.iso", cfg.seed_path.?);
 }
 
 test "config: validateStartConfig requires kernel and rootfs" {
@@ -707,6 +750,11 @@ test "config: validateStartConfig requires kernel and rootfs" {
 
   cfg.kernel_path = try allocator.dupe(u8, "/kernels/vmlinuz");
   try std.testing.expectError(error.MissingRootfs, validateStartConfig(&cfg));
+
+  cfg.seed_path = try allocator.dupe(u8, "/images/seed.iso");
+  try std.testing.expectError(error.SeedRequiresDisk, validateStartConfig(&cfg));
+  allocator.free(cfg.seed_path.?);
+  cfg.seed_path = null;
 
   cfg.initrd_path = try allocator.dupe(u8, "/images/initrd.img");
   try validateStartConfig(&cfg);
@@ -739,6 +787,11 @@ test "config: validateStartFiles checks existence" {
         defer f.close();
         try f.writeAll("rootfs");
     }
+    {
+        var f = try tmp.dir.createFile("seed.iso", .{});
+        defer f.close();
+        try f.writeAll("seed");
+    }
     const base = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
@@ -748,6 +801,8 @@ test "config: validateStartFiles checks existence" {
     defer allocator.free(initrd_path);
     const disk_path = try std.fs.path.join(allocator, &[_][]const u8{ base, "rootfs.ext4" });
     defer allocator.free(disk_path);
+    const seed_path = try std.fs.path.join(allocator, &[_][]const u8{ base, "seed.iso" });
+    defer allocator.free(seed_path);
     var cfg = try defaultConfig(allocator, "testvm");
     defer freeConfig(allocator, &cfg);
 
@@ -757,6 +812,8 @@ test "config: validateStartFiles checks existence" {
     allocator.free(cfg.initrd_path.?);
     cfg.initrd_path = null;
     cfg.disk_path = try allocator.dupe(u8, disk_path);
+    try validateStartFiles(&cfg);
+    cfg.seed_path = try allocator.dupe(u8, seed_path);
     try validateStartFiles(&cfg);
 
     allocator.free(cfg.kernel_path.?);
@@ -864,6 +921,10 @@ test "config: validateStartConfig missing fields" {
     try std.testing.expectError(error.MissingKernel, validateStartConfig(&cfg));
     cfg.kernel_path = try std.testing.allocator.dupe(u8, "/kernel");
     try std.testing.expectError(error.MissingRootfs, validateStartConfig(&cfg));
+    cfg.seed_path = try std.testing.allocator.dupe(u8, "/seed.iso");
+    try std.testing.expectError(error.SeedRequiresDisk, validateStartConfig(&cfg));
+    std.testing.allocator.free(cfg.seed_path.?);
+    cfg.seed_path = null;
     cfg.initrd_path = try std.testing.allocator.dupe(u8, "/initrd.img");
     try validateStartConfig(&cfg);
     std.testing.allocator.free(cfg.initrd_path.?);

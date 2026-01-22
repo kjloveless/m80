@@ -43,6 +43,7 @@ pub const VmmSandboxOptions = struct {
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
     disk_path: ?[]const u8 = null,
+    seed_path: ?[]const u8 = null,
     allow_network: bool = false,
 };
 
@@ -92,6 +93,9 @@ pub const SandboxProfile = struct {
         }
         if (options.disk_path) |disk| {
             try w.print("(allow file-read* (literal \"{s}\"))\n", .{disk});
+        }
+        if (options.seed_path) |seed| {
+            try w.print("(allow file-read* (literal \"{s}\"))\n", .{seed});
         }
 
         try w.writeAll("\n(allow file-read* (subpath \"/System/Library/Frameworks\"))\n");
