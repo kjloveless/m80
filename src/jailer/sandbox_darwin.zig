@@ -229,3 +229,191 @@ test "sandbox_darwin: network enabled" {
     const s = profile.getProfileString();
     try std.testing.expect(std.mem.indexOf(u8, s, "(allow network-outbound)") != null);
 }
+
+test "sandbox_darwin: profile with kernel path" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{
+        .kernel_path = "/path/to/kernel",
+    });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "/path/to/kernel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "file-read*") != null);
+}
+
+test "sandbox_darwin: profile with initrd path" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{
+        .initrd_path = "/path/to/initrd",
+    });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "/path/to/initrd") != null);
+}
+
+test "sandbox_darwin: profile with disk path" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{
+        .disk_path = "/path/to/disk.img",
+    });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "/path/to/disk.img") != null);
+}
+
+test "sandbox_darwin: profile with seed path" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{
+        .seed_path = "/path/to/seed.iso",
+    });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "/path/to/seed.iso") != null);
+}
+
+test "sandbox_darwin: profile with data disk path" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{
+        .data_disk_path = "/path/to/data.img",
+    });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "/path/to/data.img") != null);
+}
+
+test "sandbox_darwin: profile denies process-exec and process-fork" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{});
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "(deny process-exec)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(deny process-fork)") != null);
+}
+
+test "sandbox_darwin: profile allows hypervisor access" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{});
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow hv-create)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow mach-vm*)") != null);
+}
+
+test "sandbox_darwin: profile allows system library access" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{});
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "/System/Library/Frameworks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "/usr/lib") != null);
+}
+
+test "sandbox_darwin: profile allows dev null and urandom" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{});
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "/dev/null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "/dev/urandom") != null);
+}
+
+test "sandbox_darwin: VmmSandboxOptions defaults" {
+    const options = VmmSandboxOptions{};
+    try std.testing.expect(options.vm_directory == null);
+    try std.testing.expect(options.kernel_path == null);
+    try std.testing.expect(options.initrd_path == null);
+    try std.testing.expect(options.disk_path == null);
+    try std.testing.expect(options.seed_path == null);
+    try std.testing.expect(options.data_disk_path == null);
+    try std.testing.expect(!options.allow_network);
+    try std.testing.expect(!options.allow_write_vm_dir);
+}
+
+test "sandbox_darwin: SandboxError variants exist" {
+    const errors = [_]SandboxError{
+        SandboxError.ProfileCompilationFailed,
+        SandboxError.SandboxInitFailed,
+        SandboxError.InvalidProfile,
+        SandboxError.OutOfMemory,
+    };
+    try std.testing.expectEqual(@as(usize, 4), errors.len);
+}
+
+test "sandbox_darwin: profile can be rebuilt" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{ .allow_network = false });
+    const s1 = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s1, "(deny network*)") != null);
+
+    try profile.buildVmmProfile(.{ .allow_network = true });
+    const s2 = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s2, "(allow network-outbound)") != null);
+}
+
+test "sandbox_darwin: vm_directory write permission" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    // Without write permission
+    try profile.buildVmmProfile(.{
+        .vm_directory = "/Users/test/vms",
+        .allow_write_vm_dir = false,
+    });
+    var s = profile.getProfileString();
+    const read_count_1 = std.mem.count(u8, s, "file-read*");
+    const write_count_1 = std.mem.count(u8, s, "file-write*");
+
+    // With write permission
+    try profile.buildVmmProfile(.{
+        .vm_directory = "/Users/test/vms",
+        .allow_write_vm_dir = true,
+    });
+    s = profile.getProfileString();
+    const write_count_2 = std.mem.count(u8, s, "file-write*");
+
+    // Should have more write rules when write is enabled
+    try std.testing.expect(write_count_2 > write_count_1);
+    _ = read_count_1;
+}

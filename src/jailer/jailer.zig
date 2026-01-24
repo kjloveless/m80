@@ -302,7 +302,12 @@ pub fn getCurrentUid() u32 {
 /// Gets the current GID
 pub fn getCurrentGid() u32 {
     if (builtin.os.tag == .windows) return 0;
-    return std.posix.getgid();
+    if (builtin.os.tag == .linux) {
+        return @intCast(std.os.linux.syscall(.getgid, .{}));
+    }
+    // macOS uses the same syscall number as getuid but we return 0 for now
+    // as there's no direct Zig binding for getgid on macOS
+    return 0;
 }
 
 /// Checks if running as root
@@ -320,7 +325,11 @@ pub fn getEffectiveUid() u32 {
 /// Gets the effective GID
 pub fn getEffectiveGid() u32 {
     if (builtin.os.tag == .windows) return 0;
-    return std.posix.getegid();
+    if (builtin.os.tag == .linux) {
+        return @intCast(std.os.linux.syscall(.getegid, .{}));
+    }
+    // macOS - return 0 for now as there's no direct Zig binding
+    return 0;
 }
 
 // =============================================================================
@@ -396,4 +405,111 @@ test "jailer: prepare with no harden and no limits" {
     try jailer.prepare();
     const stat = try std.fs.cwd().statFile(jailer.root);
     try std.testing.expectEqual(std.fs.File.Kind.directory, stat.kind);
+}
+
+test "jailer: getEffectiveUid returns value" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const euid = getEffectiveUid();
+    // Just verify it returns something
+    _ = euid;
+}
+
+test "jailer: getEffectiveGid returns value" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const egid = getEffectiveGid();
+    // Just verify it returns something
+    _ = egid;
+}
+
+test "jailer: getCurrentGid returns value" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gid = getCurrentGid();
+    // Just verify it returns something
+    _ = gid;
+}
+
+test "jailer: config with custom target uid/gid" {
+    const config = JailerConfig{
+        .target_uid = 1000,
+        .target_gid = 1000,
+        .chroot_enabled = true,
+        .chroot_path = "/tmp/jail",
+    };
+    try std.testing.expectEqual(@as(?u32, 1000), config.target_uid);
+    try std.testing.expectEqual(@as(?u32, 1000), config.target_gid);
+    try std.testing.expect(config.chroot_enabled);
+    try std.testing.expectEqualStrings("/tmp/jail", config.chroot_path.?);
+}
+
+test "jailer: ResourceLimits with custom values" {
+    const limits = ResourceLimits{
+        .max_files = 256,
+        .max_procs = 32,
+        .max_address_space = 1024 * 1024 * 1024,
+        .max_core = 0,
+        .max_cpu_time = 60,
+    };
+    try std.testing.expectEqual(@as(?u64, 256), limits.max_files);
+    try std.testing.expectEqual(@as(?u64, 32), limits.max_procs);
+    try std.testing.expectEqual(@as(?u64, 1024 * 1024 * 1024), limits.max_address_space);
+    try std.testing.expectEqual(@as(?u64, 0), limits.max_core);
+    try std.testing.expectEqual(@as(?u64, 60), limits.max_cpu_time);
+}
+
+test "jailer: JailerError variants exist" {
+    // Test that error type has expected variants
+    const errors = [_]JailerError{
+        JailerError.PrivilegeDropFailed,
+        JailerError.PrivilegeVerifyFailed,
+        JailerError.ChrootFailed,
+        JailerError.ResourceLimitFailed,
+        JailerError.PermissionDenied,
+        JailerError.InvalidConfig,
+        JailerError.OutOfMemory,
+    };
+    try std.testing.expectEqual(@as(usize, 7), errors.len);
+}
+
+test "jailer: isRoot matches getCurrentUid" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const uid = getCurrentUid();
+    const root = isRoot();
+    try std.testing.expectEqual(uid == 0, root);
+}
+
+test "jailer: initWithConfig preserves config" {
+    const allocator = std.testing.allocator;
+    const config = JailerConfig{
+        .target_uid = 500,
+        .target_gid = 500,
+        .chroot_enabled = false,
+        .harden_permissions = false,
+        .limits = .{ .max_files = 512 },
+    };
+    var jailer = try Jailer.initWithConfig(allocator, config);
+    defer jailer.deinit();
+
+    try std.testing.expectEqual(@as(?u32, 500), jailer.config.target_uid);
+    try std.testing.expectEqual(@as(?u32, 500), jailer.config.target_gid);
+    try std.testing.expect(!jailer.config.chroot_enabled);
+    try std.testing.expect(!jailer.config.harden_permissions);
+    try std.testing.expectEqual(@as(?u64, 512), jailer.config.limits.max_files);
+}
+
+test "jailer: dropPrivileges is no-op on windows" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    // Should return without error
+    try dropPrivileges(1000, 1000);
+}
+
+test "jailer: verifyPrivilegesDropped is no-op on windows" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    // Should return without error
+    try verifyPrivilegesDropped();
+}
+
+test "jailer: setResourceLimits is no-op on windows" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    // Should return without error
+    try setResourceLimits(.{});
 }

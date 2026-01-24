@@ -2036,3 +2036,300 @@ pub fn handleVirtioRngMmio(offset: u64, is_write: bool, size: usize, value: u64)
         },
     };
 }
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+test "virtio: MMIO constants are valid" {
+    try std.testing.expectEqual(@as(u32, 0x74726976), virtio_mmio_magic);
+    try std.testing.expectEqual(@as(u32, 0x4d3830), virtio_mmio_vendor_id);
+}
+
+test "virtio: VirtqDesc struct size matches spec" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(VirtqDesc));
+}
+
+test "virtio: VirtioBlkReq struct size matches spec" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(VirtioBlkReq));
+}
+
+test "virtio: virtioBlkIndexForAddr returns correct index" {
+    try std.testing.expectEqual(@as(?usize, 0), virtioBlkIndexForAddr(virtio_blk_mmio_bases[0]));
+    try std.testing.expectEqual(@as(?usize, 1), virtioBlkIndexForAddr(virtio_blk_mmio_bases[1]));
+    try std.testing.expectEqual(@as(?usize, 2), virtioBlkIndexForAddr(virtio_blk_mmio_bases[2]));
+    try std.testing.expectEqual(@as(?usize, null), virtioBlkIndexForAddr(0x0));
+}
+
+test "virtio: virtioBlkMmioBase returns correct base" {
+    try std.testing.expectEqual(virtio_blk_mmio_bases[0], virtioBlkMmioBase(0));
+    try std.testing.expectEqual(virtio_blk_mmio_bases[1], virtioBlkMmioBase(1));
+    try std.testing.expectEqual(virtio_blk_mmio_bases[2], virtioBlkMmioBase(2));
+}
+
+test "virtio: VirtioBlkDevice defaults" {
+    const device = VirtioBlkDevice{};
+    try std.testing.expect(!device.enabled);
+    try std.testing.expect(!device.readonly);
+    try std.testing.expectEqual(@as(u64, 0), device.capacity_sectors);
+    try std.testing.expect(device.file == null);
+}
+
+test "virtio: VirtioBlkQueue defaults" {
+    const queue = VirtioBlkQueue{};
+    try std.testing.expectEqual(@as(u16, 0), queue.num);
+    try std.testing.expect(!queue.ready);
+    try std.testing.expectEqual(@as(u64, 0), queue.desc_addr);
+}
+
+test "virtio: virtioBlkDeviceFeatures readonly flag" {
+    var device = VirtioBlkDevice{};
+    device.readonly = false;
+    try std.testing.expectEqual(@as(u32, 0), virtioBlkDeviceFeatures(&device, 0));
+    device.readonly = true;
+    try std.testing.expectEqual(virtio_blk_f_ro, virtioBlkDeviceFeatures(&device, 0));
+    try std.testing.expectEqual(virtio_f_version_1, virtioBlkDeviceFeatures(&device, 1));
+    try std.testing.expectEqual(@as(u32, 0), virtioBlkDeviceFeatures(&device, 2));
+}
+
+test "virtio: virtioConsoleDeviceFeatures" {
+    try std.testing.expectEqual(@as(u32, 0), virtioConsoleDeviceFeatures(0));
+    try std.testing.expectEqual(virtio_f_version_1, virtioConsoleDeviceFeatures(1));
+    try std.testing.expectEqual(@as(u32, 0), virtioConsoleDeviceFeatures(2));
+}
+
+test "virtio: virtioRngDeviceFeatures" {
+    try std.testing.expectEqual(@as(u32, 0), virtioRngDeviceFeatures(0));
+    try std.testing.expectEqual(virtio_f_version_1, virtioRngDeviceFeatures(1));
+    try std.testing.expectEqual(@as(u32, 0), virtioRngDeviceFeatures(2));
+}
+
+test "virtio: virtioNetDeviceFeatures" {
+    try std.testing.expectEqual(virtio_net_f_mac, virtioNetDeviceFeatures(0));
+    try std.testing.expectEqual(virtio_f_version_1, virtioNetDeviceFeatures(1));
+    try std.testing.expectEqual(@as(u32, 0), virtioNetDeviceFeatures(2));
+}
+
+test "virtio: resetVirtioBlkQueue clears queue state" {
+    var device = VirtioBlkDevice{};
+    device.queue.num = 128;
+    device.queue.ready = true;
+    device.queue_sel = 1;
+    resetVirtioBlkQueue(&device);
+    try std.testing.expectEqual(@as(u16, 0), device.queue.num);
+    try std.testing.expect(!device.queue.ready);
+    try std.testing.expectEqual(@as(u16, 0), device.queue_sel);
+}
+
+test "virtio: resetVirtioConsoleState clears all state" {
+    virtio_console_state.enabled = true;
+    virtio_console_state.status = 0xFF;
+    gic_virtio_console_intid = 42;
+    virtio_console_irq_level = true;
+    resetVirtioConsoleState();
+    try std.testing.expect(!virtio_console_state.enabled);
+    try std.testing.expectEqual(@as(u32, 0), virtio_console_state.status);
+    try std.testing.expect(gic_virtio_console_intid == null);
+    try std.testing.expect(!virtio_console_irq_level);
+}
+
+test "virtio: resetVirtioRngState clears all state" {
+    virtio_rng_state.enabled = true;
+    virtio_rng_state.status = 0xFF;
+    gic_virtio_rng_intid = 43;
+    virtio_rng_irq_level = true;
+    resetVirtioRngState();
+    try std.testing.expect(!virtio_rng_state.enabled);
+    try std.testing.expect(gic_virtio_rng_intid == null);
+    try std.testing.expect(!virtio_rng_irq_level);
+}
+
+test "virtio: resetVirtioNetState clears all state" {
+    virtio_net_state.enabled = true;
+    virtio_net_state.mac = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    gic_virtio_net_intid = 44;
+    virtio_net_irq_level = true;
+    virtio_net_seen.store(true, .seq_cst);
+    resetVirtioNetState();
+    try std.testing.expect(!virtio_net_state.enabled);
+    try std.testing.expectEqual([6]u8{ 0, 0, 0, 0, 0, 0 }, virtio_net_state.mac);
+    try std.testing.expect(gic_virtio_net_intid == null);
+    try std.testing.expect(!virtio_net_seen.load(.seq_cst));
+}
+
+test "virtio: setupVirtioConsole enables device" {
+    resetVirtioConsoleState();
+    setupVirtioConsole(true);
+    try std.testing.expect(virtio_console_state.enabled);
+    setupVirtioConsole(false);
+    try std.testing.expect(!virtio_console_state.enabled);
+}
+
+test "virtio: setupVirtioRng enables device" {
+    resetVirtioRngState();
+    setupVirtioRng(true);
+    try std.testing.expect(virtio_rng_state.enabled);
+    setupVirtioRng(false);
+    try std.testing.expect(!virtio_rng_state.enabled);
+}
+
+test "virtio: setupVirtioNet enables device with MAC" {
+    resetVirtioNetState();
+    const mac = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    setupVirtioNet(true, mac);
+    try std.testing.expect(virtio_net_state.enabled);
+    try std.testing.expectEqual(mac, virtio_net_state.mac);
+}
+
+test "virtio: VirtioConsoleInput operations" {
+    virtio_console_input.mutex.lock();
+    virtio_console_input.buf.clearRetainingCapacity();
+    virtio_console_input.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), virtioConsoleInputLen());
+    appendVirtioConsoleInput("hello");
+    try std.testing.expectEqual(@as(usize, 5), virtioConsoleInputLen());
+    var buf: [5]u8 = undefined;
+    const taken = takeVirtioConsoleInput(&buf);
+    try std.testing.expectEqual(@as(usize, 5), taken);
+    try std.testing.expectEqualStrings("hello", &buf);
+}
+
+test "virtio: isDhcpPort detects DHCP ports" {
+    try std.testing.expect(isDhcpPort(67));
+    try std.testing.expect(isDhcpPort(68));
+    try std.testing.expect(!isDhcpPort(53));
+    try std.testing.expect(!isDhcpPort(80));
+}
+
+test "virtio: VirtioConsoleState defaults" {
+    const state = VirtioConsoleState{};
+    try std.testing.expect(!state.enabled);
+    try std.testing.expectEqual(@as(usize, 2), state.queues.len);
+}
+
+test "virtio: VirtioRngState defaults" {
+    const state = VirtioRngState{};
+    try std.testing.expect(!state.enabled);
+    try std.testing.expectEqual(@as(u32, 0), state.status);
+}
+
+test "virtio: VirtioNetState defaults" {
+    const state = VirtioNetState{};
+    try std.testing.expect(!state.enabled);
+    try std.testing.expectEqual([6]u8{ 0, 0, 0, 0, 0, 0 }, state.mac);
+}
+
+test "virtio: VirtioFsState defaults" {
+    const state = VirtioFsState{};
+    try std.testing.expect(!state.enabled);
+    try std.testing.expectEqual(@as(u32, 1), state.num_queues);
+}
+
+test "virtio: descriptor flags constants" {
+    try std.testing.expectEqual(@as(u16, 1), virtq_desc_flag_next);
+    try std.testing.expectEqual(@as(u16, 2), virtq_desc_flag_write);
+    try std.testing.expectEqual(@as(u16, 4), virtq_desc_flag_indirect);
+}
+
+test "virtio: block status constants" {
+    try std.testing.expectEqual(@as(u8, 0), virtio_blk_s_ok);
+    try std.testing.expectEqual(@as(u8, 1), virtio_blk_s_ioerr);
+    try std.testing.expectEqual(@as(u8, 2), virtio_blk_s_unsupported);
+}
+
+test "virtio: block request type constants" {
+    try std.testing.expectEqual(@as(u32, 0), virtio_blk_t_in);
+    try std.testing.expectEqual(@as(u32, 1), virtio_blk_t_out);
+    try std.testing.expectEqual(@as(u32, 4), virtio_blk_t_flush);
+}
+
+test "virtio: MMIO register offsets match spec" {
+    try std.testing.expectEqual(@as(u64, 0x000), virtio_mmio_reg_magic);
+    try std.testing.expectEqual(@as(u64, 0x004), virtio_mmio_reg_version);
+    try std.testing.expectEqual(@as(u64, 0x008), virtio_mmio_reg_device_id);
+    try std.testing.expectEqual(@as(u64, 0x070), virtio_mmio_reg_status);
+    try std.testing.expectEqual(@as(u64, 0x100), virtio_mmio_reg_config);
+}
+
+test "virtio: device IDs match spec" {
+    try std.testing.expectEqual(@as(u32, 1), virtio_mmio_device_id_net);
+    try std.testing.expectEqual(@as(u32, 2), virtio_mmio_device_id_blk);
+    try std.testing.expectEqual(@as(u32, 3), virtio_mmio_device_id_console);
+    try std.testing.expectEqual(@as(u32, 4), virtio_mmio_device_id_rng);
+    try std.testing.expectEqual(@as(u32, 26), virtio_mmio_device_id_fs);
+}
+
+test "virtio: queue max values are power of 2" {
+    try std.testing.expect(virtio_blk_queue_max & (virtio_blk_queue_max - 1) == 0);
+    try std.testing.expect(virtio_console_queue_max & (virtio_console_queue_max - 1) == 0);
+    try std.testing.expect(virtio_rng_queue_max & (virtio_rng_queue_max - 1) == 0);
+    try std.testing.expect(virtio_net_queue_max & (virtio_net_queue_max - 1) == 0);
+}
+
+test "virtio: ethernet type constants" {
+    try std.testing.expectEqual(@as(u16, 0x0800), ether_type_ipv4);
+    try std.testing.expectEqual(@as(u16, 0x0806), ether_type_arp);
+    try std.testing.expectEqual(@as(u8, 17), ip_proto_udp);
+}
+
+test "virtio: ensureGuestIo returns error when not initialized" {
+    const saved = guest_io;
+    defer guest_io = saved;
+    guest_io = null;
+    const result = ensureGuestIo();
+    try std.testing.expectError(error.NoGuestIo, result);
+}
+
+test "virtio: initGuestIo and ensureGuestIo" {
+    const saved = guest_io;
+    defer guest_io = saved;
+    const MockIo = struct {
+        fn read(_: u64, _: []u8) anyerror!void {}
+        fn write(_: u64, _: []const u8) anyerror!void {}
+    };
+    const io = GuestIo{ .read_bytes = MockIo.read, .write_bytes = MockIo.write };
+    initGuestIo(io);
+    const result = try ensureGuestIo();
+    try std.testing.expect(result.read_bytes == MockIo.read);
+}
+
+test "virtio: setInterruptHandler and triggerInterrupt" {
+    const saved = interrupt_handler;
+    defer interrupt_handler = saved;
+    const MockHandler = struct {
+        var call_count: u32 = 0;
+        fn handler(_: u32, _: bool) void {
+            call_count += 1;
+        }
+    };
+    MockHandler.call_count = 0;
+    setInterruptHandler(MockHandler.handler);
+    triggerInterrupt(42, true);
+    try std.testing.expectEqual(@as(u32, 1), MockHandler.call_count);
+    setInterruptHandler(null);
+    triggerInterrupt(1, true);
+}
+
+test "virtio: outboundFrameAllowed with no policy" {
+    net_policy_mutex.lock();
+    const saved = net_policy_state;
+    net_policy_state = null;
+    net_policy_mutex.unlock();
+    defer {
+        net_policy_mutex.lock();
+        net_policy_state = saved;
+        net_policy_mutex.unlock();
+    }
+    const frame = [_]u8{0} ** 100;
+    try std.testing.expect(outboundFrameAllowed(&frame));
+}
+
+test "virtio: resetVirtioBlkDevice handles out of bounds" {
+    resetVirtioBlkDevice(100);
+    resetVirtioBlkDevice(virtio_blk_device_count);
+}
+
+test "virtio: updateVirtioBlkInterrupt handles out of bounds" {
+    updateVirtioBlkInterrupt(100);
+    updateVirtioBlkInterrupt(virtio_blk_device_count);
+}
