@@ -2,3 +2,4 @@
 .zig-cache
 entitlements/
 images/
+codesign.conf
