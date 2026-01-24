@@ -2324,6 +2324,40 @@ fn loadGuestInitrd(memory_size_bytes: u64, initrd_path: ?[]const u8) !u64 {
     return try copyFileToGuest(memory_size_bytes, guestInitrdBase(), initrd_path.?, "initrd");
 }
 
+/// Boot timing state for performance measurement
+var boot_timing: struct {
+    start_us: i64 = 0,
+    vm_create_us: i64 = 0,
+    memory_map_us: i64 = 0,
+    kernel_load_us: i64 = 0,
+    initrd_load_us: i64 = 0,
+    vcpu_start_us: i64 = 0,
+} = .{};
+
+/// Returns the current timestamp in microseconds for boot timing.
+fn bootTimestamp() i64 {
+    return std.time.microTimestamp();
+}
+
+/// Logs boot timing breakdown at info level.
+fn logBootTiming() void {
+    const total = boot_timing.vcpu_start_us - boot_timing.start_us;
+    const vm_create = boot_timing.vm_create_us - boot_timing.start_us;
+    const memory_map = boot_timing.memory_map_us - boot_timing.vm_create_us;
+    const kernel_load = boot_timing.kernel_load_us - boot_timing.memory_map_us;
+    const initrd_load = boot_timing.initrd_load_us - boot_timing.kernel_load_us;
+    const vcpu_setup = boot_timing.vcpu_start_us - boot_timing.initrd_load_us;
+
+    log.info("hvf boot timing: total={d}µs vm_create={d}µs memory_map={d}µs kernel={d}µs initrd={d}µs vcpu_setup={d}µs", .{
+        total,
+        vm_create,
+        memory_map,
+        kernel_load,
+        initrd_load,
+        vcpu_setup,
+    });
+}
+
 /// Starts a VM with the HVF backend.
 ///
 /// This function performs the following steps:
@@ -2342,6 +2376,7 @@ fn loadGuestInitrd(memory_size_bytes: u64, initrd_path: ?[]const u8) !u64 {
 ///   - error.InvalidGuestLayout: Memory too small for guest layout
 ///   - error.MemoryTooLarge: Memory size exceeds platform limits
 pub fn start(cfg: config.VmConfig) !void {
+    boot_timing.start_us = bootTimestamp();
     log.info("hvf backend starting", .{});
 
     // Ensure no VM is already running (single VM at a time)
@@ -2361,6 +2396,7 @@ pub fn start(cfg: config.VmConfig) !void {
         return e;
     };
     active_vm = handle;
+    boot_timing.vm_create_us = bootTimestamp();
 
     const size_bytes_u64 = try std.math.mul(u64, cfg.memory_mb, mb_to_bytes);
     if (size_bytes_u64 > std.math.maxInt(usize)) return error.MemoryTooLarge;
@@ -2376,6 +2412,7 @@ pub fn start(cfg: config.VmConfig) !void {
         return e;
     };
     errdefer unmapActiveGuestMemory();
+    boot_timing.memory_map_us = bootTimestamp();
 
     prepareGuestImage(size_bytes_u64) catch |e| {
         log.err("hvf prepareGuestImage failed: {s}", .{@errorName(e)});
@@ -2385,10 +2422,12 @@ pub fn start(cfg: config.VmConfig) !void {
         log.err("hvf loadGuestKernel failed: {s}", .{@errorName(e)});
         return e;
     };
+    boot_timing.kernel_load_us = bootTimestamp();
     const initrd_size = loadGuestInitrd(size_bytes_u64, cfg.initrd_path) catch |e| {
         log.err("hvf loadGuestInitrd failed: {s}", .{@errorName(e)});
         return e;
     };
+    boot_timing.initrd_load_us = bootTimestamp();
     virtio.initGuestIo(.{
         .read_bytes = readGuestBytes,
         .write_bytes = writeGuestBytes,
@@ -2677,6 +2716,8 @@ pub fn start(cfg: config.VmConfig) !void {
     if (builtin.cpu.arch == .aarch64) {
         resetPl011State();
     }
+    boot_timing.vcpu_start_us = bootTimestamp();
+    logBootTiming();
     active_vcpu_thread = try std.Thread.spawn(.{}, runVcpu, .{ 0, vcpu_init });
     log.info("hvf backend ready", .{});
 }

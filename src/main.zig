@@ -45,6 +45,7 @@ else
 
 const Vm = @import("vm/vm.zig").Vm;
 const Jailer = @import("jailer/jailer.zig").Jailer;
+const snapshot = @import("vm/snapshot.zig");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -107,29 +108,45 @@ fn setEnvFlag(allocator: std.mem.Allocator, name: []const u8, value: []const u8)
 /// Parameters:
 ///   - writer: Any type that implements the Writer interface (e.g., stderr, a buffer)
 pub fn writeHelp(writer: anytype) !void {
-    // Minimal CLI surface for now; config format is intentionally simple.
     try writer.print(
-        \\m80 - windows-native microvm/sandbox manager (scaffold)
+        \\m80 - cross-platform microvm runtime
         \\
         \\usage:
-        \\  m80 init <name>
-        \\  m80 start <name>
-        \\  m80 console <name>
-        \\  m80 stop <name>
-        \\  m80 delete <name>
-        \\  m80 ps
-        \\  m80 inspect <name>
-        \\  m80 help
-        \\  
+        \\  m80 init <name>              create a new VM
+        \\  m80 start <name>             start a VM in the background
+        \\  m80 console <name>           attach to a running VM console
+        \\  m80 stop <name>              stop a running VM
+        \\  m80 delete <name>            remove a VM and its files
+        \\  m80 ps                       list all VMs and their status
+        \\  m80 inspect <name>           show VM details
+        \\  m80 snapshot <name> <path>   save VM memory to snapshot file
+        \\  m80 restore <name> <path>    restore VM memory from snapshot
+        \\  m80 clone <name> <new-name>  clone a VM (copy config)
+        \\  m80 help                     show this help message
+        \\
     , .{});
 }
 
-/// Convenience wrapper that prints help text to stderr.
-/// Silently ignores any write errors (stderr might be closed/redirected).
+/// Convenience wrapper that prints help text to stdout.
+/// Silently ignores any write errors (stdout might be closed/redirected).
 fn printHelp() void {
-    var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
-    writeHelp(&w.interface) catch {};
+    std.debug.print(
+        \\m80 - cross-platform microvm runtime
+        \\
+        \\usage:
+        \\  m80 init <name>              create a new VM
+        \\  m80 start <name>             start a VM in the background
+        \\  m80 console <name>           attach to a running VM console
+        \\  m80 stop <name>              stop a running VM
+        \\  m80 delete <name>            remove a VM and its files
+        \\  m80 ps                       list all VMs and their status
+        \\  m80 inspect <name>           show VM details
+        \\  m80 snapshot <name> <path>   save VM memory to snapshot file
+        \\  m80 restore <name> <path>    restore VM memory from snapshot
+        \\  m80 clone <name> <new-name>  clone a VM (copy config)
+        \\  m80 help                     show this help message
+        \\
+    , .{});
 }
 
 /// Checks if a file exists at the given path and returns its size in bytes.
@@ -905,6 +922,124 @@ pub fn main() !void {
             .stopped => "stopped",
         }});
         std.debug.print("config: m80.conf\n", .{});
+        return;
+    }
+
+    // ===== SNAPSHOT COMMAND =====
+    // Saves VM memory state to a snapshot file for later restoration.
+    // Usage: m80 snapshot <name> <path>
+    if (std.mem.eql(u8, cmd, "snapshot")) {
+        if (args.len < 4) {
+            errors.die("usage: m80 snapshot <name> <path>", .{});
+        }
+        const snap_path = args[3];
+
+        // Verify VM exists
+        const dir_path = try core.paths.vmDir(allocator, name);
+        defer allocator.free(dir_path);
+        var cwd = std.fs.cwd();
+        _ = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+
+        // Validate snapshot path
+        const header = snapshot.validateSnapshot(snap_path) catch |e| switch (e) {
+            error.FileNotFound => {
+                // This is expected for a new snapshot
+                std.debug.print("creating new snapshot: {s}\n", .{snap_path});
+                std.debug.print("snapshot: feature requires running VM (not yet implemented)\n", .{});
+                return;
+            },
+            error.InvalidMagic => errors.die("invalid snapshot file: {s}", .{snap_path}),
+            error.UnsupportedVersion => errors.die("unsupported snapshot version: {s}", .{snap_path}),
+            else => errors.die("snapshot validation failed: {s}", .{@errorName(e)}),
+        };
+        _ = header;
+
+        // TODO: Connect to running VM and save state
+        std.debug.print("snapshot: feature requires running VM (not yet implemented)\n", .{});
+        return;
+    }
+
+    // ===== RESTORE COMMAND =====
+    // Restores VM memory state from a previously saved snapshot.
+    // Usage: m80 restore <name> <path>
+    if (std.mem.eql(u8, cmd, "restore")) {
+        if (args.len < 4) {
+            errors.die("usage: m80 restore <name> <path>", .{});
+        }
+        const snap_path = args[3];
+
+        // Verify VM exists
+        const dir_path = try core.paths.vmDir(allocator, name);
+        defer allocator.free(dir_path);
+        var cwd = std.fs.cwd();
+        _ = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+
+        // Validate snapshot
+        const header = snapshot.validateSnapshot(snap_path) catch |e| switch (e) {
+            error.FileNotFound => errors.die("snapshot not found: {s}", .{snap_path}),
+            error.InvalidMagic => errors.die("invalid snapshot file: {s}", .{snap_path}),
+            error.UnsupportedVersion => errors.die("unsupported snapshot version: {s}", .{snap_path}),
+            else => errors.die("snapshot validation failed: {s}", .{@errorName(e)}),
+        };
+
+        std.debug.print("snapshot: memory_size={d} pages={d} non_zero={d}\n", .{
+            header.memory_size,
+            header.total_page_count,
+            header.non_zero_page_count,
+        });
+
+        // TODO: Start VM and restore state from snapshot
+        std.debug.print("restore: feature requires VM start integration (not yet implemented)\n", .{});
+        return;
+    }
+
+    // ===== CLONE COMMAND =====
+    // Creates a copy of a VM with a new name.
+    // Usage: m80 clone <name> <new-name>
+    if (std.mem.eql(u8, cmd, "clone")) {
+        if (args.len < 4) {
+            errors.die("usage: m80 clone <name> <new-name>", .{});
+        }
+        const new_name = args[3];
+
+        // Validate new name
+        if (!core.paths.validateVmName(new_name)) {
+            errors.die("invalid vm name: {s}", .{new_name});
+        }
+
+        // Verify source VM exists
+        const src_dir_path = try core.paths.vmDir(allocator, name);
+        defer allocator.free(src_dir_path);
+        var cwd = std.fs.cwd();
+        var src_dir = cwd.openDir(src_dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+        defer src_dir.close();
+
+        // Create destination VM
+        state.initVm(allocator, new_name) catch |e| switch (e) {
+            error.InvalidArgs => errors.die("invalid vm name: {s}", .{new_name}),
+            error.AlreadyExists => errors.die("vm already exists: {s}", .{new_name}),
+            else => return e,
+        };
+
+        // Copy config file
+        const dst_dir_path = try core.paths.vmDir(allocator, new_name);
+        defer allocator.free(dst_dir_path);
+        var dst_dir = cwd.openDir(dst_dir_path, .{}) catch errors.die("failed to open new vm dir: {s}", .{new_name});
+        defer dst_dir.close();
+
+        // Read source config
+        const cfg = core.config.readConfigFile(allocator, src_dir, name) catch |e| {
+            errors.die("failed to read source config: {s}", .{@errorName(e)});
+        };
+        var cfg_mut = cfg;
+        defer core.config.freeConfig(allocator, &cfg_mut);
+
+        // Write to destination
+        core.config.writeConfigFile(dst_dir, cfg_mut) catch |e| {
+            errors.die("failed to write config: {s}", .{@errorName(e)});
+        };
+
+        std.debug.print("cloned vm: {s} -> {s}\n", .{ name, new_name });
         return;
     }
 

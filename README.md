@@ -1,6 +1,6 @@
 # m80
 
-Windows-native microVM runtime (Zig) with a minimal CLI scaffold.
+Cross-platform microVM runtime (Zig) with a minimal CLI scaffold.
 
 ## Status
 
@@ -124,6 +124,8 @@ Shared directory example (strict roots required):
 ```
 mount_roots=/Users/you/projects
 mounts=code:/Users/you/projects/m80:/mnt/code:rw:virtiofs
+virtio_fs_queues=2
+virtio_fs_cache=auto
 ```
 
 Guest-side mount (virtiofs tag `code`):

@@ -14,7 +14,7 @@ Tests are aggregated via `src/all_tests.zig` using a custom runner in `src/test_
 
 ## Architecture
 
-m80 is a Windows-native microVM runtime written in Zig, with POSIX support for development. It uses platform-specific hypervisor backends (WHP on Windows, HVF on macOS, KVM on Linux).
+m80 is a cross-platform microVM runtime written in Zig. It uses platform-specific hypervisor backends (WHP on Windows, HVF on macOS, KVM on Linux).
 
 ### Core Flow
 

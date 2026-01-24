@@ -36,6 +36,8 @@ test "import: all modules" {
     _ = @import("vm/boot.zig");
     _ = @import("vm/posix.zig");
     _ = @import("vm/serial.zig");
+    _ = @import("vm/snapshot.zig");
+    _ = @import("vm/virtio.zig");
     _ = @import("vm/vm.zig");
     _ = @import("vm/windows.zig");
 }
