@@ -415,7 +415,7 @@ fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
     }
     cfg_mut.kernel_cmdline = try allocator.dupe(
         u8,
-        "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 root=/dev/vda1 rootwait rootfstype=ext4 rw devtmpfs.mount=1 systemd.mask=boot-efi.mount systemd.mask=systemd-boot-update.service loglevel=7 systemd.show_status=no systemd.log_level=info systemd.log_color=no fsck.mode=skip fsck.repair=no",
+        "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 root=/dev/vda1 rootwait rootfstype=ext4 rw devtmpfs.mount=1 systemd.mask=boot-efi.mount systemd.mask=systemd-boot-update.service quiet loglevel=3 systemd.show_status=false systemd.log_level=warning systemd.log_color=no fsck.mode=skip fsck.repair=no",
     );
 
     if (cfg_mut.mount_roots.len > 0) {
