@@ -4,87 +4,74 @@ This document lists work items needed to reach feature parity with Firecracker, 
 
 ---
 
-## P0 - Critical (Boot Performance)
+## P0 - Critical (Boot Performance) ✅ COMPLETE
 
 These items directly impact boot time and are required to beat Firecracker's ~125ms target.
 
-### 1. Memory-Mapped Kernel Loading
+### 1. Memory-Mapped Kernel Loading ✅
 
-**Current:** Streams kernel file in 64KB chunks via `read()`, copies to guest memory.
-
-**Target:** Use `mmap()` for zero-copy loading.
-
-**Impact:** ~50-150ms savings for typical kernels.
-
-**Files:**
-- `src/vm/hvf.zig` - `loadGuestKernel()`, `copyFileToGuest()`
+**Status:** COMPLETE
 
 **Implementation:**
-```zig
-fn loadKernelMapped(path: []const u8) ![]align(4096) u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    const stat = try file.stat();
-    return std.posix.mmap(null, stat.size, PROT_READ, MAP_PRIVATE, file.handle, 0);
-}
-```
+- Added `copyFileMmapToGuest()` function that uses `mmap()` for zero-copy file loading
+- Modified `copyFileToGuest()` to try mmap first, falling back to chunked reads
+- Falls back to `copyFileChunkedToGuest()` on Windows or mmap failure
+- Tests added: `hvf: copyFileToGuest uses mmap`, `hvf: copyFileMmapToGuest loads file correctly`
+
+**Files Modified:**
+- `src/vm/hvf.zig` - `copyFileToGuest()`, `copyFileMmapToGuest()`, `copyFileChunkedToGuest()`
 
 ---
 
-### 2. Lazy Memory Allocation (Demand Paging)
+### 2. Lazy Memory Allocation (Demand Paging) ✅
 
-**Current:** Pre-allocates all guest memory at boot (`page_allocator.alloc()`).
-
-**Target:** Map pages on first access using `MAP_NORESERVE` or equivalent.
-
-**Impact:** ~50-100ms savings, reduced memory footprint.
-
-**Files:**
-- `src/vm/hvf.zig` - `start()` memory allocation section
+**Status:** COMPLETE
 
 **Implementation:**
-- Use `mmap()` with `MAP_ANONYMOUS | MAP_NORESERVE`
-- Let HVF fault in pages on demand
-- Or use HVF's lazy mapping if available
+- Added `allocateGuestMemoryLazy()` function using `mmap()` with `MAP_ANONYMOUS`
+- Guest memory allocated via mmap on macOS/Linux - pages only committed on first access
+- Removed `@memset(guest_memory, 0)` - anonymous mmap pages are zero-filled by OS on demand
+- Added `freeGuestMemoryMmap()` for cleanup with `munmap()`
+- Falls back to `page_allocator.alloc()` on unsupported platforms
+- Log message: `hvf allocated X MB guest memory [lazy/mmap]`
+- Tests added: `hvf: allocateGuestMemoryLazy returns demand-paged memory`
+
+**Files Modified:**
+- `src/vm/hvf.zig` - `allocateGuestMemoryLazy()`, `freeGuestMemoryMmap()`, `start()`, `stop()`
 
 ---
 
-### 3. Parallel Kernel/Initrd Loading
+### 3. Parallel Kernel/Initrd Loading ✅
 
-**Current:** Sequential loading - kernel first, then initrd.
-
-**Target:** Load both concurrently using threads.
-
-**Impact:** ~20-50ms savings (depends on I/O).
-
-**Files:**
-- `src/vm/hvf.zig` - `start()`
+**Status:** COMPLETE
 
 **Implementation:**
-```zig
-const kernel_thread = try std.Thread.spawn(.{}, loadGuestKernel, .{...});
-const initrd_thread = try std.Thread.spawn(.{}, loadGuestInitrd, .{...});
-kernel_thread.join();
-initrd_thread.join();
-```
+- Added `loadKernelAndInitrd()` function with `ParallelLoadResult` return type
+- When both kernel_path and initrd_path are set, spawns a thread for initrd loading
+- Kernel loads on main thread while initrd loads in parallel
+- Gracefully falls back to sequential loading if thread spawn fails
+- Log message: `hvf loaded kernel and initrd in parallel`
+
+**Files Modified:**
+- `src/vm/hvf.zig` - `loadKernelAndInitrd()`, `ParallelLoadResult`, modified `start()`
 
 ---
 
-### 4. Skip Unused Device Initialization
+### 4. Skip Unused Device Initialization ✅
 
-**Current:** All VirtIO devices initialized at boot.
+**Status:** ALREADY IMPLEMENTED
 
-**Target:** Only initialize configured devices.
-
-**Impact:** ~5-10ms savings.
+**Current State:**
+- VirtIO-blk: Only sets up devices if `disk_path`, `seed_path`, or `data_disk_path` configured
+- VirtIO-console: Only enabled if `M80_VIRTIO_CONSOLE` env var or `hvc0` in cmdline
+- VirtIO-rng: Always enabled (minimal overhead - just sets a flag)
+- VirtIO-fs: Returns early if `cfg.mounts.len == 0`
+- VirtIO-net: Not initialized (vmnet removed)
+- GIC interrupts: Only registered for configured devices
 
 **Files:**
-- `src/vm/hvf.zig` - device setup section
-- `src/vm/virtio.zig`
-
-**Implementation:**
-- Skip `setupVirtioNet()` if `network_mode=locked_down` and no network config
-- Skip `setupVirtioFs()` if no mounts configured
-- Skip secondary block devices if not used
+- `src/vm/hvf.zig` - device setup and GIC interrupt registration
+- `src/vm/virtio.zig` - conditional device initialization in setup functions
 
 ---
 

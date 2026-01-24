@@ -351,6 +351,10 @@ fn dieStartConfigError(err: core.config.StartConfigError, cfg: *const core.confi
             "only one mount is supported right now. Remove extra mounts and retry.",
             .{},
         ),
+        error.VirtioFsQueuesInvalid => errors.die(
+            "virtio_fs_queues must be between 1 and 8. Set virtio_fs_queues=1 and retry.",
+            .{},
+        ),
     }
 }
 
