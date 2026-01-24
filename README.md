@@ -101,7 +101,7 @@ Example (arm64 + rootfs + NoCloud seed):
 kernel_path=images/fc-ubuntu-5.10-with-rng-vmlinux.bin
 disk_path=images/debian-12-nocloud-arm64-rootfs.ext4
 seed_path=images/debian-nocloud-seed.iso
-kernel_cmdline=earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw
+kernel_cmdline=earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw quiet loglevel=3 systemd.show_status=false systemd.log_level=warning
 ```
 
 Shortcut (Debian NoCloud dev VM):
