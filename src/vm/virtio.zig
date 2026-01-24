@@ -239,6 +239,7 @@ pub var net_policy_state: ?net_policy.NetworkPolicy = null;
 pub var net_policy_mutex = std.Thread.Mutex{};
 
 pub const virtio_fs_tag_len: usize = 36;
+const virtio_fs_queue_limit: usize = 8;
 
 pub const VirtioFsQueue = struct {
     num: u16 = 0,
@@ -259,7 +260,7 @@ pub const VirtioFsState = struct {
     driver_features: [2]u32 = .{ 0, 0 },
     interrupt_status: u32 = 0,
     queue_sel: u16 = 0,
-    queues: [2]VirtioFsQueue = .{ .{}, .{} },
+    queues: [virtio_fs_queue_limit]VirtioFsQueue = [_]VirtioFsQueue{.{}} ** virtio_fs_queue_limit,
     tag: [virtio_fs_tag_len]u8 = [_]u8{0} ** virtio_fs_tag_len,
     num_queues: u32 = 1,
 };
@@ -544,13 +545,22 @@ pub fn setupVirtioFs(allocator: std.mem.Allocator, cfg: config.VmConfig) !void {
     virtio_fs_mount_manager = manager;
 
     const mount_tag = manager.mounts.items[0].tag;
-    const device = virtio_fs.VirtioFsDevice.init(allocator, &virtio_fs_mount_manager.?, mount_tag);
+    const device = virtio_fs.VirtioFsDevice.init(
+        allocator,
+        &virtio_fs_mount_manager.?,
+        mount_tag,
+        switch (cfg.virtio_fs_cache) {
+            .none => .none,
+            .auto => .auto,
+            .always => .always,
+        },
+    );
     virtio_fs_device = device;
     virtio_fs_state.enabled = true;
     @memset(&virtio_fs_state.tag, 0);
     const tag_len = @min(mount_tag.len, virtio_fs_state.tag.len);
     @memcpy(virtio_fs_state.tag[0..tag_len], mount_tag[0..tag_len]);
-    virtio_fs_state.num_queues = 1;
+    virtio_fs_state.num_queues = @min(@as(u32, cfg.virtio_fs_queues), @as(u32, virtio_fs_state.queues.len));
     log.info("hvf virtio-fs enabled tag={s}", .{mount_tag});
 }
 
@@ -1236,6 +1246,7 @@ pub fn processVirtioNetTxQueue() !void {
 pub fn processVirtioFsQueue(queue_index: usize) !void {
     if (!virtio_fs_state.enabled) return;
     if (queue_index >= virtio_fs_state.queues.len) return;
+    if (queue_index >= @as(usize, virtio_fs_state.num_queues)) return;
     const queue = &virtio_fs_state.queues[queue_index];
     if (!queue.ready or queue.num == 0) return;
 
@@ -1837,7 +1848,7 @@ pub fn handleVirtioFsMmio(offset: u64, is_write: bool, size: usize, value: u64) 
             virtio_mmio_reg_status => {
                 if (v32 == 0) {
                     virtio_fs_state.status = 0;
-                    virtio_fs_state.queues = .{ .{}, .{} };
+                    virtio_fs_state.queues = [_]VirtioFsQueue{.{}} ** virtio_fs_queue_limit;
                 } else {
                     virtio_fs_state.status = v32;
                 }

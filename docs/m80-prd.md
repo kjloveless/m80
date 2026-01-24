@@ -129,7 +129,7 @@ Responsibilities:
 
 ## 7. Jailer / Security Model (Windows Mapping)
 
-m80 implements a **Windows-native jailer**, functionally equivalent to Firecracker’s jailer.
+m80 implements a **cross-platform jailer**, functionally equivalent to Firecracker's jailer.
 
 ### 7.1 Isolation Mechanisms
 Each `m80-vmm` process is launched with:
@@ -257,5 +257,5 @@ Per-VM:
 - Minimalism over features
 - Explicit > implicit
 - Security boundaries are mandatory
-- Windows-native primitives first
+- Cross-platform primitives
 - No hidden runtimes

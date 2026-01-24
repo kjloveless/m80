@@ -50,6 +50,17 @@ pub const VirtioFeatures = struct {
     pub const VIRTIO_FS_F_NOTIFICATION: u64 = 1 << 0;
 };
 
+pub const CacheMode = enum {
+    none,
+    auto,
+    always,
+};
+
+pub const FuseInitFlags = struct {
+    pub const FUSE_CAP_AUTO_INVAL_DATA: u32 = 1 << 12;
+    pub const FUSE_CAP_WRITEBACK_CACHE: u32 = 1 << 16;
+};
+
 pub const FuseOpcode = enum(u32) {
     FUSE_LOOKUP = 1,
     FUSE_FORGET = 2,
@@ -284,18 +295,25 @@ pub const VirtioFsDevice = struct {
     allocator: std.mem.Allocator,
     mount_manager: *mounts.MountManager,
     tag: []const u8,
+    cache_mode: CacheMode,
     next_nodeid: u64,
     next_fh: u64,
     nodes: std.AutoHashMap(u64, NodeHandle),
     handles: std.AutoHashMap(u64, FileHandle),
     features: u64,
 
-    pub fn init(allocator: std.mem.Allocator, mount_manager: *mounts.MountManager, tag: []const u8) VirtioFsDevice {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        mount_manager: *mounts.MountManager,
+        tag: []const u8,
+        cache_mode: CacheMode,
+    ) VirtioFsDevice {
         // Node IDs start at 2 (1 is root in FUSE).
         return .{
             .allocator = allocator,
             .mount_manager = mount_manager,
             .tag = tag,
+            .cache_mode = cache_mode,
             .next_nodeid = 2,
             .next_fh = 1,
             .nodes = std.AutoHashMap(u64, NodeHandle).init(allocator),
@@ -383,11 +401,17 @@ pub const VirtioFsDevice = struct {
         out_header.unique = header.unique;
 
         const out_init: *FuseInitOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
+        var flags: u32 = 0;
+        switch (self.cache_mode) {
+            .none => {},
+            .auto => flags |= FuseInitFlags.FUSE_CAP_AUTO_INVAL_DATA,
+            .always => flags |= FuseInitFlags.FUSE_CAP_WRITEBACK_CACHE,
+        }
         out_init.* = .{
             .major = 7,
             .minor = 31,
             .max_readahead = 131072,
-            .flags = 0,
+            .flags = flags,
             .max_background = 0,
             .congestion_threshold = 0,
             .max_write = 131072,
@@ -1260,7 +1284,7 @@ test "virtio_fs: VirtioFsDevice init/deinit" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     try std.testing.expectEqual(@as(u64, 2), device.next_nodeid);
@@ -1281,7 +1305,7 @@ test "virtio_fs: handleInit" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     var request: [@sizeOf(FuseInHeader) + @sizeOf(FuseInitIn)]u8 = undefined;
@@ -1321,7 +1345,7 @@ test "virtio_fs: handleInit accepts unaligned request" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     var request_buf: [@sizeOf(FuseInHeader) + @sizeOf(FuseInitIn) + 1]u8 = undefined;
@@ -1377,7 +1401,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     // LOOKUP
@@ -1534,7 +1558,7 @@ test "virtio_fs: lookup rejects traversal" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     const name = "..";
@@ -1569,7 +1593,7 @@ test "virtio_fs: read rejects short payload" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + 2]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -1598,7 +1622,7 @@ test "virtio_fs: handleOpen returns not found for missing node" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader)]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -1627,7 +1651,7 @@ test "virtio_fs: handleRead rejects invalid handle" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
@@ -1679,7 +1703,7 @@ test "virtio_fs: handleRead errors on short response buffer" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
@@ -1720,7 +1744,7 @@ test "virtio_fs: handleWrite rejects short payload" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) - 1]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -1761,7 +1785,7 @@ test "virtio_fs: handleRead maps io error on write-only file" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
@@ -1819,7 +1843,7 @@ test "virtio_fs: handleWrite maps io error on read-only file" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
@@ -1884,7 +1908,7 @@ test "virtio_fs: handleOpendir rejects non-dir node" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
@@ -1915,7 +1939,7 @@ test "virtio_fs: handleReleasedir rejects short payload" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + 1]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -1956,7 +1980,7 @@ test "virtio_fs: handleRelease closes file handle" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
@@ -1996,7 +2020,7 @@ test "virtio_fs: handleReaddir rejects short payload" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + 2]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -2043,7 +2067,7 @@ test "virtio_fs: handleReaddir returns entries" {
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
 
-    var device = VirtioFsDevice.init(allocator, &mount_manager, "test");
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, true);

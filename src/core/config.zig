@@ -118,6 +118,34 @@ pub const VmConfig = struct {
     /// List of allowed IP addresses/CIDR ranges when network_mode is allowlist.
     /// Example: "10.0.0.0/8", "192.168.1.1"
     allowed_ips: []const []const u8 = &[_][]const u8{},
+
+    /// Number of virtio-fs request queues to expose (1-8).
+    /// Higher values can improve throughput on multi-core systems.
+    virtio_fs_queues: u16 = 1,
+
+    /// Virtio-fs cache mode.
+    virtio_fs_cache: VirtioFsCacheMode = .auto,
+};
+
+pub const VirtioFsCacheMode = enum {
+    none,
+    auto,
+    always,
+
+    pub fn fromString(value: []const u8) ?VirtioFsCacheMode {
+        if (std.mem.eql(u8, value, "none")) return .none;
+        if (std.mem.eql(u8, value, "auto")) return .auto;
+        if (std.mem.eql(u8, value, "always")) return .always;
+        return null;
+    }
+
+    pub fn toString(self: VirtioFsCacheMode) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .auto => "auto",
+            .always => "always",
+        };
+    }
 };
 
 /// Default RAM allocation: 2 GB - sufficient for most lightweight workloads
@@ -211,6 +239,8 @@ pub const StartConfigError = error{
     DataDiskUnreadable,
     /// network_mode=open requires explicit env opt-in
     OpenNetworkNotAllowed,
+    /// virtio_fs_queues outside supported range
+    VirtioFsQueuesInvalid,
     /// mounts configured without mount_roots
     MountRootsRequired,
     /// unsupported mount type for this backend
@@ -512,6 +542,7 @@ pub fn validateStartConfig(cfg: *const VmConfig) StartConfigError!void {
     for (cfg.mounts) |mount_cfg| {
         if (mount_cfg.mount_type != .virtio_fs) return error.MountTypeUnsupported;
     }
+    if (cfg.virtio_fs_queues == 0 or cfg.virtio_fs_queues > 8) return error.VirtioFsQueuesInvalid;
     if (cfg.network_mode == .open) {
         const env_var = std.process.getEnvVarOwned(std.heap.page_allocator, "M80_ALLOW_OPEN_NETWORK") catch {
             return error.OpenNetworkNotAllowed;
@@ -799,6 +830,18 @@ fn applyConfigEntry(
         return;
     }
 
+    if (std.mem.eql(u8, key, "virtio_fs_queues")) {
+        const queues = std.fmt.parseInt(u16, value, 10) catch return error.InvalidValue;
+        if (queues == 0 or queues > 8) return error.InvalidValue;
+        cfg.virtio_fs_queues = queues;
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "virtio_fs_cache")) {
+        cfg.virtio_fs_cache = VirtioFsCacheMode.fromString(value) orelse return error.InvalidValue;
+        return;
+    }
+
     if (std.mem.eql(u8, key, "network_mode")) {
         cfg.network_mode = net_policy.NetworkMode.fromString(value) orelse return error.InvalidValue;
         return;
@@ -834,6 +877,7 @@ fn applyConfigEntry(
 /// Writes all config fields including:
 ///   - name, ephemeral, memory_mb, cpu_cores
 ///   - kernel_path, initrd_path, disk_path, seed_path, data_disk_path, disk_readonly, data_disk_readonly, kernel_cmdline (if set)
+///   - virtio_fs_queues, virtio_fs_cache (if non-default)
 ///   - network_mode
 ///   - allowed_domains, allowed_ips (if non-empty, as comma-separated)
 ///   - mount_roots, mounts (if non-empty, as comma-separated)
@@ -872,6 +916,12 @@ pub fn writeConfigFile(dir: std.fs.Dir, cfg: VmConfig) !void {
     }
     if (cfg.kernel_cmdline) |value| {
         try w.print("kernel_cmdline={s}\n", .{value});
+    }
+    if (cfg.virtio_fs_queues != 1) {
+        try w.print("virtio_fs_queues={}\n", .{cfg.virtio_fs_queues});
+    }
+    if (cfg.virtio_fs_cache != .auto) {
+        try w.print("virtio_fs_cache={s}\n", .{cfg.virtio_fs_cache.toString()});
     }
     try w.print("network_mode={s}\n", .{cfg.network_mode.toString()});
 
