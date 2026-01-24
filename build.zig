@@ -21,6 +21,50 @@
 
 const std = @import("std");
 
+const CodesignConfig = struct {
+    identity: ?[]const u8 = null,
+    keychain: ?[]const u8 = null,
+
+    fn deinit(self: *CodesignConfig, allocator: std.mem.Allocator) void {
+        if (self.identity) |v| allocator.free(v);
+        if (self.keychain) |v| allocator.free(v);
+    }
+};
+
+fn readCodesignConfig(allocator: std.mem.Allocator, path: []const u8) !CodesignConfig {
+    var cfg = CodesignConfig{};
+    var file = std.fs.cwd().openFile(path, .{}) catch |e| switch (e) {
+        error.FileNotFound => return cfg,
+        else => return e,
+    };
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        if (line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t\r");
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
+        if (key.len == 0) continue;
+        if (std.mem.eql(u8, key, "identity")) {
+            if (cfg.identity) |v| allocator.free(v);
+            cfg.identity = try allocator.dupe(u8, value);
+            continue;
+        }
+        if (std.mem.eql(u8, key, "keychain")) {
+            if (cfg.keychain) |v| allocator.free(v);
+            cfg.keychain = try allocator.dupe(u8, value);
+            continue;
+        }
+    }
+    return cfg;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -36,11 +80,6 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .macos) {
         exe.linkFramework("Hypervisor");
-        exe.linkFramework("vmnet");
-        exe.addCSourceFile(.{
-            .file = b.path("src/net/vmnet_bridge.c"),
-            .flags = &[_][]const u8{ "-fblocks" },
-        });
     }
 
     b.installArtifact(exe);
@@ -70,11 +109,6 @@ pub fn build(b: *std.Build) void {
     });
     if (target.result.os.tag == .macos) {
         unit_tests.linkFramework("Hypervisor");
-        unit_tests.linkFramework("vmnet");
-        unit_tests.addCSourceFile(.{
-            .file = b.path("src/net/vmnet_bridge.c"),
-            .flags = &[_][]const u8{ "-fblocks" },
-        });
     }
     unit_tests.root_module.addAnonymousImport("build_script", .{
         .root_source_file = b.path("build.zig"),
@@ -86,19 +120,31 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 
     if (target.result.os.tag == .macos) {
-        var entitlements_name: []const u8 = "entitlements/hvf-entitlements.xml";
-        if (std.process.getEnvVarOwned(b.allocator, "M80_VMNET_ENTITLEMENTS") catch null) |value| {
-            defer b.allocator.free(value);
-            if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) {
-                entitlements_name = "entitlements/hvf-entitlements-vmnet.xml";
-            }
-        }
-        var codesign_identity: []const u8 = "-";
+        const config_path = std.process.getEnvVarOwned(b.allocator, "M80_CODESIGN_CONFIG") catch null;
+        defer if (config_path) |p| b.allocator.free(p);
+        var cfg = readCodesignConfig(
+            b.allocator,
+            config_path orelse "codesign.conf",
+        ) catch CodesignConfig{};
+        defer cfg.deinit(b.allocator);
+
+        const entitlements_name: []const u8 = "entitlements/hvf-entitlements.xml";
+        var codesign_identity: []const u8 = cfg.identity orelse "-";
         var codesign_identity_buf: ?[]u8 = null;
         if (std.process.getEnvVarOwned(b.allocator, "M80_CODESIGN_IDENTITY") catch null) |value| {
             if (value.len != 0) {
                 codesign_identity = value;
                 codesign_identity_buf = value;
+            } else {
+                b.allocator.free(value);
+            }
+        }
+        var codesign_keychain: ?[]const u8 = cfg.keychain;
+        var codesign_keychain_buf: ?[]u8 = null;
+        if (std.process.getEnvVarOwned(b.allocator, "M80_CODESIGN_KEYCHAIN") catch null) |value| {
+            if (value.len != 0) {
+                codesign_keychain = value;
+                codesign_keychain_buf = value;
             } else {
                 b.allocator.free(value);
             }
@@ -109,10 +155,13 @@ pub fn build(b: *std.Build) void {
             "codesign",
             "--sign",
             codesign_identity,
-            "--entitlements",
         });
+        if (codesign_keychain) |kc| {
+            sign_exe.addArgs(&[_][]const u8{ "--keychain", kc });
+        }
+        sign_exe.addArg("--entitlements");
         sign_exe.addFileArg(entitlements);
-        sign_exe.addArgs(&[_][]const u8{ "--deep", "--force" });
+        sign_exe.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
         sign_exe.addFileArg(exe.getEmittedBin());
         sign_exe.step.dependOn(&exe.step);
 
@@ -120,10 +169,13 @@ pub fn build(b: *std.Build) void {
             "codesign",
             "--sign",
             codesign_identity,
-            "--entitlements",
         });
+        if (codesign_keychain) |kc| {
+            sign_installed.addArgs(&[_][]const u8{ "--keychain", kc });
+        }
+        sign_installed.addArg("--entitlements");
         sign_installed.addFileArg(entitlements);
-        sign_installed.addArgs(&[_][]const u8{ "--deep", "--force" });
+        sign_installed.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
         sign_installed.addArg(b.getInstallPath(.bin, exe.name));
         sign_installed.step.dependOn(b.getInstallStep());
 
@@ -131,14 +183,20 @@ pub fn build(b: *std.Build) void {
             "codesign",
             "--sign",
             codesign_identity,
-            "--entitlements",
         });
+        if (codesign_keychain) |kc| {
+            sign_tests.addArgs(&[_][]const u8{ "--keychain", kc });
+        }
+        sign_tests.addArg("--entitlements");
         sign_tests.addFileArg(entitlements);
-        sign_tests.addArgs(&[_][]const u8{ "--deep", "--force" });
+        sign_tests.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
         sign_tests.addFileArg(unit_tests.getEmittedBin());
         sign_tests.step.dependOn(&unit_tests.step);
         run_unit_tests.step.dependOn(&sign_tests.step);
 
         run_cmd.step.dependOn(&sign_installed.step);
+
+        if (codesign_identity_buf) |buf| b.allocator.free(buf);
+        if (codesign_keychain_buf) |buf| b.allocator.free(buf);
     }
 }

@@ -39,7 +39,6 @@ const dtb = @import("dtb.zig");
 const builtin = @import("builtin");
 const dns = @import("../net/dns.zig");
 const net_policy = @import("../net/policy.zig");
-const vmnet = @import("../net/vmnet.zig");
 const virtio_fs = @import("../fs/virtio_fs.zig");
 const mounts = @import("../fs/mounts.zig");
 const SerialIo = serial.SerialIo;
@@ -1046,13 +1045,6 @@ var virtio_net_seen = std.atomic.Value(bool).init(false);
 var gic_virtio_net_intid: ?u32 = null;
 var virtio_net_irq_level = false;
 
-var vmnet_iface: ?vmnet.VmnetInterface = null;
-var vmnet_rx_thread: ?std.Thread = null;
-var vmnet_rx_running = std.atomic.Value(bool).init(false);
-var vmnet_rx_mutex = std.Thread.Mutex{};
-var vmnet_rx_cond = std.Thread.Condition{};
-var vmnet_rx_pending = false;
-var vmnet_dispatch_queue: ?vmnet.c_types.dispatch_queue_t = null;
 
 var net_policy_state: ?net_policy.NetworkPolicy = null;
 var net_policy_mutex = std.Thread.Mutex{};
@@ -2025,121 +2017,9 @@ fn initNetworkPolicy(cfg: config.VmConfig) !void {
     net_policy_state = policy;
 }
 
-fn startVmnetInterface() !void {
-    const iface = vmnet.startShared() catch |e| {
-        switch (e) {
-            error.NotAuthorized => log.err(
-                "hvf vmnet not authorized; ensure com.apple.vm.networking entitlement is present and codesign succeeded",
-                .{},
-            ),
-            else => log.err("hvf vmnet start failed: {s}", .{@errorName(e)}),
-        }
-        return error.NetworkUnavailable;
-    };
-    vmnet_iface = iface;
-    setupVirtioNet(true, iface.mac);
-
-    const q = vmnet.c_types.dispatch_queue_create("m80.vmnet", null);
-    vmnet_dispatch_queue = q;
-    vmnet.setEventCallback(iface, q, vmnetEventCallback, null) catch |e| {
-        log.warn("hvf vmnet event callback failed: {s}", .{@errorName(e)});
-    };
-
-    vmnet_rx_running.store(true, .seq_cst);
-    vmnet_rx_thread = std.Thread.spawn(.{}, vmnetRxLoop, .{}) catch |e| {
-        vmnet_rx_running.store(false, .seq_cst);
-        log.warn("hvf vmnet rx thread failed: {s}", .{@errorName(e)});
-        return;
-    };
-    vmnet_rx_mutex.lock();
-    vmnet_rx_pending = true;
-    vmnet_rx_cond.signal();
-    vmnet_rx_mutex.unlock();
-}
-
-fn stopVmnetInterface() void {
-    vmnet_rx_running.store(false, .seq_cst);
-    vmnet_rx_mutex.lock();
-    vmnet_rx_pending = true;
-    vmnet_rx_cond.signal();
-    vmnet_rx_mutex.unlock();
-    if (vmnet_rx_thread) |thread| {
-        thread.join();
-        vmnet_rx_thread = null;
-    }
-    if (vmnet_iface) |iface| {
-        vmnet.stop(iface) catch |e| {
-            log.warn("hvf vmnet stop failed: {s}", .{@errorName(e)});
-        };
-        vmnet_iface = null;
-    }
-    vmnet_dispatch_queue = null;
-    if (net_policy_state) |*policy| {
-        policy.deinit();
-        net_policy_state = null;
-    }
-}
-
-export fn vmnetEventCallback(event_mask: vmnet.c_types.interface_event_t, _: vmnet.c_types.xpc_object_t, _: ?*anyopaque) callconv(.c) void {
-    if ((event_mask & vmnet.c_types.VMNET_INTERFACE_PACKETS_AVAILABLE) == 0) return;
-    vmnet_rx_mutex.lock();
-    vmnet_rx_pending = true;
-    vmnet_rx_cond.signal();
-    vmnet_rx_mutex.unlock();
-}
-
-fn vmnetRxLoop() void {
-    var buf: [4096]u8 = undefined;
-    var iov = vmnet.c_types.iovec{
-        .iov_base = @ptrCast(buf[0..].ptr),
-        .iov_len = buf.len,
-    };
-    var pkt = vmnet.c_types.vmpktdesc{
-        .vm_pkt_size = buf.len,
-        .vm_pkt_iov = &iov,
-        .vm_pkt_iovcnt = 1,
-        .vm_flags = 0,
-    };
-
-    while (vmnet_rx_running.load(.seq_cst)) {
-        vmnet_rx_mutex.lock();
-        while (!vmnet_rx_pending and vmnet_rx_running.load(.seq_cst)) {
-            vmnet_rx_cond.wait(&vmnet_rx_mutex);
-        }
-        vmnet_rx_pending = false;
-        vmnet_rx_mutex.unlock();
-
-        if (!vmnet_rx_running.load(.seq_cst)) break;
-
-        const iface = vmnet_iface orelse continue;
-        while (true) {
-            var pktcnt: c_int = 1;
-            pkt.vm_pkt_size = buf.len;
-            const result = vmnet.readPackets(iface, @ptrCast(&pkt), &pktcnt);
-            if (result) |_| {} else |_| {
-                break;
-            }
-            if (pktcnt == 0) break;
-            const frame = buf[0..pkt.vm_pkt_size];
-            handleInboundFrame(frame);
-        }
-    }
-}
-
 const ether_type_ipv4: u16 = 0x0800;
 const ether_type_arp: u16 = 0x0806;
 const ip_proto_udp: u8 = 17;
-
-fn handleInboundFrame(frame: []const u8) void {
-    if (!virtio_net_state.enabled) return;
-    if (frame.len < 14) return;
-    if (net_policy_state != null) {
-        maybeCacheDnsResponse(frame);
-    }
-    virtioNetRxPacket(frame) catch |e| {
-        log.debug("hvf virtio-net rx drop: {s}", .{@errorName(e)});
-    };
-}
 
 fn maybeCacheDnsResponse(frame: []const u8) void {
     if (frame.len < 14) return;
@@ -2728,7 +2608,6 @@ fn processVirtioNetTxQueue() !void {
     if (!virtio_net_state.enabled) return;
     const queue = &virtio_net_state.queues[1];
     if (!queue.ready or queue.num == 0) return;
-    const iface = vmnet_iface orelse return;
 
     const avail_idx = try readGuestU16(queue.avail_addr + 2);
     while (queue.last_avail_idx != avail_idx) {
@@ -2779,20 +2658,7 @@ fn processVirtioNetTxQueue() !void {
         }
 
         if (frame_len > 0 and outboundFrameAllowed(frame_buf[0..frame_len])) {
-            var iov = vmnet.c_types.iovec{
-                .iov_base = @ptrCast(frame_buf[0..].ptr),
-                .iov_len = frame_len,
-            };
-            var pkt = vmnet.c_types.vmpktdesc{
-                .vm_pkt_size = frame_len,
-                .vm_pkt_iov = &iov,
-                .vm_pkt_iovcnt = 1,
-                .vm_flags = 0,
-            };
-            var pktcnt: c_int = 1;
-            vmnet.writePackets(iface, @ptrCast(&pkt), &pktcnt) catch |e| {
-                log.debug("hvf vmnet write failed: {s}", .{@errorName(e)});
-            };
+            // vmnet disabled; drop outbound frames for now.
         }
 
         const used_slot = queue.used_idx % queue.num;
@@ -4480,9 +4346,7 @@ pub fn start(cfg: config.VmConfig) !void {
         return e;
     };
     if (cfg.network_mode != .locked_down) {
-        try initNetworkPolicy(cfg);
-        errdefer stopVmnetInterface();
-        try startVmnetInterface();
+        log.warn("hvf networking disabled (vmnet removed); network_mode ignored", .{});
     }
     const cmdline = if (cfg.kernel_cmdline) |value| value else defaultCmdlineForConfig(cfg);
     var boot_state = if (builtin.cpu.arch == .aarch64)
@@ -4803,7 +4667,6 @@ pub fn stop() !void {
     resetVirtioRngState();
     resetVirtioNetState();
     resetVirtioFsState();
-    stopVmnetInterface();
 
     if (active_guest_memory) |buffer| {
         unmapActiveGuestMemory();

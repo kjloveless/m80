@@ -502,10 +502,6 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     };
 
     vm.start(cfg_mut) catch |e| switch (e) {
-        error.NetworkUnavailable => errors.die(
-            "network setup failed. Check com.apple.vm.networking entitlement, codesign output, and network_mode configuration.",
-            .{},
-        ),
         error.MountsInvalid => errors.die(
             "mounts rejected. Ensure mount_roots includes the host path and no path traversal is present.",
             .{},

@@ -363,43 +363,82 @@ pub fn resolveRelativePaths(
     cfg: *VmConfig,
 ) !void {
     if (cfg.kernel_path) |path| {
-        if (!std.fs.path.isAbsolute(path)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, path });
+        var resolved = path;
+        if (try expandTildePath(allocator, path)) |expanded| {
             allocator.free(path);
+            resolved = expanded;
+        }
+        if (!std.fs.path.isAbsolute(resolved)) {
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            allocator.free(resolved);
             cfg.kernel_path = joined;
+        } else {
+            cfg.kernel_path = resolved;
         }
     }
     if (cfg.initrd_path) |path| {
-        if (!std.fs.path.isAbsolute(path)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, path });
+        var resolved = path;
+        if (try expandTildePath(allocator, path)) |expanded| {
             allocator.free(path);
+            resolved = expanded;
+        }
+        if (!std.fs.path.isAbsolute(resolved)) {
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            allocator.free(resolved);
             cfg.initrd_path = joined;
+        } else {
+            cfg.initrd_path = resolved;
         }
     }
     if (cfg.disk_path) |path| {
-        if (!std.fs.path.isAbsolute(path)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, path });
+        var resolved = path;
+        if (try expandTildePath(allocator, path)) |expanded| {
             allocator.free(path);
+            resolved = expanded;
+        }
+        if (!std.fs.path.isAbsolute(resolved)) {
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            allocator.free(resolved);
             cfg.disk_path = joined;
+        } else {
+            cfg.disk_path = resolved;
         }
     }
     if (cfg.seed_path) |path| {
-        if (!std.fs.path.isAbsolute(path)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, path });
+        var resolved = path;
+        if (try expandTildePath(allocator, path)) |expanded| {
             allocator.free(path);
+            resolved = expanded;
+        }
+        if (!std.fs.path.isAbsolute(resolved)) {
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            allocator.free(resolved);
             cfg.seed_path = joined;
+        } else {
+            cfg.seed_path = resolved;
         }
     }
     if (cfg.data_disk_path) |path| {
-        if (!std.fs.path.isAbsolute(path)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, path });
+        var resolved = path;
+        if (try expandTildePath(allocator, path)) |expanded| {
             allocator.free(path);
+            resolved = expanded;
+        }
+        if (!std.fs.path.isAbsolute(resolved)) {
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            allocator.free(resolved);
             cfg.data_disk_path = joined;
+        } else {
+            cfg.data_disk_path = resolved;
         }
     }
     if (cfg.mount_roots.len > 0) {
         var needs_rewrite = false;
         for (cfg.mount_roots) |root| {
+            if (root.len > 0 and root[0] == '~') {
+                needs_rewrite = true;
+                break;
+            }
             if (!std.fs.path.isAbsolute(root)) {
                 needs_rewrite = true;
                 break;
@@ -408,12 +447,17 @@ pub fn resolveRelativePaths(
         if (needs_rewrite) {
             const rewritten = try allocator.alloc([]const u8, cfg.mount_roots.len);
             for (cfg.mount_roots, 0..) |root, i| {
-                if (!std.fs.path.isAbsolute(root)) {
-                    const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, root });
+                var resolved = root;
+                if (try expandTildePath(allocator, root)) |expanded| {
                     allocator.free(root);
+                    resolved = expanded;
+                }
+                if (!std.fs.path.isAbsolute(resolved)) {
+                    const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+                    allocator.free(resolved);
                     rewritten[i] = joined;
                 } else {
-                    rewritten[i] = root;
+                    rewritten[i] = resolved;
                 }
             }
             allocator.free(cfg.mount_roots);
@@ -422,6 +466,10 @@ pub fn resolveRelativePaths(
     }
     if (cfg.mounts.len > 0) {
         for (cfg.mounts) |*mount_cfg| {
+            if (try expandTildePath(allocator, mount_cfg.host_path)) |expanded| {
+                allocator.free(mount_cfg.host_path);
+                mount_cfg.host_path = expanded;
+            }
             if (!std.fs.path.isAbsolute(mount_cfg.host_path)) {
                 const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, mount_cfg.host_path });
                 allocator.free(mount_cfg.host_path);
@@ -429,6 +477,20 @@ pub fn resolveRelativePaths(
             }
         }
     }
+}
+
+fn expandTildePath(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    if (path.len == 0 or path[0] != '~') return null;
+    if (path.len > 1 and path[1] != '/') return null;
+
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch
+        std.process.getEnvVarOwned(allocator, "USERPROFILE") catch return null;
+    if (path.len == 1) return home;
+    if (path.len == 2) return home;
+
+    const joined = try std.fs.path.join(allocator, &[_][]const u8{ home, path[2..] });
+    allocator.free(home);
+    return joined;
 }
 
 /// Validates that required config fields are set for starting a VM.
@@ -442,22 +504,22 @@ pub fn resolveRelativePaths(
 /// Errors:
 ///   - MissingKernel: kernel_path is null
 pub fn validateStartConfig(cfg: *const VmConfig) StartConfigError!void {
-  if (cfg.kernel_path == null) return error.MissingKernel;
-  if (cfg.seed_path != null and cfg.disk_path == null) return error.SeedRequiresDisk;
-  if (cfg.initrd_path == null and cfg.disk_path == null) return error.MissingRootfs;
-  if (cfg.mounts.len > 0 and cfg.mount_roots.len == 0) return error.MountRootsRequired;
-  if (cfg.mounts.len > 1) return error.MountCountUnsupported;
-  for (cfg.mounts) |mount_cfg| {
-    if (mount_cfg.mount_type != .virtio_fs) return error.MountTypeUnsupported;
-  }
-  if (cfg.network_mode == .open) {
-    const env_var = std.process.getEnvVarOwned(std.heap.page_allocator, "M80_ALLOW_OPEN_NETWORK") catch {
-      return error.OpenNetworkNotAllowed;
-    };
-    defer std.heap.page_allocator.free(env_var);
-    const allowed = std.mem.eql(u8, env_var, "1") or std.mem.eql(u8, env_var, "true");
-    if (!allowed) return error.OpenNetworkNotAllowed;
-  }
+    if (cfg.kernel_path == null) return error.MissingKernel;
+    if (cfg.seed_path != null and cfg.disk_path == null) return error.SeedRequiresDisk;
+    if (cfg.initrd_path == null and cfg.disk_path == null) return error.MissingRootfs;
+    if (cfg.mounts.len > 0 and cfg.mount_roots.len == 0) return error.MountRootsRequired;
+    if (cfg.mounts.len > 1) return error.MountCountUnsupported;
+    for (cfg.mounts) |mount_cfg| {
+        if (mount_cfg.mount_type != .virtio_fs) return error.MountTypeUnsupported;
+    }
+    if (cfg.network_mode == .open) {
+        const env_var = std.process.getEnvVarOwned(std.heap.page_allocator, "M80_ALLOW_OPEN_NETWORK") catch {
+            return error.OpenNetworkNotAllowed;
+        };
+        defer std.heap.page_allocator.free(env_var);
+        const allowed = std.mem.eql(u8, env_var, "1") or std.mem.eql(u8, env_var, "true");
+        if (!allowed) return error.OpenNetworkNotAllowed;
+    }
 }
 
 /// Validates that kernel/initrd files exist and are readable.
@@ -468,29 +530,29 @@ pub fn validateStartConfig(cfg: *const VmConfig) StartConfigError!void {
 ///   - KernelNotFound/InitrdNotFound/DiskNotFound/SeedNotFound/DataDiskNotFound: File doesn't exist
 ///   - KernelUnreadable/InitrdUnreadable/DiskUnreadable/SeedUnreadable/DataDiskUnreadable: File exists but can't be opened
 pub fn validateStartFiles(cfg: *const VmConfig) StartConfigError!void {
-  if (cfg.kernel_path) |path| {
-    try checkReadableFile(path, .kernel);
-  } else {
-    return error.MissingKernel;
-  }
-  if (cfg.seed_path != null and cfg.disk_path == null) {
-    return error.SeedRequiresDisk;
-  }
-  if (cfg.initrd_path == null and cfg.disk_path == null) {
-    return error.MissingRootfs;
-  }
-  if (cfg.initrd_path) |path| {
-    try checkReadableFile(path, .initrd);
-  }
-  if (cfg.disk_path) |path| {
-    try checkReadableFile(path, .disk);
-  }
-  if (cfg.seed_path) |path| {
-    try checkReadableFile(path, .seed);
-  }
-  if (cfg.data_disk_path) |path| {
-    try checkReadableFile(path, .data_disk);
-  }
+    if (cfg.kernel_path) |path| {
+        try checkReadableFile(path, .kernel);
+    } else {
+        return error.MissingKernel;
+    }
+    if (cfg.seed_path != null and cfg.disk_path == null) {
+        return error.SeedRequiresDisk;
+    }
+    if (cfg.initrd_path == null and cfg.disk_path == null) {
+        return error.MissingRootfs;
+    }
+    if (cfg.initrd_path) |path| {
+        try checkReadableFile(path, .initrd);
+    }
+    if (cfg.disk_path) |path| {
+        try checkReadableFile(path, .disk);
+    }
+    if (cfg.seed_path) |path| {
+        try checkReadableFile(path, .seed);
+    }
+    if (cfg.data_disk_path) |path| {
+        try checkReadableFile(path, .data_disk);
+    }
 }
 
 /// Used to provide specific error messages for kernel vs initrd file issues.
@@ -998,20 +1060,20 @@ test "config: validateStartConfig requires kernel and rootfs" {
 
     try std.testing.expectError(error.MissingKernel, validateStartConfig(&cfg));
 
-  cfg.kernel_path = try allocator.dupe(u8, "/kernels/vmlinuz");
-  try std.testing.expectError(error.MissingRootfs, validateStartConfig(&cfg));
+    cfg.kernel_path = try allocator.dupe(u8, "/kernels/vmlinuz");
+    try std.testing.expectError(error.MissingRootfs, validateStartConfig(&cfg));
 
-  cfg.seed_path = try allocator.dupe(u8, "/images/seed.iso");
-  try std.testing.expectError(error.SeedRequiresDisk, validateStartConfig(&cfg));
-  allocator.free(cfg.seed_path.?);
-  cfg.seed_path = null;
+    cfg.seed_path = try allocator.dupe(u8, "/images/seed.iso");
+    try std.testing.expectError(error.SeedRequiresDisk, validateStartConfig(&cfg));
+    allocator.free(cfg.seed_path.?);
+    cfg.seed_path = null;
 
-  cfg.initrd_path = try allocator.dupe(u8, "/images/initrd.img");
-  try validateStartConfig(&cfg);
-  allocator.free(cfg.initrd_path.?);
-  cfg.initrd_path = null;
-  cfg.disk_path = try allocator.dupe(u8, "/images/rootfs.ext4");
-  try validateStartConfig(&cfg);
+    cfg.initrd_path = try allocator.dupe(u8, "/images/initrd.img");
+    try validateStartConfig(&cfg);
+    allocator.free(cfg.initrd_path.?);
+    cfg.initrd_path = null;
+    cfg.disk_path = try allocator.dupe(u8, "/images/rootfs.ext4");
+    try validateStartConfig(&cfg);
 }
 
 test "config: validateStartFiles checks existence" {
