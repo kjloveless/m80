@@ -38,6 +38,7 @@ const boot = @import("boot.zig");
 const dtb = @import("dtb.zig");
 const builtin = @import("builtin");
 const virtio = @import("virtio.zig");
+const vmnet = @import("../net/vmnet.zig");
 const SerialIo = serial.SerialIo;
 const IoExit = serial.IoExit;
 
@@ -900,6 +901,11 @@ var console_socket_thread: ?std.Thread = null;
 var console_socket_running = std.atomic.Value(bool).init(false);
 var console_socket_path: ?[]u8 = null;
 
+/// Active vmnet interface for networking (macOS only)
+var active_vmnet_iface: ?vmnet.VmnetInterface = null;
+var vmnet_rx_thread: ?std.Thread = null;
+var vmnet_rx_running = std.atomic.Value(bool).init(false);
+
 
 /// GIC wiring for arm64 interrupt injection
 var gic_enabled = false;
@@ -1572,6 +1578,115 @@ fn appendSerialInput(bytes: []const u8) void {
         return;
     }
     serial_io.append(std.heap.page_allocator, bytes);
+}
+
+// =============================================================================
+// VMNET NETWORKING (macOS only)
+// =============================================================================
+
+/// TX callback: called by virtio-net when guest sends a packet.
+/// Writes the frame to the vmnet interface.
+fn vmnetTxCallback(frame: []const u8) void {
+    const iface = active_vmnet_iface orelse return;
+    if (frame.len == 0 or frame.len > iface.max_packet_size) return;
+
+
+    // Set up packet descriptor for vmnet_write
+    var iov: vmnet.c_types.iovec = .{
+        .iov_base = @constCast(@ptrCast(frame.ptr)),
+        .iov_len = frame.len,
+    };
+    var pkt: vmnet.c_types.vmpktdesc = .{
+        .vm_pkt_size = frame.len,
+        .vm_pkt_iov = &iov,
+        .vm_pkt_iovcnt = 1,
+        .vm_flags = 0,
+    };
+    var pktcnt: c_int = 1;
+    vmnet.writePackets(iface, @ptrCast(&pkt), &pktcnt) catch |e| {
+        log.debug("hvf vmnet tx write failed: {s}", .{@errorName(e)});
+        return;
+    };
+    if (pktcnt != 1) {
+        log.debug("hvf vmnet tx write incomplete: pktcnt={d}", .{pktcnt});
+    }
+}
+
+/// RX loop: polls vmnet for incoming packets and delivers to virtio-net.
+fn vmnetRxLoop() void {
+    const iface = active_vmnet_iface orelse return;
+    var pkt_buf: [2048]u8 = undefined;
+
+    var rx_poll_count: u64 = 0;
+    while (vmnet_rx_running.load(.seq_cst)) {
+        // Reset iov and pkt each iteration (vmnet_read may modify them)
+        var iov: vmnet.c_types.iovec = .{
+            .iov_base = &pkt_buf,
+            .iov_len = pkt_buf.len,
+        };
+        var pkt: vmnet.c_types.vmpktdesc = .{
+            .vm_pkt_size = pkt_buf.len,
+            .vm_pkt_iov = &iov,
+            .vm_pkt_iovcnt = 1,
+            .vm_flags = 0,
+        };
+        var pktcnt: c_int = 1;
+
+        vmnet.readPackets(iface, @ptrCast(&pkt), &pktcnt) catch |e| {
+            if (e != vmnet.VmnetError.StartFailed) {
+                log.debug("hvf vmnet rx failed: {s}", .{@errorName(e)});
+            }
+            std.Thread.sleep(1 * std.time.ns_per_ms); // 1ms backoff on error
+            continue;
+        };
+
+        rx_poll_count += 1;
+        if (rx_poll_count % 10000 == 0) {
+            log.debug("hvf vmnet rx poll count={d} pktcnt={d} size={d}", .{ rx_poll_count, pktcnt, pkt.vm_pkt_size });
+        }
+
+        if (pktcnt > 0 and pkt.vm_pkt_size > 0) {
+            const frame = pkt_buf[0..pkt.vm_pkt_size];
+            virtio.virtioNetRxPacket(frame) catch |e| {
+                log.debug("hvf vmnet rx deliver failed: {s}", .{@errorName(e)});
+            };
+        } else {
+            // No packets available, sleep briefly to avoid busy-spinning
+            std.Thread.sleep(100 * std.time.ns_per_us); // 100µs
+        }
+    }
+}
+
+fn startVmnetRxThread() void {
+    if (vmnet_rx_running.load(.seq_cst)) return;
+    vmnet_rx_running.store(true, .seq_cst);
+    vmnet_rx_thread = std.Thread.spawn(.{}, vmnetRxLoop, .{}) catch |e| {
+        vmnet_rx_running.store(false, .seq_cst);
+        log.warn("hvf vmnet rx thread failed: {s}", .{@errorName(e)});
+        return;
+    };
+    log.info("hvf vmnet rx thread started", .{});
+}
+
+fn stopVmnetRxThread() void {
+    if (!vmnet_rx_running.load(.seq_cst)) return;
+    vmnet_rx_running.store(false, .seq_cst);
+    if (vmnet_rx_thread) |thread| {
+        thread.join();
+        vmnet_rx_thread = null;
+    }
+}
+
+fn stopVmnetInterface() void {
+    stopVmnetRxThread();
+    virtio.setNetTxCallback(null);
+    if (active_vmnet_iface) |iface| {
+        vmnet.stop(iface) catch |e| {
+            log.warn("hvf vmnet stop failed: {s}", .{@errorName(e)});
+        };
+        active_vmnet_iface = null;
+        log.info("hvf vmnet stopped", .{});
+    }
 }
 
 fn consoleSocketLoop() void {
@@ -2630,8 +2745,37 @@ pub fn start(cfg: config.VmConfig) !void {
         log.err("hvf virtio-fs setup failed: {s}", .{@errorName(e)});
         return e;
     };
-    if (cfg.network_mode != .locked_down) {
-        log.warn("hvf networking disabled (vmnet removed); network_mode ignored", .{});
+    // Initialize networking if not locked down
+    if (cfg.network_mode != .locked_down and builtin.os.tag == .macos) {
+        // Start vmnet interface in shared mode
+        if (vmnet.startShared()) |vmnet_iface| {
+            active_vmnet_iface = vmnet_iface;
+            log.info(
+                "hvf vmnet started mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} mtu={d}",
+                .{
+                    vmnet_iface.mac[0], vmnet_iface.mac[1], vmnet_iface.mac[2],
+                    vmnet_iface.mac[3], vmnet_iface.mac[4], vmnet_iface.mac[5],
+                    vmnet_iface.mtu,
+                },
+            );
+            virtio.setupVirtioNet(true, vmnet_iface.mac);
+            virtio.setNetTxCallback(vmnetTxCallback);
+            startVmnetRxThread();
+        } else |e| {
+            if (e == vmnet.VmnetError.NotAuthorized or e == vmnet.VmnetError.StartFailed) {
+                // vmnet returns VMNET_FAILURE (not NOT_AUTHORIZED) when missing entitlement
+                log.warn("hvf vmnet failed (run with sudo for networking)", .{});
+            } else {
+                log.warn("hvf vmnet start failed: {s}", .{@errorName(e)});
+            }
+            log.warn("hvf networking disabled for this VM", .{});
+            virtio.setupVirtioNet(false, .{ 0, 0, 0, 0, 0, 0 });
+        }
+    } else if (cfg.network_mode != .locked_down) {
+        log.warn("hvf networking only supported on macOS; network_mode ignored", .{});
+        virtio.setupVirtioNet(false, .{ 0, 0, 0, 0, 0, 0 });
+    } else {
+        virtio.setupVirtioNet(false, .{ 0, 0, 0, 0, 0, 0 });
     }
     const cmdline = if (cfg.kernel_cmdline) |value| value else defaultCmdlineForConfig(cfg);
     var boot_state = if (builtin.cpu.arch == .aarch64)
@@ -2952,6 +3096,7 @@ pub fn stop() !void {
     virtio.resetVirtioBlkState();
     virtio.resetVirtioConsoleState();
     virtio.resetVirtioRngState();
+    stopVmnetInterface();
     virtio.resetVirtioNetState();
     virtio.resetVirtioFsState();
 

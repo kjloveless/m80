@@ -67,7 +67,7 @@ pub fn startShared() VmnetError!VmnetInterface {
 
     c.xpc_dictionary_set_uint64(desc, c.vmnet_operation_mode_key, c.VMNET_SHARED_MODE);
     c.xpc_dictionary_set_bool(desc, c.vmnet_allocate_mac_address_key, true);
-    c.xpc_dictionary_set_bool(desc, c.vmnet_enable_isolation_key, true);
+    c.xpc_dictionary_set_bool(desc, c.vmnet_enable_isolation_key, false);
 
     var iface: c.interface_ref = undefined;
     var params: c.xpc_object_t = null;

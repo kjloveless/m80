@@ -34,6 +34,9 @@ if [[ -f "${kernel_deb}" ]]; then
       "${mod_base}/kernel/drivers/block/virtio_blk.ko"
       "${mod_base}/kernel/drivers/char/virtio_console.ko"
       "${mod_base}/kernel/drivers/char/hw_random/virtio-rng.ko"
+      "${mod_base}/kernel/net/core/failover.ko"
+      "${mod_base}/kernel/drivers/net/net_failover.ko"
+      "${mod_base}/kernel/drivers/net/virtio_net.ko"
       "${mod_base}/kernel/fs/fuse/fuse.ko"
       "${mod_base}/kernel/fs/fuse/virtiofs.ko"
     )
