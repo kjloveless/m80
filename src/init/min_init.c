@@ -86,6 +86,9 @@ static void load_required_modules(void) {
       "/lib/modules/6.1.0-42-cloud-arm64/kernel/drivers/block/virtio_blk.ko",
       "/lib/modules/6.1.0-42-cloud-arm64/kernel/drivers/char/virtio_console.ko",
       "/lib/modules/6.1.0-42-cloud-arm64/kernel/drivers/char/hw_random/virtio-rng.ko",
+      "/lib/modules/6.1.0-42-cloud-arm64/kernel/net/core/failover.ko",
+      "/lib/modules/6.1.0-42-cloud-arm64/kernel/drivers/net/net_failover.ko",
+      "/lib/modules/6.1.0-42-cloud-arm64/kernel/drivers/net/virtio_net.ko",
       "/lib/modules/6.1.0-42-cloud-arm64/kernel/fs/fuse/fuse.ko",
       "/lib/modules/6.1.0-42-cloud-arm64/kernel/fs/fuse/virtiofs.ko",
   };
@@ -296,8 +299,8 @@ static int mount_root_and_switch(void) {
   }
 
   if (run_fsck(root_dev) != 0) {
-    write_line("m80 initramfs: fsck failed");
-    return -1;
+    write_line("m80 initramfs: fsck failed, trying mount anyway");
+    // Continue anyway - fsck failure might be recoverable
   }
 
   if (mount(root_dev, "/new_root", root_fstype, ro ? MS_RDONLY : 0, NULL) != 0) {

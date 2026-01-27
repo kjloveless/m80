@@ -99,7 +99,7 @@ pub const virtio_console_queue_max: u16 = 128;
 pub const virtio_rng_mmio_base: u64 = 0x0a003000;
 pub const virtio_rng_mmio_size: u64 = 0x1000;
 pub const virtio_rng_queue_max: u16 = 128;
-pub const virtio_net_mmio_base: u64 = 0x0a004000;
+pub const virtio_net_mmio_base: u64 = 0x0a006000;
 pub const virtio_net_mmio_size: u64 = 0x1000;
 pub const virtio_net_queue_max: u16 = 256;
 pub const virtio_fs_mmio_base: u64 = 0x0a005000;
@@ -234,6 +234,14 @@ pub var virtio_net_seen = std.atomic.Value(bool).init(false);
 pub var gic_virtio_net_intid: ?u32 = null;
 pub var virtio_net_irq_level = false;
 
+/// Callback for transmitting a network frame to the host.
+/// Called when guest sends a packet via virtio-net TX queue.
+pub const NetTxCallback = *const fn (frame: []const u8) void;
+pub var net_tx_callback: ?NetTxCallback = null;
+
+pub fn setNetTxCallback(cb: ?NetTxCallback) void {
+    net_tx_callback = cb;
+}
 
 pub var net_policy_state: ?net_policy.NetworkPolicy = null;
 pub var net_policy_mutex = std.Thread.Mutex{};
@@ -1109,12 +1117,21 @@ pub fn processVirtioConsoleQueue(queue_index: u16) !void {
     updateVirtioConsoleInterrupt();
 }
 
-pub const virtio_net_hdr_len: usize = 10;
+// Linux virtio-net driver uses 12-byte header (virtio_net_hdr_mrg_rxbuf)
+// even when VIRTIO_NET_F_MRG_RXBUF is not negotiated
+pub const virtio_net_hdr_len: usize = 12;
 
 pub fn virtioNetRxPacket(frame: []const u8) !void {
-    if (!virtio_net_state.enabled) return;
+    if (!virtio_net_state.enabled) {
+        log.debug("hvf virtio-net rx: not enabled", .{});
+        return;
+    }
     const queue = &virtio_net_state.queues[0];
-    if (!queue.ready or queue.num == 0) return;
+    if (!queue.ready or queue.num == 0) {
+        log.debug("hvf virtio-net rx: queue not ready ready={} num={d}", .{ queue.ready, queue.num });
+        return;
+    }
+    log.debug("hvf virtio-net rx: frame len={d}", .{frame.len});
 
     const avail_idx = try readGuestU16(queue.avail_addr + 2);
     if (queue.last_avail_idx == avail_idx) return;
@@ -1175,9 +1192,16 @@ pub fn virtioNetRxPacket(frame: []const u8) !void {
 }
 
 pub fn processVirtioNetTxQueue() !void {
-    if (!virtio_net_state.enabled) return;
+    if (!virtio_net_state.enabled) {
+        log.debug("hvf virtio-net tx queue: not enabled", .{});
+        return;
+    }
     const queue = &virtio_net_state.queues[1];
-    if (!queue.ready or queue.num == 0) return;
+    if (!queue.ready or queue.num == 0) {
+        log.debug("hvf virtio-net tx queue: not ready ready={} num={d}", .{ queue.ready, queue.num });
+        return;
+    }
+    log.debug("hvf virtio-net tx queue: processing", .{});
 
     const avail_idx = try readGuestU16(queue.avail_addr + 2);
     while (queue.last_avail_idx != avail_idx) {
@@ -1227,8 +1251,15 @@ pub fn processVirtioNetTxQueue() !void {
             desc_index = desc.next;
         }
 
-        if (frame_len > 0 and outboundFrameAllowed(frame_buf[0..frame_len])) {
-            // vmnet disabled; drop outbound frames for now.
+        if (frame_len > 0) {
+            const allowed = outboundFrameAllowed(frame_buf[0..frame_len]);
+            log.debug("hvf virtio-net tx: frame len={d} allowed={}", .{ frame_len, allowed });
+            if (allowed) {
+                // Send frame to host via vmnet callback
+                if (net_tx_callback) |cb| {
+                    cb(frame_buf[0..frame_len]);
+                }
+            }
         }
 
         const used_slot = queue.used_idx % queue.num;
@@ -1633,6 +1664,12 @@ pub fn handleVirtioNetMmio(offset: u64, is_write: bool, size: usize, value: u64)
     if (!virtio_net_seen.swap(true, .seq_cst)) {
         log.info("hvf virtio-net mmio first access offset=0x{x} write={s}", .{ offset, if (is_write) "yes" else "no" });
     }
+    // Debug: log all MMIO accesses
+    if (is_write) {
+        log.debug("hvf virtio-net mmio write offset=0x{x} value=0x{x} size={d}", .{ offset, value, size });
+    } else {
+        log.debug("hvf virtio-net mmio read offset=0x{x} size={d}", .{ offset, size });
+    }
     const width: usize = @min(size, 4);
     if (is_write) {
         const v32: u32 = @intCast(value & 0xFFFF_FFFF);
@@ -1710,7 +1747,7 @@ pub fn handleVirtioNetMmio(offset: u64, is_write: bool, size: usize, value: u64)
         return 0;
     }
 
-    return switch (offset) {
+    const result = switch (offset) {
         virtio_mmio_reg_magic => virtio_mmio_magic,
         virtio_mmio_reg_version => virtio_mmio_version,
         virtio_mmio_reg_device_id => virtio_mmio_device_id_net,
@@ -1782,6 +1819,10 @@ pub fn handleVirtioNetMmio(offset: u64, is_write: bool, size: usize, value: u64)
             break :blk 0;
         },
     };
+    if (!is_write) {
+        log.debug("hvf virtio-net mmio read result offset=0x{x} value=0x{x}", .{ offset, result });
+    }
+    return result;
 }
 
 pub fn handleVirtioFsMmio(offset: u64, is_write: bool, size: usize, value: u64) u64 {
