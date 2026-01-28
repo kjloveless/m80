@@ -1703,6 +1703,7 @@ fn vmnetRxLoop() void {
 
         if (pktcnt > 0 and pkt.vm_pkt_size > 0) {
             const frame = pkt_buf[0..pkt.vm_pkt_size];
+            virtio.maybeCacheDnsResponse(frame);
             virtio.virtioNetRxPacket(frame) catch |e| {
                 log.debug("hvf vmnet rx deliver failed: {s}", .{@errorName(e)});
             };
@@ -2816,6 +2817,10 @@ pub fn start(cfg: config.VmConfig) !void {
             );
             virtio.setupVirtioNet(true, vmnet_iface.mac);
             virtio.setNetTxCallback(vmnetTxCallback);
+            virtio.initNetworkPolicy(cfg) catch |e| {
+                log.err("hvf network policy init failed: {s}", .{@errorName(e)});
+                return e;
+            };
             startVmnetRxThread();
         } else |e| {
             if (e == vmnet.VmnetError.NotAuthorized or e == vmnet.VmnetError.StartFailed) {

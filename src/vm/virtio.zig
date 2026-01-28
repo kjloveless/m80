@@ -671,6 +671,101 @@ pub fn outboundFrameAllowed(frame: []const u8) bool {
     return policy.isIpAllowed(dst_ip);
 }
 
+/// Check if frame is a blocked DNS query and send REFUSED response if so.
+/// Returns true if a REFUSED response was sent (caller should drop original packet).
+pub fn maybeSendDnsRefused(frame: []const u8) bool {
+    net_policy_mutex.lock();
+    defer net_policy_mutex.unlock();
+    if (net_policy_state == null) return false;
+    const policy = &net_policy_state.?;
+    if (policy.mode == .open) return false;
+
+    // Parse frame to check if it's a blocked DNS query
+    if (frame.len < 14) return false;
+    const ethertype = std.mem.readInt(u16, frame[12..14], .big);
+    if (ethertype != ether_type_ipv4) return false;
+
+    const ip_offset: usize = 14;
+    if (frame.len < ip_offset + 20) return false;
+    const ihl = (frame[ip_offset] & 0x0F) * 4;
+    if (frame.len < ip_offset + ihl + 8) return false;
+    const protocol = frame[ip_offset + 9];
+    if (protocol != ip_proto_udp) return false;
+
+    const udp_offset = ip_offset + ihl;
+    const dst_port = std.mem.readInt(u16, frame[udp_offset + 2 ..][0..2], .big);
+    if (dst_port != 53) return false;
+
+    const payload_offset = udp_offset + 8;
+    if (payload_offset >= frame.len) return false;
+    const payload = frame[payload_offset..];
+
+    // Check if domain is blocked
+    var name_buf: [256]u8 = undefined;
+    const domain = dns.parseQueryDomain(payload, &name_buf) catch return false;
+    if (policy.isDomainAllowed(domain)) return false;
+
+    // Domain is blocked - send REFUSED response
+    log.info("virtio-net dns blocked: {s}", .{domain});
+    sendDnsRefusedResponse(frame, ip_offset, ihl, udp_offset, payload_offset);
+    return true;
+}
+
+fn sendDnsRefusedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offset: usize, payload_offset: usize) void {
+    // Build response packet by copying and modifying the query
+    var response: [1500]u8 = undefined;
+    const frame_len = @min(frame.len, response.len);
+    @memcpy(response[0..frame_len], frame[0..frame_len]);
+
+    // Swap Ethernet MAC addresses (dst <-> src)
+    const tmp_mac: [6]u8 = response[0..6].*;
+    @memcpy(response[0..6], response[6..12]);
+    @memcpy(response[6..12], &tmp_mac);
+
+    // Swap IP addresses (src <-> dst)
+    const tmp_ip: [4]u8 = response[ip_offset + 12 ..][0..4].*;
+    @memcpy(response[ip_offset + 12 ..][0..4], response[ip_offset + 16 ..][0..4]);
+    @memcpy(response[ip_offset + 16 ..][0..4], &tmp_ip);
+
+    // Recalculate IP header checksum
+    response[ip_offset + 10] = 0;
+    response[ip_offset + 11] = 0;
+    var ip_sum: u32 = 0;
+    var i: usize = 0;
+    while (i < ihl) : (i += 2) {
+        ip_sum += std.mem.readInt(u16, response[ip_offset + i ..][0..2], .big);
+    }
+    while (ip_sum > 0xFFFF) {
+        ip_sum = (ip_sum & 0xFFFF) + (ip_sum >> 16);
+    }
+    std.mem.writeInt(u16, response[ip_offset + 10 ..][0..2], @intCast(~@as(u16, @truncate(ip_sum))), .big);
+
+    // Swap UDP ports (src <-> dst)
+    const tmp_port: [2]u8 = response[udp_offset..][0..2].*;
+    @memcpy(response[udp_offset..][0..2], response[udp_offset + 2 ..][0..2]);
+    @memcpy(response[udp_offset + 2 ..][0..2], &tmp_port);
+
+    // Zero UDP checksum (optional for IPv4)
+    response[udp_offset + 6] = 0;
+    response[udp_offset + 7] = 0;
+
+    // Modify DNS header: set QR=1 (response) and RCODE=5 (REFUSED)
+    // DNS flags are at payload_offset + 2..4
+    // Original flags format: QR(1) OPCODE(4) AA(1) TC(1) RD(1) | RA(1) Z(3) RCODE(4)
+    // We want: QR=1, keep OPCODE, clear AA/TC, keep RD, set RA=1, RCODE=5
+    const orig_flags = std.mem.readInt(u16, response[payload_offset + 2 ..][0..2], .big);
+    const opcode = (orig_flags >> 11) & 0xF;
+    const rd = (orig_flags >> 8) & 1;
+    // QR=1, OPCODE kept, AA=0, TC=0, RD kept, RA=1, Z=0, RCODE=5
+    const new_flags: u16 = (1 << 15) | (opcode << 11) | (rd << 8) | (1 << 7) | 5;
+    std.mem.writeInt(u16, response[payload_offset + 2 ..][0..2], new_flags, .big);
+
+    // Send response back to guest
+    virtioNetRxPacket(response[0..frame_len]) catch |e| {
+        log.warn("virtio-net dns refused response failed: {s}", .{@errorName(e)});
+    };
+}
+
 pub fn virtioConsoleInputLen() usize {
     virtio_console_input.mutex.lock();
     defer virtio_console_input.mutex.unlock();
@@ -1259,6 +1354,9 @@ pub fn processVirtioNetTxQueue() !void {
                 if (net_tx_callback) |cb| {
                     cb(frame_buf[0..frame_len]);
                 }
+            } else {
+                // If blocked DNS query, send REFUSED response back to guest
+                _ = maybeSendDnsRefused(frame_buf[0..frame_len]);
             }
         }
 
