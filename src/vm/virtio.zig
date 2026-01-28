@@ -281,7 +281,7 @@ fn drainPendingRefused() void {
 
         pending_refused_queue.head = (pending_refused_queue.head + 1) % PendingRefusedQueue.max_pending;
         pending_refused_queue.count -= 1;
-        log.info("virtio-net dns refused sent (queued)", .{});
+        log.info("virtio-net dns nxdomain sent (queued)", .{});
     }
 }
 
@@ -816,12 +816,13 @@ fn sendDnsRefusedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offs
     // Modify DNS header: set QR=1 (response) and RCODE=5 (REFUSED)
     // DNS flags are at payload_offset + 2..4
     // Original flags format: QR(1) OPCODE(4) AA(1) TC(1) RD(1) | RA(1) Z(3) RCODE(4)
-    // We want: QR=1, keep OPCODE, clear AA/TC, keep RD, set RA=1, RCODE=5
+    // We want: QR=1, keep OPCODE, set AA=1, clear TC, keep RD, set RA=1, RCODE=3 (NXDOMAIN)
+    // Using NXDOMAIN instead of REFUSED so clients don't retry thinking another server might work
     const orig_flags = std.mem.readInt(u16, response[payload_offset + 2 ..][0..2], .big);
     const opcode = (orig_flags >> 11) & 0xF;
     const rd = (orig_flags >> 8) & 1;
-    // QR=1, OPCODE kept, AA=0, TC=0, RD kept, RA=1, Z=0, RCODE=5
-    const new_flags: u16 = (1 << 15) | (opcode << 11) | (rd << 8) | (1 << 7) | 5;
+    // QR=1, OPCODE kept, AA=1, TC=0, RD kept, RA=1, Z=0, RCODE=3 (NXDOMAIN)
+    const new_flags: u16 = (1 << 15) | (opcode << 11) | (1 << 10) | (rd << 8) | (1 << 7) | 3;
     std.mem.writeInt(u16, response[payload_offset + 2 ..][0..2], new_flags, .big);
 
     // Send response back to guest
@@ -831,16 +832,16 @@ fn sendDnsRefusedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offs
             pending_refused_mutex.lock();
             defer pending_refused_mutex.unlock();
             if (queuePendingRefused(response[0..frame_len])) {
-                log.info("virtio-net dns refused queued (no buffers)", .{});
+                log.info("virtio-net dns nxdomain queued (no buffers)", .{});
             } else {
-                log.warn("virtio-net dns refused dropped (queue full)", .{});
+                log.warn("virtio-net dns nxdomain dropped (queue full)", .{});
             }
             return;
         }
-        log.warn("virtio-net dns refused send failed: {s}", .{@errorName(e)});
+        log.warn("virtio-net dns nxdomain send failed: {s}", .{@errorName(e)});
         return;
     };
-    log.info("virtio-net dns refused sent", .{});
+    log.info("virtio-net dns nxdomain sent", .{});
 }
 
 pub fn virtioConsoleInputLen() usize {
