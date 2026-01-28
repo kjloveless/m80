@@ -93,6 +93,62 @@ fn defaultCmdlineForConfig(cfg: config.VmConfig) []const u8 {
     return "console=ttyS0 quiet loglevel=3 systemd.show_status=false systemd.log_level=warning";
 }
 
+/// Builds a mount specification string for the kernel command line.
+/// Format: "m80.mounts=tag1:/path1,tag2:/path2"
+/// Returns null if no mounts are configured.
+fn buildMountSpecString(allocator: std.mem.Allocator, cfg: config.VmConfig) !?[]const u8 {
+    if (cfg.mounts.len == 0) return null;
+
+    var total_len: usize = "m80.mounts=".len;
+    for (cfg.mounts, 0..) |mount, i| {
+        if (i > 0) total_len += 1; // comma
+        total_len += mount.tag.len + 1 + mount.guest_path.len; // tag:guest_path
+    }
+
+    var result = try allocator.alloc(u8, total_len);
+    var pos: usize = 0;
+
+    @memcpy(result[pos..][0.."m80.mounts=".len], "m80.mounts=");
+    pos += "m80.mounts=".len;
+
+    for (cfg.mounts, 0..) |mount, i| {
+        if (i > 0) {
+            result[pos] = ',';
+            pos += 1;
+        }
+        @memcpy(result[pos..][0..mount.tag.len], mount.tag);
+        pos += mount.tag.len;
+        result[pos] = ':';
+        pos += 1;
+        @memcpy(result[pos..][0..mount.guest_path.len], mount.guest_path);
+        pos += mount.guest_path.len;
+    }
+
+    return result;
+}
+
+/// Builds the complete kernel command line with mount specifications appended.
+/// If the config has a custom kernel_cmdline, uses that; otherwise uses default.
+/// Appends mount specifications if any mounts are configured.
+fn buildCmdlineWithMounts(allocator: std.mem.Allocator, cfg: config.VmConfig) ![]const u8 {
+    const base_cmdline = if (cfg.kernel_cmdline) |value| value else defaultCmdlineForConfig(cfg);
+    const mount_spec = try buildMountSpecString(allocator, cfg);
+
+    if (mount_spec == null) {
+        // No mounts, return the base cmdline (caller should not free if it came from config)
+        return try allocator.dupe(u8, base_cmdline);
+    }
+
+    // Combine base cmdline with mount spec
+    const result = try allocator.alloc(u8, base_cmdline.len + 1 + mount_spec.?.len);
+    @memcpy(result[0..base_cmdline.len], base_cmdline);
+    result[base_cmdline.len] = ' ';
+    @memcpy(result[base_cmdline.len + 1 ..][0..mount_spec.?.len], mount_spec.?);
+    allocator.free(mount_spec.?);
+
+    return result;
+}
+
 const arm64_page_table_alignment: u64 = 0x1000;
 const arm64_page_table_bytes: u64 = 0x2000;
 const arm64_mair_el1: u64 = 0x000004ff;
@@ -2777,7 +2833,14 @@ pub fn start(cfg: config.VmConfig) !void {
     } else {
         virtio.setupVirtioNet(false, .{ 0, 0, 0, 0, 0, 0 });
     }
-    const cmdline = if (cfg.kernel_cmdline) |value| value else defaultCmdlineForConfig(cfg);
+    const cmdline = buildCmdlineWithMounts(std.heap.page_allocator, cfg) catch |e| {
+        log.err("hvf buildCmdlineWithMounts failed: {s}", .{@errorName(e)});
+        return e;
+    };
+    defer std.heap.page_allocator.free(cmdline);
+    if (cfg.mounts.len > 0) {
+        log.info("hvf cmdline with mounts: {s}", .{cmdline});
+    }
     var boot_state = if (builtin.cpu.arch == .aarch64)
         boot.computeBootStateWithBase(
             guestMemoryBase(),

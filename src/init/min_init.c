@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -163,17 +164,17 @@ static int find_param_value(const char *cmdline, const char *key, char *out, siz
   size_t key_len = strlen(key);
   const char *p = cmdline;
   while (*p) {
-    while (*p == ' ') p++;
+    while (*p == ' ' || *p == '\n' || *p == '\r') p++;
     if (strncmp(p, key, key_len) == 0 && p[key_len] == '=') {
       p += key_len + 1;
       size_t i = 0;
-      while (*p && *p != ' ' && i + 1 < out_max) {
+      while (*p && *p != ' ' && *p != '\n' && *p != '\r' && i + 1 < out_max) {
         out[i++] = *p++;
       }
       out[i] = '\0';
       return 0;
     }
-    while (*p && *p != ' ') p++;
+    while (*p && *p != ' ' && *p != '\n') p++;
   }
   return -1;
 }
@@ -254,50 +255,339 @@ static void write_file(const char *path, const char *content) {
   close(fd);
 }
 
-static int mount_virtiofs_shares(void) {
-  // Check if any virtiofs devices exist by looking at sysfs
-  // The kernel creates /sys/bus/virtio/drivers/virtiofs/virtioN for each device
+// Create parent directories recursively (simple version)
+static void mkdir_p(const char *path) {
+  char tmp[512];
+  char *p = NULL;
+  size_t len;
+
+  snprintf(tmp, sizeof(tmp), "%s", path);
+  len = strlen(tmp);
+  if (len > 0 && tmp[len - 1] == '/') {
+    tmp[len - 1] = '\0';
+  }
+  for (p = tmp + 1; *p; p++) {
+    if (*p == '/') {
+      *p = '\0';
+      mkdir(tmp, 0755);
+      *p = '/';
+    }
+  }
+  mkdir(tmp, 0755);
+}
+
+// Mount virtiofs shares from kernel cmdline parameter m80.mounts=tag1:/path1,tag2:/path2
+static int mount_virtiofs_from_cmdline(const char *cmdline) {
+  char mounts_param[1024];
+  if (find_param_value(cmdline, "m80.mounts", mounts_param, sizeof(mounts_param)) != 0) {
+    return 0; // No mounts specified
+  }
+
+  int mounted_count = 0;
+  char *saveptr1 = NULL;
+  char mounts_copy[1024];
+  strncpy(mounts_copy, mounts_param, sizeof(mounts_copy) - 1);
+  mounts_copy[sizeof(mounts_copy) - 1] = '\0';
+
+  char *entry = strtok_r(mounts_copy, ",", &saveptr1);
+  while (entry != NULL) {
+    // Parse tag:path
+    char *colon = strchr(entry, ':');
+    if (colon == NULL) {
+      char msg[256];
+      snprintf(msg, sizeof(msg), "m80 initramfs: invalid mount entry: %s", entry);
+      write_line(msg);
+      entry = strtok_r(NULL, ",", &saveptr1);
+      continue;
+    }
+
+    *colon = '\0';
+    const char *tag = entry;
+    const char *guest_path = colon + 1;
+
+    // Build the full path under /new_root
+    char full_path[512];
+    snprintf(full_path, sizeof(full_path), "/new_root%s", guest_path);
+
+    // Create mount point
+    mkdir_p(full_path);
+
+    // Attempt mount
+    if (mount(tag, full_path, "virtiofs", 0, NULL) == 0) {
+      char msg[256];
+      snprintf(msg, sizeof(msg), "m80 initramfs: mounted virtiofs %s -> %s", tag, guest_path);
+      write_line(msg);
+      mounted_count++;
+    } else {
+      char msg[256];
+      snprintf(msg, sizeof(msg), "m80 initramfs: failed to mount virtiofs %s -> %s (errno=%d)",
+               tag, guest_path, errno);
+      write_line(msg);
+    }
+
+    entry = strtok_r(NULL, ",", &saveptr1);
+  }
+
+  return mounted_count;
+}
+
+// Mount virtiofs devices discovered via sysfs (kernel 6.9+ with /sys/fs/virtiofs)
+// This provides automatic discovery when the cmdline doesn't specify mounts
+static int mount_virtiofs_from_sysfs(void) {
+  const char *sysfs_dir = "/sys/fs/virtiofs";
+
+  // Check if sysfs virtiofs directory exists (kernel 6.9+)
+  if (access(sysfs_dir, F_OK) != 0) {
+    return 0; // Sysfs virtiofs not available (older kernel)
+  }
+
+  DIR *dir = opendir(sysfs_dir);
+  if (dir == NULL) {
+    return 0;
+  }
+
+  int mounted_count = 0;
+  struct dirent *entry;
+
+  while ((entry = readdir(dir)) != NULL) {
+    // Skip . and ..
+    if (entry->d_name[0] == '.') {
+      continue;
+    }
+
+    // Read the tag from /sys/fs/virtiofs/<N>/tag
+    char tag_path[512];
+    snprintf(tag_path, sizeof(tag_path), "%s/%s/tag", sysfs_dir, entry->d_name);
+
+    int fd = open(tag_path, O_RDONLY);
+    if (fd < 0) {
+      continue;
+    }
+
+    char tag[128];
+    ssize_t n = read(fd, tag, sizeof(tag) - 1);
+    close(fd);
+
+    if (n <= 0) {
+      continue;
+    }
+    tag[n] = '\0';
+
+    // Trim newline
+    char *newline = strchr(tag, '\n');
+    if (newline) {
+      *newline = '\0';
+    }
+
+    // Mount to /mnt/<tag>
+    char guest_path[256];
+    snprintf(guest_path, sizeof(guest_path), "/mnt/%s", tag);
+
+    char full_path[512];
+    snprintf(full_path, sizeof(full_path), "/new_root%s", guest_path);
+
+    mkdir_p(full_path);
+
+    if (mount(tag, full_path, "virtiofs", 0, NULL) == 0) {
+      char msg[256];
+      snprintf(msg, sizeof(msg), "m80 initramfs: mounted virtiofs %s -> %s (sysfs)", tag, guest_path);
+      write_line(msg);
+      mounted_count++;
+    }
+  }
+
+  closedir(dir);
+  return mounted_count;
+}
+
+// Check if a guest_path is in the cmdline mount config
+static int is_mount_in_config(const char *cmdline, const char *guest_path) {
+  char mounts_param[1024];
+  if (find_param_value(cmdline, "m80.mounts", mounts_param, sizeof(mounts_param)) != 0) {
+    return 0;
+  }
+
+  char mounts_copy[1024];
+  strncpy(mounts_copy, mounts_param, sizeof(mounts_copy) - 1);
+  mounts_copy[sizeof(mounts_copy) - 1] = '\0';
+
+  char *saveptr = NULL;
+  char *entry = strtok_r(mounts_copy, ",", &saveptr);
+  while (entry != NULL) {
+    char *colon = strchr(entry, ':');
+    if (colon != NULL) {
+      const char *path = colon + 1;
+      if (strcmp(path, guest_path) == 0) {
+        return 1;
+      }
+    }
+    entry = strtok_r(NULL, ",", &saveptr);
+  }
+  return 0;
+}
+
+// Unmount virtiofs shares that are no longer in the config
+static void unmount_stale_virtiofs(const char *cmdline) {
+  FILE *fp = fopen("/proc/mounts", "r");
+  if (fp == NULL) {
+    return;
+  }
+
+  char line[1024];
+  char stale_mounts[16][256];
+  int stale_count = 0;
+
+  while (fgets(line, sizeof(line), fp) != NULL && stale_count < 16) {
+    char device[256], mountpoint[256], fstype[64];
+    if (sscanf(line, "%255s %255s %63s", device, mountpoint, fstype) != 3) {
+      continue;
+    }
+
+    if (strcmp(fstype, "virtiofs") != 0) {
+      continue;
+    }
+
+    // Check if this mount is in the current config
+    if (!is_mount_in_config(cmdline, mountpoint)) {
+      strncpy(stale_mounts[stale_count], mountpoint, 255);
+      stale_mounts[stale_count][255] = '\0';
+      stale_count++;
+    }
+  }
+  fclose(fp);
+
+  // Unmount stale mounts
+  for (int i = 0; i < stale_count; i++) {
+    if (umount(stale_mounts[i]) == 0) {
+      char msg[256];
+      snprintf(msg, sizeof(msg), "m80 initramfs: unmounted stale virtiofs %s", stale_mounts[i]);
+      write_line(msg);
+      // Try to remove empty directory
+      rmdir(stale_mounts[i]);
+    }
+  }
+}
+
+static int mount_virtiofs_shares(const char *cmdline) {
+  // Check if virtiofs driver is loaded
   if (access("/sys/bus/virtio/drivers/virtiofs", F_OK) != 0) {
     return 0; // No virtiofs driver loaded, nothing to mount
   }
 
-  // Try to mount the 'host' tag to /mnt/host
-  // This is the default m80 convention
+  // Unmount any virtiofs shares no longer in config
+  unmount_stale_virtiofs(cmdline);
+
+  // First, try to mount from kernel cmdline specifications
+  int count = mount_virtiofs_from_cmdline(cmdline);
+
+  // If cmdline mounts worked, we're done
+  if (count > 0) {
+    return count;
+  }
+
+  // Second, try sysfs enumeration (kernel 6.9+)
+  count = mount_virtiofs_from_sysfs();
+  if (count > 0) {
+    return count;
+  }
+
+  // Fallback: if no mounts found, try default "host" tag
   mkdir("/new_root/mnt", 0755);
   mkdir("/new_root/mnt/host", 0755);
 
   if (mount("host", "/new_root/mnt/host", "virtiofs", 0, NULL) == 0) {
-    write_line("m80 initramfs: mounted virtiofs host -> /mnt/host");
+    write_line("m80 initramfs: mounted virtiofs host -> /mnt/host (default)");
     return 1;
   }
 
-  // Mount failed - might not be configured, that's ok
   return 0;
 }
 
-static void install_systemd_mount_unit(void) {
+// Convert a path to systemd mount unit filename (e.g., /mnt/host -> mnt-host.mount)
+static void path_to_unit_name(const char *path, char *out, size_t out_size) {
+  // Skip leading slash
+  const char *p = path;
+  if (*p == '/') p++;
+
+  size_t pos = 0;
+  while (*p && pos + 1 < out_size - 6) { // Reserve space for ".mount"
+    if (*p == '/') {
+      out[pos++] = '-';
+    } else {
+      out[pos++] = *p;
+    }
+    p++;
+  }
+  // Remove trailing dash if any
+  if (pos > 0 && out[pos - 1] == '-') {
+    pos--;
+  }
+  snprintf(out + pos, out_size - pos, ".mount");
+}
+
+static void install_systemd_mount_unit_for(const char *tag, const char *guest_path) {
+  char unit_name[256];
+  path_to_unit_name(guest_path, unit_name, sizeof(unit_name));
+
+  char unit_path[512];
+  snprintf(unit_path, sizeof(unit_path), "/new_root/etc/systemd/system/%s", unit_name);
+
+  char unit_content[1024];
+  snprintf(unit_content, sizeof(unit_content),
+      "[Unit]\n"
+      "Description=m80 virtiofs share (%s)\n"
+      "After=local-fs-pre.target\n"
+      "Before=local-fs.target\n"
+      "\n"
+      "[Mount]\n"
+      "What=%s\n"
+      "Where=%s\n"
+      "Type=virtiofs\n"
+      "Options=nofail,x-systemd.device-timeout=5\n"
+      "\n"
+      "[Install]\n"
+      "WantedBy=local-fs.target\n",
+      tag, tag, guest_path);
+
+  write_file(unit_path, unit_content);
+
+  char symlink_path[512];
+  snprintf(symlink_path, sizeof(symlink_path),
+      "/new_root/etc/systemd/system/local-fs.target.wants/%s", unit_name);
+  char symlink_target[256];
+  snprintf(symlink_target, sizeof(symlink_target), "../%s", unit_name);
+  symlink(symlink_target, symlink_path);
+}
+
+static void install_systemd_mount_unit(const char *cmdline) {
   mkdir("/new_root/etc", 0755);
   mkdir("/new_root/etc/systemd", 0755);
   mkdir("/new_root/etc/systemd/system", 0755);
   mkdir("/new_root/etc/systemd/system/local-fs.target.wants", 0755);
 
-  write_file(
-      "/new_root/etc/systemd/system/mnt-host.mount",
-      "[Unit]\n"
-      "Description=m80 host share\n"
-      "After=local-fs-pre.target\n"
-      "Before=local-fs.target\n"
-      "\n"
-      "[Mount]\n"
-      "What=host\n"
-      "Where=/mnt/host\n"
-      "Type=virtiofs\n"
-      "Options=defaults\n"
-      "\n"
-      "[Install]\n"
-      "WantedBy=local-fs.target\n");
+  char mounts_param[1024];
+  if (find_param_value(cmdline, "m80.mounts", mounts_param, sizeof(mounts_param)) == 0) {
+    // Install units for each configured mount
+    char mounts_copy[1024];
+    strncpy(mounts_copy, mounts_param, sizeof(mounts_copy) - 1);
+    mounts_copy[sizeof(mounts_copy) - 1] = '\0';
 
-  symlink("../mnt-host.mount", "/new_root/etc/systemd/system/local-fs.target.wants/mnt-host.mount");
+    char *saveptr = NULL;
+    char *entry = strtok_r(mounts_copy, ",", &saveptr);
+    while (entry != NULL) {
+      char *colon = strchr(entry, ':');
+      if (colon != NULL) {
+        *colon = '\0';
+        const char *tag = entry;
+        const char *guest_path = colon + 1;
+        install_systemd_mount_unit_for(tag, guest_path);
+      }
+      entry = strtok_r(NULL, ",", &saveptr);
+    }
+  } else {
+    // Fallback: install default host mount unit
+    install_systemd_mount_unit_for("host", "/mnt/host");
+  }
 }
 
 static int mount_root_and_switch(void) {
@@ -334,10 +624,10 @@ static int mount_root_and_switch(void) {
   mkdir("/new_root/dev", 0755);
 
   // Mount virtiofs shares early (before systemd) for reliability
-  mount_virtiofs_shares();
+  mount_virtiofs_shares(cmdline);
 
   // Also install systemd unit as fallback for remounting after reboot
-  install_systemd_mount_unit();
+  install_systemd_mount_unit(cmdline);
 
   mount("/proc", "/new_root/proc", NULL, MS_MOVE, NULL);
   mount("/sys", "/new_root/sys", NULL, MS_MOVE, NULL);
