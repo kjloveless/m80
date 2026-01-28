@@ -254,6 +254,27 @@ static void write_file(const char *path, const char *content) {
   close(fd);
 }
 
+static int mount_virtiofs_shares(void) {
+  // Check if any virtiofs devices exist by looking at sysfs
+  // The kernel creates /sys/bus/virtio/drivers/virtiofs/virtioN for each device
+  if (access("/sys/bus/virtio/drivers/virtiofs", F_OK) != 0) {
+    return 0; // No virtiofs driver loaded, nothing to mount
+  }
+
+  // Try to mount the 'host' tag to /mnt/host
+  // This is the default m80 convention
+  mkdir("/new_root/mnt", 0755);
+  mkdir("/new_root/mnt/host", 0755);
+
+  if (mount("host", "/new_root/mnt/host", "virtiofs", 0, NULL) == 0) {
+    write_line("m80 initramfs: mounted virtiofs host -> /mnt/host");
+    return 1;
+  }
+
+  // Mount failed - might not be configured, that's ok
+  return 0;
+}
+
 static void install_systemd_mount_unit(void) {
   mkdir("/new_root/etc", 0755);
   mkdir("/new_root/etc/systemd", 0755);
@@ -311,9 +332,11 @@ static int mount_root_and_switch(void) {
   mkdir("/new_root/proc", 0555);
   mkdir("/new_root/sys", 0555);
   mkdir("/new_root/dev", 0755);
-  mkdir("/new_root/mnt", 0755);
-  mkdir("/new_root/mnt/host", 0755);
 
+  // Mount virtiofs shares early (before systemd) for reliability
+  mount_virtiofs_shares();
+
+  // Also install systemd unit as fallback for remounting after reboot
   install_systemd_mount_unit();
 
   mount("/proc", "/new_root/proc", NULL, MS_MOVE, NULL);
