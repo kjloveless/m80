@@ -235,6 +235,56 @@ pub var gic_virtio_net_intid: ?u32 = null;
 pub var virtio_net_irq_level = false;
 var virtio_net_rx_mutex = std.Thread.Mutex{};
 
+/// Pending DNS REFUSED responses waiting for RX buffers
+const PendingRefusedQueue = struct {
+    const max_pending = 16;
+    const max_frame_len = 1500;
+    frames: [max_pending][max_frame_len]u8 = undefined,
+    lengths: [max_pending]usize = .{0} ** max_pending,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+};
+var pending_refused_queue = PendingRefusedQueue{};
+var pending_refused_mutex = std.Thread.Mutex{};
+
+fn queuePendingRefused(frame: []const u8) bool {
+    if (pending_refused_queue.count >= PendingRefusedQueue.max_pending) return false;
+    if (frame.len > PendingRefusedQueue.max_frame_len) return false;
+
+    const idx = pending_refused_queue.tail;
+    @memcpy(pending_refused_queue.frames[idx][0..frame.len], frame);
+    pending_refused_queue.lengths[idx] = frame.len;
+    pending_refused_queue.tail = (pending_refused_queue.tail + 1) % PendingRefusedQueue.max_pending;
+    pending_refused_queue.count += 1;
+    return true;
+}
+
+fn drainPendingRefused() void {
+    pending_refused_mutex.lock();
+    defer pending_refused_mutex.unlock();
+
+    while (pending_refused_queue.count > 0) {
+        const idx = pending_refused_queue.head;
+        const len = pending_refused_queue.lengths[idx];
+        const frame = pending_refused_queue.frames[idx][0..len];
+
+        virtioNetRxPacket(frame) catch |e| {
+            // Still no buffers, leave remaining in queue
+            if (e == error.NoBuffersAvailable) return;
+            log.warn("virtio-net pending refused send failed: {s}", .{@errorName(e)});
+            // Remove failed frame and continue
+            pending_refused_queue.head = (pending_refused_queue.head + 1) % PendingRefusedQueue.max_pending;
+            pending_refused_queue.count -= 1;
+            continue;
+        };
+
+        pending_refused_queue.head = (pending_refused_queue.head + 1) % PendingRefusedQueue.max_pending;
+        pending_refused_queue.count -= 1;
+        log.info("virtio-net dns refused sent (queued)", .{});
+    }
+}
+
 /// Callback for transmitting a network frame to the host.
 /// Called when guest sends a packet via virtio-net TX queue.
 pub const NetTxCallback = *const fn (frame: []const u8) void;
@@ -578,9 +628,21 @@ pub fn initNetworkPolicy(cfg: config.VmConfig) !void {
     policy.mode = cfg.network_mode;
     errdefer policy.deinit();
 
-    for (cfg.allowed_domains) |domain| {
-        if (domain.len == 0) continue;
-        try policy.addDomainRule(domain);
+    for (cfg.allowed_domains) |domain_spec| {
+        if (domain_spec.len == 0) continue;
+        // Parse "domain:port" format - strip port suffix for domain matching
+        if (std.mem.lastIndexOfScalar(u8, domain_spec, ':')) |colon_idx| {
+            const domain = domain_spec[0..colon_idx];
+            const port_str = domain_spec[colon_idx + 1 ..];
+            if (std.fmt.parseInt(u16, port_str, 10)) |port| {
+                try policy.addDomainRuleWithPorts(domain, port, port);
+            } else |_| {
+                // Not a valid port number, treat whole string as domain
+                try policy.addDomainRule(domain_spec);
+            }
+        } else {
+            try policy.addDomainRule(domain_spec);
+        }
     }
     for (cfg.allowed_ips) |ip_str| {
         if (ip_str.len == 0) continue;
@@ -707,7 +769,8 @@ pub fn maybeSendDnsRefused(frame: []const u8) bool {
     if (policy.isDomainAllowed(domain)) return false;
 
     // Domain is blocked - send REFUSED response
-    log.info("virtio-net dns blocked: {s}", .{domain});
+    const dst_ip: [4]u8 = frame[ip_offset + 16 ..][0..4].*;
+    log.info("virtio-net dns blocked: {s} (to {d}.{d}.{d}.{d})", .{ domain, dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3] });
     sendDnsRefusedResponse(frame, ip_offset, ihl, udp_offset, payload_offset);
     return true;
 }
@@ -763,6 +826,17 @@ fn sendDnsRefusedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offs
 
     // Send response back to guest
     virtioNetRxPacket(response[0..frame_len]) catch |e| {
+        if (e == error.NoBuffersAvailable) {
+            // Queue for later delivery when guest posts RX buffers
+            pending_refused_mutex.lock();
+            defer pending_refused_mutex.unlock();
+            if (queuePendingRefused(response[0..frame_len])) {
+                log.info("virtio-net dns refused queued (no buffers)", .{});
+            } else {
+                log.warn("virtio-net dns refused dropped (queue full)", .{});
+            }
+            return;
+        }
         log.warn("virtio-net dns refused send failed: {s}", .{@errorName(e)});
         return;
     };
@@ -1840,7 +1914,10 @@ pub fn handleVirtioNetMmio(offset: u64, is_write: bool, size: usize, value: u64)
             },
             virtio_mmio_reg_queue_notify => {
                 const queue_index: u16 = @intCast(v32 & 0xFFFF);
-                if (queue_index == 1) {
+                if (queue_index == 0) {
+                    // Guest posted RX buffers, drain pending REFUSED responses
+                    drainPendingRefused();
+                } else if (queue_index == 1) {
                     processVirtioNetTxQueue() catch |e| {
                         log.warn("hvf virtio-net tx notify failed: {s}", .{@errorName(e)});
                     };
