@@ -439,41 +439,35 @@ fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
         "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 root=/dev/vda1 rootwait rootfstype=ext4 rw devtmpfs.mount=1 systemd.mask=boot-efi.mount systemd.mask=systemd-boot-update.service quiet loglevel=3 systemd.show_status=false systemd.log_level=warning systemd.log_color=no fsck.mode=skip fsck.repair=no",
     );
 
-    if (cfg_mut.mount_roots.len > 0) {
-        for (cfg_mut.mount_roots) |root| allocator.free(root);
-        allocator.free(cfg_mut.mount_roots);
-        cfg_mut.mount_roots = &[_][]const u8{};
-    }
-    if (cfg_mut.mounts.len > 0) {
-        for (cfg_mut.mounts) |mount_cfg| {
-            allocator.free(mount_cfg.tag);
-            allocator.free(mount_cfg.host_path);
-            allocator.free(mount_cfg.guest_path);
+    // Only set default mounts if none are configured
+    if (cfg_mut.mounts.len == 0) {
+        if (cfg_mut.mount_roots.len > 0) {
+            for (cfg_mut.mount_roots) |root| allocator.free(root);
+            allocator.free(cfg_mut.mount_roots);
+            cfg_mut.mount_roots = &[_][]const u8{};
         }
-        allocator.free(cfg_mut.mounts);
-        cfg_mut.mounts = &[_]mounts.MountConfig{};
+
+        const mount_root = std.fs.path.dirname(cwd_path) orelse cwd_path;
+        const mount_root_owned = try allocator.dupe(u8, mount_root);
+        const mount_host = try allocator.dupe(u8, cwd_path);
+        const mount_tag = try allocator.dupe(u8, "host");
+        const mount_guest = try allocator.dupe(u8, "/mnt/host");
+
+        const mount_roots_list = try allocator.alloc([]const u8, 1);
+        @constCast(mount_roots_list)[0] = mount_root_owned;
+        cfg_mut.mount_roots = mount_roots_list;
+
+        cfg_mut.mounts = try allocator.alloc(mounts.MountConfig, 1);
+        cfg_mut.mounts[0] = .{
+            .tag = mount_tag,
+            .host_path = mount_host,
+            .guest_path = mount_guest,
+            .access = .read_write,
+            .mount_type = .virtio_fs,
+            .max_file_size = 0,
+            .allow_exec = false,
+        };
     }
-
-    const mount_root = std.fs.path.dirname(cwd_path) orelse cwd_path;
-    const mount_root_owned = try allocator.dupe(u8, mount_root);
-    const mount_host = try allocator.dupe(u8, cwd_path);
-    const mount_tag = try allocator.dupe(u8, "host");
-    const mount_guest = try allocator.dupe(u8, "/mnt/host");
-
-    const mount_roots_list = try allocator.alloc([]const u8, 1);
-    @constCast(mount_roots_list)[0] = mount_root_owned;
-    cfg_mut.mount_roots = mount_roots_list;
-
-    cfg_mut.mounts = try allocator.alloc(mounts.MountConfig, 1);
-    cfg_mut.mounts[0] = .{
-        .tag = mount_tag,
-        .host_path = mount_host,
-        .guest_path = mount_guest,
-        .access = .read_write,
-        .mount_type = .virtio_fs,
-        .max_file_size = 0,
-        .allow_exec = false,
-    };
 
     try core.config.writeConfigFile(vm_dir, cfg_mut);
 }
