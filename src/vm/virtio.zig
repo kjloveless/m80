@@ -1275,11 +1275,20 @@ pub fn processVirtioNetTxQueue() !void {
 }
 
 pub fn processVirtioFsQueue(queue_index: usize) !void {
-    if (!virtio_fs_state.enabled) return;
+    if (!virtio_fs_state.enabled) {
+        log.debug("hvf virtio-fs queue: not enabled", .{});
+        return;
+    }
     if (queue_index >= virtio_fs_state.queues.len) return;
-    if (queue_index >= @as(usize, virtio_fs_state.num_queues)) return;
+    // Queue 0 is hipq, queues 1..num_queues are request queues
+    // Valid indices are 0 through num_queues (inclusive)
+    if (queue_index > @as(usize, virtio_fs_state.num_queues)) return;
     const queue = &virtio_fs_state.queues[queue_index];
-    if (!queue.ready or queue.num == 0) return;
+    if (!queue.ready or queue.num == 0) {
+        log.debug("hvf virtio-fs queue {d}: not ready ready={} num={d}", .{ queue_index, queue.ready, queue.num });
+        return;
+    }
+    log.debug("hvf virtio-fs queue {d}: processing", .{queue_index});
 
     const avail_idx = try readGuestU16(queue.avail_addr + 2);
     while (queue.last_avail_idx != avail_idx) {
@@ -1330,10 +1339,14 @@ pub fn processVirtioFsQueue(queue_index: usize) !void {
 
         var response_len: usize = 0;
         if (virtio_fs_device) |*device| {
+            log.debug("hvf virtio-fs handling request len={d}", .{request.items.len});
             response_len = device.handleRequest(request.items, response_buf) catch |e| blk: {
                 log.warn("hvf virtio-fs request failed: {s}", .{@errorName(e)});
                 break :blk 0;
             };
+            log.debug("hvf virtio-fs response len={d}", .{response_len});
+        } else {
+            log.warn("hvf virtio-fs device not initialized", .{});
         }
 
         if (response_len == 0 and request.items.len >= @sizeOf(virtio_fs.FuseInHeader)) {
@@ -1851,6 +1864,7 @@ pub fn handleVirtioFsMmio(offset: u64, is_write: bool, size: usize, value: u64) 
             virtio_mmio_reg_queue_ready => {
                 const queue = &virtio_fs_state.queues[@min(@as(usize, virtio_fs_state.queue_sel), virtio_fs_state.queues.len - 1)];
                 queue.ready = (v32 & 0x1) == 1;
+                log.info("hvf virtio-fs queue {d} ready={}", .{ virtio_fs_state.queue_sel, queue.ready });
             },
             virtio_mmio_reg_queue_desc_low => {
                 const queue = &virtio_fs_state.queues[@min(@as(usize, virtio_fs_state.queue_sel), virtio_fs_state.queues.len - 1)];
@@ -1878,6 +1892,7 @@ pub fn handleVirtioFsMmio(offset: u64, is_write: bool, size: usize, value: u64) 
             },
             virtio_mmio_reg_queue_notify => {
                 const notify_index: usize = @intCast(v32 & 0xFFFF);
+                log.debug("hvf virtio-fs queue notify={d}", .{notify_index});
                 processVirtioFsQueue(notify_index) catch |e| {
                     log.warn("hvf virtio-fs queue notify failed: {s}", .{@errorName(e)});
                 };
@@ -2264,6 +2279,42 @@ test "virtio: VirtioFsState defaults" {
     const state = VirtioFsState{};
     try std.testing.expect(!state.enabled);
     try std.testing.expectEqual(@as(u32, 1), state.num_queues);
+}
+
+test "virtio: virtio-fs queue index validation" {
+    // VirtIO-FS queue layout:
+    // - Queue 0: hipq (high priority queue)
+    // - Queues 1..num_request_queues: request queues
+    // With num_request_queues=1, valid indices are 0 and 1
+    // With num_request_queues=2, valid indices are 0, 1, and 2
+
+    // Helper to check if queue index is valid for given num_queues
+    const isValidQueueIndex = struct {
+        fn check(queue_index: usize, num_queues: u32, queues_len: usize) bool {
+            if (queue_index >= queues_len) return false;
+            // Queue 0 is hipq, queues 1..num_queues are request queues
+            // Valid indices are 0 through num_queues (inclusive)
+            if (queue_index > @as(usize, num_queues)) return false;
+            return true;
+        }
+    }.check;
+
+    const queues_len: usize = 8; // virtio_fs_queue_limit
+
+    // With num_queues=1 (default): queue 0 (hipq) and queue 1 (request) are valid
+    try std.testing.expect(isValidQueueIndex(0, 1, queues_len)); // hipq
+    try std.testing.expect(isValidQueueIndex(1, 1, queues_len)); // request queue 1
+    try std.testing.expect(!isValidQueueIndex(2, 1, queues_len)); // invalid
+
+    // With num_queues=2: queues 0, 1, 2 are valid
+    try std.testing.expect(isValidQueueIndex(0, 2, queues_len)); // hipq
+    try std.testing.expect(isValidQueueIndex(1, 2, queues_len)); // request queue 1
+    try std.testing.expect(isValidQueueIndex(2, 2, queues_len)); // request queue 2
+    try std.testing.expect(!isValidQueueIndex(3, 2, queues_len)); // invalid
+
+    // Edge case: queue index at array boundary
+    try std.testing.expect(!isValidQueueIndex(queues_len, 8, queues_len)); // out of bounds
+    try std.testing.expect(isValidQueueIndex(queues_len - 1, 8, queues_len)); // last valid
 }
 
 test "virtio: descriptor flags constants" {
