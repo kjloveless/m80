@@ -233,6 +233,7 @@ pub var virtio_net_state = VirtioNetState{};
 pub var virtio_net_seen = std.atomic.Value(bool).init(false);
 pub var gic_virtio_net_intid: ?u32 = null;
 pub var virtio_net_irq_level = false;
+var virtio_net_rx_mutex = std.Thread.Mutex{};
 
 /// Callback for transmitting a network frame to the host.
 /// Called when guest sends a packet via virtio-net TX queue.
@@ -762,8 +763,10 @@ fn sendDnsRefusedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offs
 
     // Send response back to guest
     virtioNetRxPacket(response[0..frame_len]) catch |e| {
-        log.warn("virtio-net dns refused response failed: {s}", .{@errorName(e)});
+        log.warn("virtio-net dns refused send failed: {s}", .{@errorName(e)});
+        return;
     };
+    log.info("virtio-net dns refused sent", .{});
 }
 
 pub fn virtioConsoleInputLen() usize {
@@ -1217,19 +1220,25 @@ pub fn processVirtioConsoleQueue(queue_index: u16) !void {
 pub const virtio_net_hdr_len: usize = 12;
 
 pub fn virtioNetRxPacket(frame: []const u8) !void {
+    virtio_net_rx_mutex.lock();
+    defer virtio_net_rx_mutex.unlock();
+
     if (!virtio_net_state.enabled) {
         log.debug("hvf virtio-net rx: not enabled", .{});
-        return;
+        return error.NotEnabled;
     }
     const queue = &virtio_net_state.queues[0];
     if (!queue.ready or queue.num == 0) {
         log.debug("hvf virtio-net rx: queue not ready ready={} num={d}", .{ queue.ready, queue.num });
-        return;
+        return error.QueueNotReady;
     }
     log.debug("hvf virtio-net rx: frame len={d}", .{frame.len});
 
     const avail_idx = try readGuestU16(queue.avail_addr + 2);
-    if (queue.last_avail_idx == avail_idx) return;
+    if (queue.last_avail_idx == avail_idx) {
+        log.debug("hvf virtio-net rx: no buffers available last={d} avail={d}", .{ queue.last_avail_idx, avail_idx });
+        return error.NoBuffersAvailable;
+    }
 
     const ring_index = queue.last_avail_idx % queue.num;
     const head = try readGuestU16(queue.avail_addr + 4 + @as(u64, ring_index) * 2);
@@ -2512,6 +2521,101 @@ test "virtio: outboundFrameAllowed with no policy" {
     }
     const frame = [_]u8{0} ** 100;
     try std.testing.expect(outboundFrameAllowed(&frame));
+}
+
+test "virtio: maybeSendDnsRefused returns false with no policy" {
+    net_policy_mutex.lock();
+    const saved = net_policy_state;
+    net_policy_state = null;
+    net_policy_mutex.unlock();
+    defer {
+        net_policy_mutex.lock();
+        net_policy_state = saved;
+        net_policy_mutex.unlock();
+    }
+    const frame = [_]u8{0} ** 100;
+    try std.testing.expect(!maybeSendDnsRefused(&frame));
+}
+
+test "virtio: maybeSendDnsRefused returns false for non-DNS" {
+    net_policy_mutex.lock();
+    const saved = net_policy_state;
+    // Set up allowlist policy
+    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
+    policy.mode = .allowlist;
+    net_policy_state = policy;
+    net_policy_mutex.unlock();
+    defer {
+        net_policy_mutex.lock();
+        net_policy_state = saved;
+        net_policy_mutex.unlock();
+    }
+    // Build a minimal IPv4/TCP frame (not DNS)
+    var frame: [60]u8 = undefined;
+    @memset(&frame, 0);
+    // Ethernet header
+    frame[12] = 0x08; // ethertype IPv4
+    frame[13] = 0x00;
+    // IP header at offset 14
+    frame[14] = 0x45; // version 4, IHL 5
+    frame[23] = 6; // protocol TCP (not UDP)
+    // maybeSendDnsRefused should return false for non-UDP
+    try std.testing.expect(!maybeSendDnsRefused(&frame));
+}
+
+test "virtio: maybeSendDnsRefused returns false for allowed domain" {
+    net_policy_mutex.lock();
+    const saved = net_policy_state;
+    // Set up allowlist policy with allowed domain
+    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
+    policy.mode = .allowlist;
+    try policy.addDomainRule("example.com");
+    net_policy_state = policy;
+    net_policy_mutex.unlock();
+    defer {
+        net_policy_mutex.lock();
+        if (net_policy_state) |*p| p.deinit();
+        net_policy_state = saved;
+        net_policy_mutex.unlock();
+    }
+    // Build a DNS query for example.com
+    var frame: [100]u8 = undefined;
+    @memset(&frame, 0);
+    // Ethernet header
+    frame[12] = 0x08; // ethertype IPv4
+    frame[13] = 0x00;
+    // IP header at offset 14
+    frame[14] = 0x45; // version 4, IHL 5
+    frame[23] = 17; // protocol UDP
+    // UDP header at offset 34
+    frame[36] = 0x00; // dst port 53
+    frame[37] = 0x35;
+    // DNS query at offset 42
+    // Transaction ID
+    frame[42] = 0x12;
+    frame[43] = 0x34;
+    // Flags (standard query)
+    frame[44] = 0x01;
+    frame[45] = 0x00;
+    // Questions = 1
+    frame[46] = 0x00;
+    frame[47] = 0x01;
+    // DNS name: example.com = 7example3com0
+    frame[54] = 7;
+    frame[55] = 'e';
+    frame[56] = 'x';
+    frame[57] = 'a';
+    frame[58] = 'm';
+    frame[59] = 'p';
+    frame[60] = 'l';
+    frame[61] = 'e';
+    frame[62] = 3;
+    frame[63] = 'c';
+    frame[64] = 'o';
+    frame[65] = 'm';
+    frame[66] = 0;
+    // maybeSendDnsRefused should return false for allowed domain
+    try std.testing.expect(!maybeSendDnsRefused(&frame));
 }
 
 test "virtio: resetVirtioBlkDevice handles out of bounds" {
