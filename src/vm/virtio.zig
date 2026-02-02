@@ -445,7 +445,7 @@ pub const virtq_desc_flag_write: u16 = 2;
 pub const virtq_desc_flag_indirect: u16 = 4;
 
 pub const VirtioBlkReq = packed struct {
-    @"type": u32,
+    type: u32,
     reserved: u32,
     sector: u64,
 };
@@ -553,6 +553,281 @@ pub fn resetVirtioFsState() void {
         manager.deinit();
         virtio_fs_mount_manager = null;
     }
+}
+
+// =============================================================================
+// SNAPSHOT STATE CAPTURE
+// =============================================================================
+
+const snapshot = @import("snapshot.zig");
+
+/// Helper to convert internal queue state to snapshot format
+fn queueToSnapshotState(queue: anytype) snapshot.VirtioQueueState {
+    return .{
+        .num = queue.num,
+        .ready = if (queue.ready) 1 else 0,
+        .desc_addr = queue.desc_addr,
+        .avail_addr = queue.avail_addr,
+        .used_addr = queue.used_addr,
+        .last_avail_idx = queue.last_avail_idx,
+        .used_idx = queue.used_idx,
+    };
+}
+
+/// Helper to restore internal queue state from snapshot format
+fn snapshotToQueueState(comptime QueueType: type, snap: snapshot.VirtioQueueState) QueueType {
+    return .{
+        .num = snap.num,
+        .ready = snap.ready != 0,
+        .desc_addr = snap.desc_addr,
+        .avail_addr = snap.avail_addr,
+        .used_addr = snap.used_addr,
+        .last_avail_idx = snap.last_avail_idx,
+        .used_idx = snap.used_idx,
+    };
+}
+
+/// Captures virtio-blk device state for snapshot
+pub fn captureVirtioBlkState(index: usize) ?snapshot.VirtioBlkSnapshotState {
+    if (index >= virtio_blk_devices.len) return null;
+    const device = &virtio_blk_devices[index];
+    if (!device.enabled) return null;
+
+    return .{
+        .capacity_sectors = device.capacity_sectors,
+        .readonly = if (device.readonly) 1 else 0,
+        .status = device.status,
+        .device_features_sel = device.device_features_sel,
+        .driver_features_sel = device.driver_features_sel,
+        .driver_features = device.driver_features,
+        .interrupt_status = device.interrupt_status,
+        .queue_sel = device.queue_sel,
+        .queue = queueToSnapshotState(device.queue),
+    };
+}
+
+/// Restores virtio-blk device state from snapshot
+pub fn restoreVirtioBlkState(index: usize, snap: snapshot.VirtioBlkSnapshotState) void {
+    if (index >= virtio_blk_devices.len) return;
+    const device = &virtio_blk_devices[index];
+
+    device.status = snap.status;
+    device.device_features_sel = snap.device_features_sel;
+    device.driver_features_sel = snap.driver_features_sel;
+    device.driver_features = snap.driver_features;
+    device.interrupt_status = snap.interrupt_status;
+    device.queue_sel = snap.queue_sel;
+    device.queue = snapshotToQueueState(VirtioBlkQueue, snap.queue);
+}
+
+/// Captures virtio-console state for snapshot
+pub fn captureVirtioConsoleState() ?snapshot.VirtioConsoleSnapshotState {
+    if (!virtio_console_state.enabled) return null;
+
+    return .{
+        .status = virtio_console_state.status,
+        .device_features_sel = virtio_console_state.device_features_sel,
+        .driver_features_sel = virtio_console_state.driver_features_sel,
+        .driver_features = virtio_console_state.driver_features,
+        .interrupt_status = virtio_console_state.interrupt_status,
+        .queue_sel = virtio_console_state.queue_sel,
+        .rx_queue = queueToSnapshotState(virtio_console_state.queues[0]),
+        .tx_queue = queueToSnapshotState(virtio_console_state.queues[1]),
+    };
+}
+
+/// Restores virtio-console state from snapshot
+pub fn restoreVirtioConsoleState(snap: snapshot.VirtioConsoleSnapshotState) void {
+    virtio_console_state.status = snap.status;
+    virtio_console_state.device_features_sel = snap.device_features_sel;
+    virtio_console_state.driver_features_sel = snap.driver_features_sel;
+    virtio_console_state.driver_features = snap.driver_features;
+    virtio_console_state.interrupt_status = snap.interrupt_status;
+    virtio_console_state.queue_sel = snap.queue_sel;
+    virtio_console_state.queues[0] = snapshotToQueueState(VirtioConsoleQueue, snap.rx_queue);
+    virtio_console_state.queues[1] = snapshotToQueueState(VirtioConsoleQueue, snap.tx_queue);
+}
+
+/// Captures virtio-rng state for snapshot
+pub fn captureVirtioRngState() ?snapshot.VirtioRngSnapshotState {
+    if (!virtio_rng_state.enabled) return null;
+
+    return .{
+        .status = virtio_rng_state.status,
+        .device_features_sel = virtio_rng_state.device_features_sel,
+        .driver_features_sel = virtio_rng_state.driver_features_sel,
+        .driver_features = virtio_rng_state.driver_features,
+        .interrupt_status = virtio_rng_state.interrupt_status,
+        .queue_sel = virtio_rng_state.queue_sel,
+        .queue = queueToSnapshotState(virtio_rng_state.queue),
+    };
+}
+
+/// Restores virtio-rng state from snapshot
+pub fn restoreVirtioRngState(snap: snapshot.VirtioRngSnapshotState) void {
+    virtio_rng_state.status = snap.status;
+    virtio_rng_state.device_features_sel = snap.device_features_sel;
+    virtio_rng_state.driver_features_sel = snap.driver_features_sel;
+    virtio_rng_state.driver_features = snap.driver_features;
+    virtio_rng_state.interrupt_status = snap.interrupt_status;
+    virtio_rng_state.queue_sel = snap.queue_sel;
+    virtio_rng_state.queue = snapshotToQueueState(VirtioRngQueue, snap.queue);
+}
+
+/// Captures virtio-net state for snapshot
+pub fn captureVirtioNetState() ?snapshot.VirtioNetSnapshotState {
+    if (!virtio_net_state.enabled) return null;
+
+    return .{
+        .mac = virtio_net_state.mac,
+        .status = virtio_net_state.status,
+        .device_features_sel = virtio_net_state.device_features_sel,
+        .driver_features_sel = virtio_net_state.driver_features_sel,
+        .driver_features = virtio_net_state.driver_features,
+        .interrupt_status = virtio_net_state.interrupt_status,
+        .queue_sel = virtio_net_state.queue_sel,
+        .rx_queue = queueToSnapshotState(virtio_net_state.queues[0]),
+        .tx_queue = queueToSnapshotState(virtio_net_state.queues[1]),
+    };
+}
+
+/// Restores virtio-net state from snapshot
+pub fn restoreVirtioNetState(snap: snapshot.VirtioNetSnapshotState) void {
+    virtio_net_state.mac = snap.mac;
+    virtio_net_state.status = snap.status;
+    virtio_net_state.device_features_sel = snap.device_features_sel;
+    virtio_net_state.driver_features_sel = snap.driver_features_sel;
+    virtio_net_state.driver_features = snap.driver_features;
+    virtio_net_state.interrupt_status = snap.interrupt_status;
+    virtio_net_state.queue_sel = snap.queue_sel;
+    virtio_net_state.queues[0] = snapshotToQueueState(VirtioNetQueue, snap.rx_queue);
+    virtio_net_state.queues[1] = snapshotToQueueState(VirtioNetQueue, snap.tx_queue);
+}
+
+/// Captures virtio-fs state for snapshot
+pub fn captureVirtioFsState() ?snapshot.VirtioFsSnapshotState {
+    if (!virtio_fs_state.enabled) return null;
+
+    var state = snapshot.VirtioFsSnapshotState{
+        .status = virtio_fs_state.status,
+        .device_features_sel = virtio_fs_state.device_features_sel,
+        .driver_features_sel = virtio_fs_state.driver_features_sel,
+        .driver_features = virtio_fs_state.driver_features,
+        .interrupt_status = virtio_fs_state.interrupt_status,
+        .queue_sel = virtio_fs_state.queue_sel,
+        .num_queues = @intCast(virtio_fs_state.num_queues),
+    };
+
+    const num_queues = @min(virtio_fs_state.num_queues, virtio_fs_queue_limit);
+    for (0..num_queues) |i| {
+        state.queues[i] = queueToSnapshotState(virtio_fs_state.queues[i]);
+    }
+
+    return state;
+}
+
+/// Restores virtio-fs state from snapshot
+pub fn restoreVirtioFsState(snap: snapshot.VirtioFsSnapshotState) void {
+    virtio_fs_state.status = snap.status;
+    virtio_fs_state.device_features_sel = snap.device_features_sel;
+    virtio_fs_state.driver_features_sel = snap.driver_features_sel;
+    virtio_fs_state.driver_features = snap.driver_features;
+    virtio_fs_state.interrupt_status = snap.interrupt_status;
+    virtio_fs_state.queue_sel = snap.queue_sel;
+    virtio_fs_state.num_queues = snap.num_queues;
+
+    const num_queues = @min(snap.num_queues, virtio_fs_queue_limit);
+    for (0..num_queues) |i| {
+        virtio_fs_state.queues[i] = snapshotToQueueState(VirtioFsQueue, snap.queues[i]);
+    }
+}
+
+/// Collects all enabled device states for snapshot
+pub fn collectDeviceStates(allocator: std.mem.Allocator) ![]snapshot.DeviceStateEntry {
+    var entries = std.ArrayList(snapshot.DeviceStateEntry).init(allocator);
+    errdefer entries.deinit();
+
+    // VirtIO-blk devices
+    for (0..virtio_blk_device_count) |i| {
+        if (captureVirtioBlkState(i)) |state| {
+            const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioBlkSnapshotState));
+            @memcpy(data, std.mem.asBytes(&state));
+            try entries.append(.{
+                .header = .{
+                    .device_type = .virtio_blk,
+                    .device_index = @intCast(i),
+                    .state_size = @sizeOf(snapshot.VirtioBlkSnapshotState),
+                },
+                .data = data,
+            });
+        }
+    }
+
+    // VirtIO-console
+    if (captureVirtioConsoleState()) |state| {
+        const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioConsoleSnapshotState));
+        @memcpy(data, std.mem.asBytes(&state));
+        try entries.append(.{
+            .header = .{
+                .device_type = .virtio_console,
+                .device_index = 0,
+                .state_size = @sizeOf(snapshot.VirtioConsoleSnapshotState),
+            },
+            .data = data,
+        });
+    }
+
+    // VirtIO-rng
+    if (captureVirtioRngState()) |state| {
+        const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioRngSnapshotState));
+        @memcpy(data, std.mem.asBytes(&state));
+        try entries.append(.{
+            .header = .{
+                .device_type = .virtio_rng,
+                .device_index = 0,
+                .state_size = @sizeOf(snapshot.VirtioRngSnapshotState),
+            },
+            .data = data,
+        });
+    }
+
+    // VirtIO-net
+    if (captureVirtioNetState()) |state| {
+        const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioNetSnapshotState));
+        @memcpy(data, std.mem.asBytes(&state));
+        try entries.append(.{
+            .header = .{
+                .device_type = .virtio_net,
+                .device_index = 0,
+                .state_size = @sizeOf(snapshot.VirtioNetSnapshotState),
+            },
+            .data = data,
+        });
+    }
+
+    // VirtIO-fs
+    if (captureVirtioFsState()) |state| {
+        const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioFsSnapshotState));
+        @memcpy(data, std.mem.asBytes(&state));
+        try entries.append(.{
+            .header = .{
+                .device_type = .virtio_fs,
+                .device_index = 0,
+                .state_size = @sizeOf(snapshot.VirtioFsSnapshotState),
+            },
+            .data = data,
+        });
+    }
+
+    return entries.toOwnedSlice();
+}
+
+/// Frees device state entries allocated by collectDeviceStates
+pub fn freeDeviceStates(allocator: std.mem.Allocator, entries: []snapshot.DeviceStateEntry) void {
+    for (entries) |entry| {
+        allocator.free(entry.data);
+    }
+    allocator.free(entries);
 }
 
 pub fn setupVirtioConsole(enabled: bool) void {
@@ -1001,7 +1276,7 @@ pub fn processVirtioBlkRequest(device: *VirtioBlkDevice, head: u16) !u32 {
         status = virtio_blk_s_ioerr;
     }
 
-    switch (req.@"type") {
+    switch (req.type) {
         virtio_blk_t_in => {
             if (status != virtio_blk_s_ok) {
                 // status already set
@@ -1075,7 +1350,7 @@ pub fn processVirtioBlkRequest(device: *VirtioBlkDevice, head: u16) !u32 {
         device.log_remaining -= 1;
         log.info(
             "hvf virtio-blk req type={d} sector={d} len={d} status={d}",
-            .{ req.@"type", req.sector, data_len, status },
+            .{ req.type, req.sector, data_len, status },
         );
     }
     return @intCast(data_len);
@@ -1510,13 +1785,21 @@ pub fn processVirtioFsQueue(queue_index: usize) !void {
             desc_index = desc.next;
         }
 
-        if (write_descs.items.len == 0) return error.InvalidGuestLayout;
+        var no_reply = false;
+        if (request.items.len >= @sizeOf(virtio_fs.FuseInHeader)) {
+            var in_header: virtio_fs.FuseInHeader = undefined;
+            @memcpy(std.mem.asBytes(&in_header), request.items[0..@sizeOf(virtio_fs.FuseInHeader)]);
+            const opcode = virtio_fs.FuseOpcode.fromInt(in_header.opcode);
+            no_reply = opcode == .FUSE_FORGET or opcode == .FUSE_BATCH_FORGET;
+        }
+
+        if (write_descs.items.len == 0 and !no_reply) return error.InvalidGuestLayout;
 
         var total_write_len: usize = 0;
         for (write_descs.items) |entry| total_write_len += entry.len;
-        if (total_write_len == 0) return error.InvalidGuestLayout;
+        if (total_write_len == 0 and !no_reply) return error.InvalidGuestLayout;
 
-        var response_buf = try std.heap.page_allocator.alloc(u8, total_write_len);
+        var response_buf = try std.heap.page_allocator.alloc(u8, @max(@as(usize, 1), total_write_len));
         defer std.heap.page_allocator.free(response_buf);
 
         var response_len: usize = 0;
@@ -1526,12 +1809,13 @@ pub fn processVirtioFsQueue(queue_index: usize) !void {
                 log.warn("hvf virtio-fs request failed: {s}", .{@errorName(e)});
                 break :blk 0;
             };
+            if (no_reply) response_len = 0;
             log.debug("hvf virtio-fs response len={d}", .{response_len});
         } else {
             log.warn("hvf virtio-fs device not initialized", .{});
         }
 
-        if (response_len == 0 and request.items.len >= @sizeOf(virtio_fs.FuseInHeader)) {
+        if (!no_reply and response_len == 0 and request.items.len >= @sizeOf(virtio_fs.FuseInHeader)) {
             var in_header: virtio_fs.FuseInHeader = undefined;
             @memcpy(std.mem.asBytes(&in_header), request.items[0..@sizeOf(virtio_fs.FuseInHeader)]);
             const out_header: *virtio_fs.FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
@@ -1542,14 +1826,16 @@ pub fn processVirtioFsQueue(queue_index: usize) !void {
         }
 
         response_len = @min(response_len, response_buf.len);
-        var remaining = response_len;
-        var resp_offset: usize = 0;
-        for (write_descs.items) |entry| {
-            if (remaining == 0) break;
-            const chunk = @min(@as(usize, entry.len), remaining);
-            try writeGuestBytes(entry.addr, response_buf[resp_offset .. resp_offset + chunk]);
-            resp_offset += chunk;
-            remaining -= chunk;
+        if (!no_reply and write_descs.items.len > 0) {
+            var remaining = response_len;
+            var resp_offset: usize = 0;
+            for (write_descs.items) |entry| {
+                if (remaining == 0) break;
+                const chunk = @min(@as(usize, entry.len), remaining);
+                try writeGuestBytes(entry.addr, response_buf[resp_offset .. resp_offset + chunk]);
+                resp_offset += chunk;
+                remaining -= chunk;
+            }
         }
 
         const used_slot = queue.used_idx % queue.num;
