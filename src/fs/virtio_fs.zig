@@ -31,6 +31,14 @@
 //! - Invalid handles return EBADF (-9)
 
 const std = @import("std");
+const builtin = @import("builtin");
+const c = if (builtin.os.tag == .windows) struct {} else @cImport({
+    @cInclude("unistd.h");
+    @cInclude("sys/mount.h");
+    @cInclude("sys/xattr.h");
+    @cInclude("fcntl.h");
+    @cInclude("sys/ioctl.h");
+});
 const mounts = @import("mounts.zig");
 const path_util = @import("../util/path.zig");
 
@@ -124,7 +132,8 @@ pub const FuseInHeader = extern struct {
     uid: u32,
     gid: u32,
     pid: u32,
-    padding: u32,
+    total_extlen: u16,
+    padding: u16,
 };
 
 pub const FuseOutHeader = extern struct {
@@ -138,6 +147,8 @@ pub const FuseInitIn = extern struct {
     minor: u32,
     max_readahead: u32,
     flags: u32,
+    flags2: u32,
+    unused: [11]u32,
 };
 
 pub const FuseInitOut = extern struct {
@@ -189,7 +200,7 @@ pub const FuseAttr = extern struct {
     gid: u32,
     rdev: u32,
     blksize: u32,
-    padding: u32,
+    flags: u32,
 };
 
 pub const FuseAttrOut = extern struct {
@@ -211,7 +222,7 @@ pub const FuseEntryOut = extern struct {
 
 pub const FuseOpenIn = extern struct {
     flags: u32,
-    unused: u32,
+    open_flags: u32,
 };
 
 pub const FuseMkdirIn = extern struct {
@@ -230,7 +241,7 @@ pub const FuseCreateIn = extern struct {
     flags: u32,
     mode: u32,
     umask: u32,
-    padding: u32,
+    open_flags: u32,
 };
 
 pub const FuseOpenOut = extern struct {
@@ -271,11 +282,184 @@ pub const FuseReleaseIn = extern struct {
     lock_owner: u64,
 };
 
+pub const FuseForgetIn = extern struct {
+    nlookup: u64,
+};
+
+pub const FuseBatchForgetIn = extern struct {
+    count: u32,
+    dummy: u32,
+};
+
+pub const FuseForgetOne = extern struct {
+    nodeid: u64,
+    nlookup: u64,
+};
+
+pub const FuseRenameIn = extern struct {
+    newdir: u64,
+};
+
+pub const FuseRename2In = extern struct {
+    newdir: u64,
+    flags: u32,
+    padding: u32,
+};
+
+pub const FuseLinkIn = extern struct {
+    oldnodeid: u64,
+};
+
+pub const FuseFlushIn = extern struct {
+    fh: u64,
+    unused: u32,
+    padding: u32,
+    lock_owner: u64,
+};
+
+pub const FuseFsyncIn = extern struct {
+    fh: u64,
+    fsync_flags: u32,
+    padding: u32,
+};
+
+pub const FuseSetxattrIn = extern struct {
+    size: u32,
+    flags: u32,
+};
+
+pub const FuseGetxattrIn = extern struct {
+    size: u32,
+    padding: u32,
+};
+
+pub const FuseGetxattrOut = extern struct {
+    size: u32,
+    padding: u32,
+};
+
+pub const FuseFileLock = extern struct {
+    start: u64,
+    end: u64,
+    type: u32,
+    pid: u32,
+};
+
+pub const FuseLkIn = extern struct {
+    fh: u64,
+    owner: u64,
+    lk: FuseFileLock,
+    lk_flags: u32,
+    padding: u32,
+};
+
+pub const FuseLkOut = extern struct {
+    lk: FuseFileLock,
+};
+
+pub const FuseAccessIn = extern struct {
+    mask: u32,
+    padding: u32,
+};
+
+pub const FuseInterruptIn = extern struct {
+    unique: u64,
+};
+
+pub const FuseBmapIn = extern struct {
+    block: u64,
+    blocksize: u32,
+    padding: u32,
+};
+
+pub const FuseBmapOut = extern struct {
+    block: u64,
+};
+
+pub const FuseIoctlIn = extern struct {
+    fh: u64,
+    flags: u32,
+    cmd: u32,
+    arg: u64,
+    in_size: u32,
+    out_size: u32,
+};
+
+pub const FuseIoctlOut = extern struct {
+    result: i32,
+    flags: u32,
+    in_iovs: u32,
+    out_iovs: u32,
+};
+
+pub const FusePollIn = extern struct {
+    fh: u64,
+    kh: u64,
+    flags: u32,
+    events: u32,
+};
+
+pub const FusePollOut = extern struct {
+    revents: u32,
+    padding: u32,
+};
+
+pub const FuseFallocateIn = extern struct {
+    fh: u64,
+    offset: u64,
+    length: u64,
+    mode: u32,
+    padding: u32,
+};
+
+pub const FuseDirentPlus = extern struct {
+    entry_out: FuseEntryOut,
+    dirent: FuseDirent,
+};
+
+pub const FuseKstatfs = extern struct {
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    bsize: u32,
+    namelen: u32,
+    frsize: u32,
+    padding: u32,
+    spare: [6]u32,
+};
+
+pub const FuseStatfsOut = extern struct {
+    st: FuseKstatfs,
+};
+
+pub const FuseLseekIn = extern struct {
+    fh: u64,
+    offset: u64,
+    whence: u32,
+    padding: u32,
+};
+
+pub const FuseLseekOut = extern struct {
+    offset: u64,
+};
+
+pub const FuseCopyFileRangeIn = extern struct {
+    fh_in: u64,
+    off_in: u64,
+    nodeid_out: u64,
+    fh_out: u64,
+    off_out: u64,
+    len: u64,
+    flags: u64,
+};
+
 pub const FuseDirent = extern struct {
     ino: u64,
     off: u64,
     namelen: u32,
-    @"type": u32,
+    type: u32,
 };
 
 pub const NodeHandle = struct {
@@ -358,20 +542,49 @@ pub const VirtioFsDevice = struct {
         return switch (opcode) {
             .FUSE_INIT => self.handleInit(&header, payload, response_buf),
             .FUSE_LOOKUP => self.handleLookup(&header, payload, response_buf),
+            .FUSE_FORGET => self.handleForget(&header, payload, response_buf),
             .FUSE_GETATTR => self.handleGetattr(&header, response_buf),
             .FUSE_SETATTR => self.handleSetattr(&header, payload, response_buf),
+            .FUSE_READLINK => self.handleReadlink(&header, response_buf),
+            .FUSE_SYMLINK => self.handleSymlink(&header, payload, response_buf),
             .FUSE_OPEN => self.handleOpen(&header, payload, response_buf),
             .FUSE_MKDIR => self.handleMkdir(&header, payload, response_buf),
             .FUSE_MKNOD => self.handleMknod(&header, payload, response_buf),
+            .FUSE_RENAME => self.handleRename(&header, payload, response_buf),
+            .FUSE_LINK => self.handleLink(&header, payload, response_buf),
             .FUSE_READ => self.handleRead(&header, payload, response_buf),
             .FUSE_WRITE => self.handleWrite(&header, payload, response_buf),
+            .FUSE_STATFS => self.handleStatfs(&header, response_buf),
             .FUSE_CREATE => self.handleCreate(&header, payload, response_buf),
             .FUSE_UNLINK => self.handleUnlink(&header, payload, response_buf),
             .FUSE_RMDIR => self.handleRmdir(&header, payload, response_buf),
             .FUSE_RELEASE => self.handleRelease(&header, payload, response_buf),
+            .FUSE_FLUSH => self.handleFlush(&header, payload, response_buf),
+            .FUSE_FSYNC => self.handleFsync(&header, payload, response_buf),
             .FUSE_OPENDIR => self.handleOpendir(&header, payload, response_buf),
             .FUSE_READDIR => self.handleReaddir(&header, payload, response_buf),
             .FUSE_RELEASEDIR => self.handleReleasedir(&header, payload, response_buf),
+            .FUSE_FSYNCDIR => self.handleFsyncdir(&header, payload, response_buf),
+            .FUSE_GETLK => self.handleGetlk(&header, payload, response_buf),
+            .FUSE_SETLK => self.handleSetlk(&header, payload, response_buf),
+            .FUSE_SETLKW => self.handleSetlkw(&header, payload, response_buf),
+            .FUSE_SETXATTR => self.handleSetxattr(&header, payload, response_buf),
+            .FUSE_GETXATTR => self.handleGetxattr(&header, payload, response_buf),
+            .FUSE_LISTXATTR => self.handleListxattr(&header, payload, response_buf),
+            .FUSE_REMOVEXATTR => self.handleRemovexattr(&header, payload, response_buf),
+            .FUSE_ACCESS => self.handleAccess(&header, payload, response_buf),
+            .FUSE_INTERRUPT => self.handleInterrupt(&header, payload, response_buf),
+            .FUSE_BMAP => self.handleBmap(&header, payload, response_buf),
+            .FUSE_IOCTL => self.handleIoctl(&header, payload, response_buf),
+            .FUSE_POLL => self.handlePoll(&header, payload, response_buf),
+            .FUSE_BATCH_FORGET => self.handleBatchForget(&header, payload, response_buf),
+            .FUSE_READDIRPLUS => self.handleReaddirplus(&header, payload, response_buf),
+            .FUSE_RENAME2 => self.handleRename2(&header, payload, response_buf),
+            .FUSE_LSEEK => self.handleLseek(&header, payload, response_buf),
+            .FUSE_COPY_FILE_RANGE => self.handleCopyFileRange(&header, payload, response_buf),
+            .FUSE_FALLOCATE => self.handleFallocate(&header, payload, response_buf),
+            .FUSE_SETUPMAPPING => self.handleSetupmapping(&header, payload, response_buf),
+            .FUSE_REMOVEMAPPING => self.handleRemovemapping(&header, payload, response_buf),
             .FUSE_DESTROY => self.handleDestroy(&header, response_buf),
             else => self.sendError(&header, -38, response_buf), // ENOSYS
         };
@@ -383,8 +596,23 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        if (payload.len < @sizeOf(FuseInitIn)) {
+        if (payload.len < 16) {
             return self.sendError(header, -22, response_buf);
+        }
+
+        // Read the first 16 bytes (major, minor, max_readahead, flags).
+        var init_in = FuseInitIn{
+            .major = 0,
+            .minor = 0,
+            .max_readahead = 0,
+            .flags = 0,
+            .flags2 = 0,
+            .unused = std.mem.zeroes([11]u32),
+        };
+        const init_base = payload[0..16];
+        @memcpy(std.mem.asBytes(&init_in)[0..16], init_base);
+        if (payload.len >= @sizeOf(FuseInitIn)) {
+            @memcpy(std.mem.asBytes(&init_in), payload[0..@sizeOf(FuseInitIn)]);
         }
 
         const out_header_size = @sizeOf(FuseOutHeader);
@@ -408,9 +636,9 @@ pub const VirtioFsDevice = struct {
             .always => flags |= FuseInitFlags.FUSE_CAP_WRITEBACK_CACHE,
         }
         out_init.* = .{
-            .major = 7,
-            .minor = 31,
-            .max_readahead = 131072,
+            .major = @max(init_in.major, 7),
+            .minor = @min(init_in.minor, 31),
+            .max_readahead = @min(init_in.max_readahead, 131072),
             .flags = flags,
             .max_background = 0,
             .congestion_threshold = 0,
@@ -430,9 +658,7 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
-        }
+        if (header.nodeid == 1) try self.ensureRootNode();
         const name_end = std.mem.indexOfScalar(u8, payload, 0) orelse payload.len;
         const name = payload[0..name_end];
 
@@ -441,17 +667,23 @@ pub const VirtioFsDevice = struct {
         }
 
         // Reject traversal attempts from the guest.
-        if (path_util.containsTraversal(name)) {
+        if (path_util.containsTraversal(name) or containsPathSeparator(name)) {
             return self.sendError(header, -1, response_buf);
         }
 
-        const parent_node = self.nodes.get(header.nodeid);
-        const parent_path = if (parent_node) |n| n.path else "";
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+        const parent_path = parent_node.path;
 
         const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_path, name }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
+
+        if (self.validateAccess(full_path, .read)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
 
         const stat = std.fs.cwd().statFile(full_path) catch {
             return self.sendError(header, -2, response_buf);
@@ -464,17 +696,271 @@ pub const VirtioFsDevice = struct {
         return self.sendEntryOut(header, nodeid, &stat, response_buf);
     }
 
+    fn handleForget(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        _ = payload;
+        if (header.nodeid != 1) {
+            if (self.nodes.fetchRemove(header.nodeid)) |kv| {
+                self.allocator.free(kv.value.path);
+            }
+        }
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleReadlink(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        if (self.validateAccess(node.path, .read)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+
+        const out_header_size = @sizeOf(FuseOutHeader);
+        if (response_buf.len < out_header_size + 1) {
+            return VirtioFsError.IoError;
+        }
+
+        const link_buf = response_buf[out_header_size..];
+        const link = std.posix.readlink(node.path, link_buf) catch |e| switch (e) {
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.InvalidUtf8 => return self.sendError(header, -5, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(out_header_size + link.len);
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+        return out_header_size + link.len;
+    }
+
+    fn handleSymlink(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const name = parseCString(payload, 0) orelse return self.sendError(header, -22, response_buf);
+        const target = parseCString(payload, name.next) orelse return self.sendError(header, -22, response_buf);
+
+        if (name.slice.len == 0) return self.sendError(header, -2, response_buf);
+        if (path_util.containsTraversal(name.slice) or containsPathSeparator(name.slice)) {
+            return self.sendError(header, -1, response_buf);
+        }
+
+        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, name.slice }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(full_path);
+
+        if (self.validateAccess(full_path, .create)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+
+        std.posix.symlink(target.slice, full_path) catch |e| switch (e) {
+            error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        const stat = std.fs.cwd().statFile(full_path) catch return self.sendError(header, -5, response_buf);
+        const nodeid = self.allocateNode(full_path, false) catch return self.sendError(header, -12, response_buf);
+        return self.sendEntryOut(header, nodeid, &stat, response_buf);
+    }
+
+    fn handleRename(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseRenameIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const rename_in: *const FuseRenameIn = @ptrCast(@alignCast(payload.ptr));
+        const new_parent = self.nodes.get(rename_in.newdir) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const names = parseCString(payload, @sizeOf(FuseRenameIn)) orelse return self.sendError(header, -22, response_buf);
+        const new_name = parseCString(payload, names.next) orelse return self.sendError(header, -22, response_buf);
+
+        if (names.slice.len == 0 or new_name.slice.len == 0) {
+            return self.sendError(header, -2, response_buf);
+        }
+        if (path_util.containsTraversal(names.slice) or containsPathSeparator(names.slice)) {
+            return self.sendError(header, -1, response_buf);
+        }
+        if (path_util.containsTraversal(new_name.slice) or containsPathSeparator(new_name.slice)) {
+            return self.sendError(header, -1, response_buf);
+        }
+
+        const old_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, names.slice }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(old_path);
+        const new_path = std.fs.path.join(self.allocator, &[_][]const u8{ new_parent.path, new_name.slice }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(new_path);
+
+        if (self.validateAccess(old_path, .rename)) |errno| return self.sendError(header, errno, response_buf);
+        if (self.validateAccess(new_path, .create)) |errno| return self.sendError(header, errno, response_buf);
+
+        std.posix.rename(old_path, new_path) catch |e| switch (e) {
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.NotDir => return self.sendError(header, -20, response_buf),
+            error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleRename2(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseRename2In)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const rename2_in: *const FuseRename2In = @ptrCast(@alignCast(payload.ptr));
+        // Only support flags=0 or NOREPLACE (1).
+        const RENAME_NOREPLACE: u32 = 1;
+        if (rename2_in.flags != 0 and rename2_in.flags != RENAME_NOREPLACE) {
+            return self.sendError(header, -38, response_buf);
+        }
+
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+        const new_parent = self.nodes.get(rename2_in.newdir) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const names = parseCString(payload, @sizeOf(FuseRename2In)) orelse return self.sendError(header, -22, response_buf);
+        const new_name = parseCString(payload, names.next) orelse return self.sendError(header, -22, response_buf);
+        if (names.slice.len == 0 or new_name.slice.len == 0) {
+            return self.sendError(header, -2, response_buf);
+        }
+        if (path_util.containsTraversal(names.slice) or containsPathSeparator(names.slice)) {
+            return self.sendError(header, -1, response_buf);
+        }
+        if (path_util.containsTraversal(new_name.slice) or containsPathSeparator(new_name.slice)) {
+            return self.sendError(header, -1, response_buf);
+        }
+
+        const old_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, names.slice }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(old_path);
+        const new_path = std.fs.path.join(self.allocator, &[_][]const u8{ new_parent.path, new_name.slice }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(new_path);
+
+        if (rename2_in.flags == RENAME_NOREPLACE) {
+            if (std.fs.cwd().statFile(new_path)) |_| {
+                return self.sendError(header, -17, response_buf);
+            } else |_| {}
+        }
+
+        if (self.validateAccess(old_path, .rename)) |errno| return self.sendError(header, errno, response_buf);
+        if (self.validateAccess(new_path, .create)) |errno| return self.sendError(header, errno, response_buf);
+
+        std.posix.rename(old_path, new_path) catch |e| switch (e) {
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.NotDir => return self.sendError(header, -20, response_buf),
+            error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleLink(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseLinkIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const parent_node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+        const link_in: *const FuseLinkIn = @ptrCast(@alignCast(payload.ptr));
+        const old_node = self.nodes.get(link_in.oldnodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const name = parseCString(payload, @sizeOf(FuseLinkIn)) orelse return self.sendError(header, -22, response_buf);
+        if (name.slice.len == 0) return self.sendError(header, -2, response_buf);
+        if (path_util.containsTraversal(name.slice) or containsPathSeparator(name.slice)) {
+            return self.sendError(header, -1, response_buf);
+        }
+
+        const new_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, name.slice }) catch {
+            return self.sendError(header, -12, response_buf);
+        };
+        defer self.allocator.free(new_path);
+
+        if (self.validateAccess(new_path, .create)) |errno| return self.sendError(header, errno, response_buf);
+
+        std.posix.link(old_node.path, new_path) catch |e| switch (e) {
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        const stat = std.fs.cwd().statFile(new_path) catch return self.sendError(header, -5, response_buf);
+        const nodeid = self.allocateNode(new_path, stat.kind == .directory) catch return self.sendError(header, -12, response_buf);
+        return self.sendEntryOut(header, nodeid, &stat, response_buf);
+    }
+
     fn handleGetattr(
         self: *VirtioFsDevice,
         header: *const FuseInHeader,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
-        }
+        if (header.nodeid == 1) try self.ensureRootNode();
         const node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
+
+        if (self.validateAccess(node.path, .stat)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
 
         const stat = std.fs.cwd().statFile(node.path) catch {
             return self.sendError(header, -2, response_buf);
@@ -483,6 +969,14 @@ pub const VirtioFsDevice = struct {
         return self.sendAttrOut(header, &stat, response_buf);
     }
 
+    // FUSE SETATTR valid bits
+    const FATTR_MODE: u32 = 1 << 0;
+    const FATTR_SIZE: u32 = 1 << 3;
+    const FATTR_ATIME: u32 = 1 << 4;
+    const FATTR_MTIME: u32 = 1 << 5;
+    const FATTR_ATIME_NOW: u32 = 1 << 7;
+    const FATTR_MTIME_NOW: u32 = 1 << 8;
+
     fn handleSetattr(
         self: *VirtioFsDevice,
         header: *const FuseInHeader,
@@ -490,22 +984,89 @@ pub const VirtioFsDevice = struct {
         response_buf: []u8,
     ) VirtioFsError!usize {
         // Accept short payloads; some kernels send a smaller setattr struct.
-        // We currently ignore the requested changes and return current attrs.
         if (payload.len < 8) {
-            return self.sendError(header, -22, response_buf);
+            return self.sendError(header, -22, response_buf); // EINVAL
         }
 
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
-        }
+        if (header.nodeid == 1) try self.ensureRootNode();
         const node = self.nodes.get(header.nodeid) orelse {
-            return self.sendError(header, -2, response_buf);
+            return self.sendError(header, -2, response_buf); // ENOENT
         };
 
-        // TODO: apply attribute changes (size, mode, times). For now, report success
-        // with current attrs to avoid "Function not implemented" from tools like touch.
+        var setattr_in: FuseSetattrIn = std.mem.zeroes(FuseSetattrIn);
+        @memcpy(std.mem.asBytes(&setattr_in)[0..payload.len], payload);
+        const valid = setattr_in.valid;
+        const wants_write = (valid & (FATTR_SIZE | FATTR_MODE | FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW)) != 0;
+        if (wants_write) {
+            if (self.validateAccess(node.path, .write)) |errno| {
+                return self.sendError(header, errno, response_buf);
+            }
+        }
+
+        // Apply size change (truncate)
+        if (valid & FATTR_SIZE != 0) {
+            const file = std.fs.cwd().openFile(node.path, .{ .mode = .read_write }) catch {
+                return self.sendError(header, -13, response_buf); // EACCES
+            };
+            defer file.close();
+            file.setEndPos(setattr_in.size) catch {
+                return self.sendError(header, -5, response_buf); // EIO
+            };
+        }
+
+        // Apply mode change (chmod)
+        if (valid & FATTR_MODE != 0) {
+            const mode: std.posix.mode_t = @truncate(setattr_in.mode & 0o7777);
+            std.posix.fchmodat(std.fs.cwd().fd, node.path, mode, 0) catch {
+                return self.sendError(header, -13, response_buf); // EACCES
+            };
+        }
+
+        // Apply timestamp changes (utime/utimes)
+        const has_atime = (valid & FATTR_ATIME != 0) or (valid & FATTR_ATIME_NOW != 0);
+        const has_mtime = (valid & FATTR_MTIME != 0) or (valid & FATTR_MTIME_NOW != 0);
+        if (has_atime or has_mtime) {
+            // Get current stat for OMIT cases and UTIME_NOW
+            const current_stat = std.fs.cwd().statFile(node.path) catch {
+                return self.sendError(header, -2, response_buf); // ENOENT
+            };
+            const now = std.time.nanoTimestamp();
+
+            // Compute atime in nanoseconds
+            var atime_ns: i128 = undefined;
+            if (valid & FATTR_ATIME_NOW != 0) {
+                atime_ns = now;
+            } else if (valid & FATTR_ATIME != 0) {
+                atime_ns = @as(i128, setattr_in.atime) * std.time.ns_per_s + setattr_in.atimensec;
+            } else {
+                // OMIT: keep current atime
+                atime_ns = current_stat.atime;
+            }
+
+            // Compute mtime in nanoseconds
+            var mtime_ns: i128 = undefined;
+            if (valid & FATTR_MTIME_NOW != 0) {
+                mtime_ns = now;
+            } else if (valid & FATTR_MTIME != 0) {
+                mtime_ns = @as(i128, setattr_in.mtime) * std.time.ns_per_s + setattr_in.mtimensec;
+            } else {
+                // OMIT: keep current mtime
+                mtime_ns = current_stat.mtime;
+            }
+
+            // Open file and update times
+            const file = std.fs.cwd().openFile(node.path, .{ .mode = .read_write }) catch {
+                return self.sendError(header, -13, response_buf); // EACCES
+            };
+            defer file.close();
+            file.updateTimes(atime_ns, mtime_ns) catch {
+                return self.sendError(header, -13, response_buf); // EACCES
+            };
+        }
+
+        // Return updated attributes
         const stat = std.fs.cwd().statFile(node.path) catch {
-            return self.sendError(header, -2, response_buf);
+            return self.sendError(header, -2, response_buf); // ENOENT
         };
 
         return self.sendAttrOut(header, &stat, response_buf);
@@ -517,16 +1078,34 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = payload;
-
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
+        if (payload.len < @sizeOf(FuseOpenIn)) {
+            return self.sendError(header, -22, response_buf);
         }
+
+        if (header.nodeid == 1) try self.ensureRootNode();
         const node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
 
-        const file = std.fs.cwd().openFile(node.path, .{ .mode = .read_write }) catch |e| switch (e) {
+        if (node.is_dir) {
+            return self.sendError(header, -21, response_buf);
+        }
+
+        const open_in: *const FuseOpenIn = @ptrCast(@alignCast(payload.ptr));
+        const accmode = open_in.flags & O_ACCMODE;
+        const write_access = accmode != O_RDONLY;
+        if (write_access) {
+            if (self.validateAccess(node.path, .write)) |errno| {
+                return self.sendError(header, errno, response_buf);
+            }
+        } else {
+            if (self.validateAccess(node.path, .read)) |errno| {
+                return self.sendError(header, errno, response_buf);
+            }
+        }
+
+        const file_mode: std.fs.File.OpenMode = if (accmode == O_WRONLY) .write_only else if (accmode == O_RDWR) .read_write else .read_only;
+        const file = std.fs.cwd().openFile(node.path, .{ .mode = file_mode }) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             else => return self.sendError(header, -5, response_buf),
@@ -550,9 +1129,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -22, response_buf);
         }
 
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
-        }
+        if (header.nodeid == 1) try self.ensureRootNode();
         const parent_node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
@@ -563,7 +1140,7 @@ pub const VirtioFsDevice = struct {
         if (entry_name.len == 0) {
             return self.sendError(header, -2, response_buf);
         }
-        if (path_util.containsTraversal(entry_name)) {
+        if (path_util.containsTraversal(entry_name) or containsPathSeparator(entry_name)) {
             return self.sendError(header, -1, response_buf);
         }
 
@@ -571,6 +1148,10 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
+
+        if (self.validateAccess(full_path, .create)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
 
         std.fs.cwd().makeDir(full_path) catch |e| switch (e) {
             error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
@@ -594,9 +1175,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -22, response_buf);
         }
 
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
-        }
+        if (header.nodeid == 1) try self.ensureRootNode();
         const parent_node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
@@ -607,7 +1186,7 @@ pub const VirtioFsDevice = struct {
         if (entry_name.len == 0) {
             return self.sendError(header, -2, response_buf);
         }
-        if (path_util.containsTraversal(entry_name)) {
+        if (path_util.containsTraversal(entry_name) or containsPathSeparator(entry_name)) {
             return self.sendError(header, -1, response_buf);
         }
 
@@ -615,6 +1194,10 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
+
+        if (self.validateAccess(full_path, .create)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
 
         const file = std.fs.cwd().createFile(full_path, .{ .read = true, .truncate = false }) catch |e| switch (e) {
             error.PathAlreadyExists => std.fs.cwd().openFile(full_path, .{ .mode = .read_write }) catch |open_err| switch (open_err) {
@@ -651,6 +1234,9 @@ pub const VirtioFsDevice = struct {
         };
 
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
+        if (self.validateAccess(handle.node.path, .read)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
 
         const out_header_size = @sizeOf(FuseOutHeader);
         if (response_buf.len < out_header_size) {
@@ -689,6 +1275,9 @@ pub const VirtioFsDevice = struct {
         };
 
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
+        if (self.validateAccess(handle.node.path, .write)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
 
         const data_offset = @sizeOf(FuseWriteIn);
         if (payload.len < data_offset + write_in.size) {
@@ -704,6 +1293,77 @@ pub const VirtioFsDevice = struct {
         return self.sendWriteOut(header, @intCast(bytes_written), response_buf);
     }
 
+    fn handleStatfs(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (builtin.os.tag != .windows) {
+            const stat_path = if (header.nodeid == 1 or header.nodeid == 0) blk: {
+                const mount = self.mount_manager.getMountByTag(self.tag) orelse break :blk ".";
+                break :blk mount.host_path;
+            } else if (self.nodes.get(header.nodeid)) |node|
+                node.path
+            else
+                ".";
+            const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseStatfsOut);
+            if (response_buf.len < total_size) return VirtioFsError.IoError;
+
+            const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+            out_header.len = @intCast(total_size);
+            out_header.@"error" = 0;
+            out_header.unique = header.unique;
+
+            var stat_out: *FuseStatfsOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
+            var st: c.struct_statfs = undefined;
+            // statfs on current working dir; callers generally use root node.
+            const stat_path_z = try toZ(self.allocator, stat_path);
+            defer self.allocator.free(stat_path_z);
+            if (c.statfs(stat_path_z.ptr, &st) != 0) {
+                return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+            }
+            const name_len: u64 = if (builtin.os.tag == .macos) 255 else @intCast(st.f_namelen);
+            const frsize: u64 = if (builtin.os.tag == .linux) @intCast(st.f_frsize) else @intCast(st.f_bsize);
+            stat_out.st = .{
+                .blocks = @intCast(st.f_blocks),
+                .bfree = @intCast(st.f_bfree),
+                .bavail = @intCast(st.f_bavail),
+                .files = @intCast(st.f_files),
+                .ffree = @intCast(st.f_ffree),
+                .bsize = @intCast(st.f_bsize),
+                .namelen = @intCast(name_len),
+                .frsize = @intCast(frsize),
+                .padding = 0,
+                .spare = std.mem.zeroes([6]u32),
+            };
+            return total_size;
+        }
+
+        const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseStatfsOut);
+        if (response_buf.len < total_size) return VirtioFsError.IoError;
+
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(total_size);
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+
+        const stat_out: *FuseStatfsOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
+        stat_out.st = .{
+            .blocks = 0,
+            .bfree = 0,
+            .bavail = 0,
+            .files = 0,
+            .ffree = 0,
+            .bsize = 4096,
+            .namelen = 255,
+            .frsize = 4096,
+            .padding = 0,
+            .spare = std.mem.zeroes([6]u32),
+        };
+
+        return total_size;
+    }
+
     fn handleCreate(
         self: *VirtioFsDevice,
         header: *const FuseInHeader,
@@ -714,9 +1374,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -22, response_buf);
         }
 
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
-        }
+        if (header.nodeid == 1) try self.ensureRootNode();
         const parent_node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
@@ -727,7 +1385,7 @@ pub const VirtioFsDevice = struct {
         if (entry_name.len == 0) {
             return self.sendError(header, -2, response_buf);
         }
-        if (path_util.containsTraversal(entry_name)) {
+        if (path_util.containsTraversal(entry_name) or containsPathSeparator(entry_name)) {
             return self.sendError(header, -1, response_buf);
         }
 
@@ -736,8 +1394,16 @@ pub const VirtioFsDevice = struct {
         };
         defer self.allocator.free(full_path);
 
-        const file = std.fs.cwd().createFile(full_path, .{ .read = true, .truncate = false }) catch |e| switch (e) {
-            error.PathAlreadyExists => std.fs.cwd().openFile(full_path, .{ .mode = .read_write }) catch |open_err| switch (open_err) {
+        if (self.validateAccess(full_path, .create)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+
+        const create_in: *const FuseCreateIn = @ptrCast(@alignCast(payload.ptr));
+        const accmode = create_in.flags & O_ACCMODE;
+        const read_enabled = accmode != O_WRONLY;
+        const file_mode: std.fs.File.OpenMode = if (accmode == O_WRONLY) .write_only else if (accmode == O_RDWR) .read_write else .read_only;
+        const file = std.fs.cwd().createFile(full_path, .{ .read = read_enabled, .truncate = false }) catch |e| switch (e) {
+            error.PathAlreadyExists => std.fs.cwd().openFile(full_path, .{ .mode = file_mode }) catch |open_err| switch (open_err) {
                 error.AccessDenied => return self.sendError(header, -13, response_buf),
                 error.FileNotFound => return self.sendError(header, -2, response_buf),
                 else => return self.sendError(header, -5, response_buf),
@@ -770,9 +1436,7 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
-        }
+        if (header.nodeid == 1) try self.ensureRootNode();
         const parent_node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
@@ -782,7 +1446,7 @@ pub const VirtioFsDevice = struct {
         if (entry_name.len == 0) {
             return self.sendError(header, -2, response_buf);
         }
-        if (path_util.containsTraversal(entry_name)) {
+        if (path_util.containsTraversal(entry_name) or containsPathSeparator(entry_name)) {
             return self.sendError(header, -1, response_buf);
         }
 
@@ -790,6 +1454,10 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
+
+        if (self.validateAccess(full_path, .delete)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
 
         std.fs.cwd().deleteFile(full_path) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
@@ -807,9 +1475,7 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
-        }
+        if (header.nodeid == 1) try self.ensureRootNode();
         const parent_node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
@@ -819,7 +1485,7 @@ pub const VirtioFsDevice = struct {
         if (entry_name.len == 0) {
             return self.sendError(header, -2, response_buf);
         }
-        if (path_util.containsTraversal(entry_name)) {
+        if (path_util.containsTraversal(entry_name) or containsPathSeparator(entry_name)) {
             return self.sendError(header, -1, response_buf);
         }
 
@@ -827,6 +1493,10 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
+
+        if (self.validateAccess(full_path, .delete)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
 
         std.fs.cwd().deleteDir(full_path) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
@@ -859,6 +1529,35 @@ pub const VirtioFsDevice = struct {
         return self.sendError(header, 0, response_buf);
     }
 
+    fn handleFlush(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseFlushIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleFsync(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseFsyncIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const fsync_in: *const FuseFsyncIn = @ptrCast(@alignCast(payload.ptr));
+        const handle = self.handles.get(fsync_in.fh) orelse return self.sendError(header, -9, response_buf);
+        if (handle.file) |f| {
+            f.sync() catch return self.sendError(header, -5, response_buf);
+        }
+        return self.sendError(header, 0, response_buf);
+    }
+
     fn handleOpendir(
         self: *VirtioFsDevice,
         header: *const FuseInHeader,
@@ -867,15 +1566,17 @@ pub const VirtioFsDevice = struct {
     ) VirtioFsError!usize {
         _ = payload;
 
-        if (header.nodeid == 1) {
-            try self.ensureRootNode();
-        }
+        if (header.nodeid == 1) try self.ensureRootNode();
         const node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
 
         if (!node.is_dir) {
             return self.sendError(header, -20, response_buf);
+        }
+
+        if (self.validateAccess(node.path, .readdir)) |errno| {
+            return self.sendError(header, errno, response_buf);
         }
 
         const dir = std.fs.cwd().openDir(node.path, .{ .iterate = true }) catch |e| switch (e) {
@@ -910,6 +1611,9 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -9, response_buf);
         };
         const dir = handle.dir orelse return self.sendError(header, -9, response_buf);
+        if (self.validateAccess(handle.node.path, .readdir)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
 
         const out_header_size = @sizeOf(FuseOutHeader);
         if (response_buf.len < out_header_size) {
@@ -917,26 +1621,22 @@ pub const VirtioFsDevice = struct {
         }
         const max_data = @min(read_in.size, @as(u32, @intCast(response_buf.len - out_header_size)));
 
-        // Only support offset=0 in this stub.
-        if (read_in.offset != 0) {
-            const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-            out_header.len = @intCast(out_header_size);
-            out_header.@"error" = 0;
-            out_header.unique = header.unique;
-            return out_header_size;
-        }
-
         const DT_DIR: u32 = 4;
         const DT_REG: u32 = 8;
 
         var pos: usize = out_header_size;
         var next_off: u64 = 1;
+        const skip_off = read_in.offset;
         var d = dir;
         var it = d.iterate();
         while (true) {
             const entry = it.next() catch return self.sendError(header, -5, response_buf);
             if (entry == null) break;
             const entry_val = entry.?;
+            if (next_off <= skip_off) {
+                next_off += 1;
+                continue;
+            }
             const name_len: u32 = @intCast(entry_val.name.len);
             const entry_size = @sizeOf(FuseDirent) + entry_val.name.len;
             const padded_size = std.mem.alignForward(usize, entry_size, 8);
@@ -944,9 +1644,9 @@ pub const VirtioFsDevice = struct {
 
             var dirent = FuseDirent{
                 .ino = next_off,
-                .off = next_off,
+                .off = next_off + 1,
                 .namelen = name_len,
-                .@"type" = switch (entry_val.kind) {
+                .type = switch (entry_val.kind) {
                     .directory => DT_DIR,
                     .file => DT_REG,
                     else => 0,
@@ -961,6 +1661,112 @@ pub const VirtioFsDevice = struct {
                 response_buf[pos + entry_size ..][0..(padded_size - entry_size)],
                 0,
             );
+            pos += padded_size;
+            next_off += 1;
+        }
+
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(pos);
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+
+        return pos;
+    }
+
+    fn handleReaddirplus(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseReadIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+
+        var read_in: FuseReadIn = undefined;
+        @memcpy(std.mem.asBytes(&read_in), payload[0..@sizeOf(FuseReadIn)]);
+
+        const handle = self.handles.get(read_in.fh) orelse {
+            return self.sendError(header, -9, response_buf);
+        };
+        const dir = handle.dir orelse return self.sendError(header, -9, response_buf);
+        if (self.validateAccess(handle.node.path, .readdir)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+
+        const out_header_size = @sizeOf(FuseOutHeader);
+        if (response_buf.len < out_header_size) {
+            return VirtioFsError.IoError;
+        }
+        const max_data = @min(read_in.size, @as(u32, @intCast(response_buf.len - out_header_size)));
+
+        const DT_DIR: u32 = 4;
+        const DT_REG: u32 = 8;
+
+        var pos: usize = out_header_size;
+        var next_off: u64 = 1;
+        const skip_off = read_in.offset;
+        var d = dir;
+        var it = d.iterate();
+        while (true) {
+            const entry = it.next() catch return self.sendError(header, -5, response_buf);
+            if (entry == null) break;
+            const entry_val = entry.?;
+            if (next_off <= skip_off) {
+                next_off += 1;
+                continue;
+            }
+
+            const name_len: u32 = @intCast(entry_val.name.len);
+            const entry_size = @sizeOf(FuseDirentPlus) + entry_val.name.len;
+            const padded_size = std.mem.alignForward(usize, entry_size, 8);
+            if (pos + padded_size > out_header_size + max_data) break;
+
+            const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ handle.node.path, entry_val.name }) catch {
+                return self.sendError(header, -12, response_buf);
+            };
+            defer self.allocator.free(full_path);
+
+            const stat = std.fs.cwd().statFile(full_path) catch {
+                return self.sendError(header, -2, response_buf);
+            };
+            const nodeid = self.allocateNode(full_path, stat.kind == .directory) catch {
+                return self.sendError(header, -12, response_buf);
+            };
+
+            var entry_out = FuseEntryOut{
+                .nodeid = nodeid,
+                .generation = 1,
+                .entry_valid = 1,
+                .attr_valid = 1,
+                .entry_valid_nsec = 0,
+                .attr_valid_nsec = 0,
+                .attr = statToFuseAttr(nodeid, &stat),
+            };
+            @memcpy(response_buf[pos..][0..@sizeOf(FuseEntryOut)], std.mem.asBytes(&entry_out));
+
+            var dirent = FuseDirent{
+                .ino = next_off,
+                .off = next_off + 1,
+                .namelen = name_len,
+                .type = switch (entry_val.kind) {
+                    .directory => DT_DIR,
+                    .file => DT_REG,
+                    else => 0,
+                },
+            };
+            const dirent_start = pos + @sizeOf(FuseEntryOut);
+            @memcpy(response_buf[dirent_start..][0..@sizeOf(FuseDirent)], std.mem.asBytes(&dirent));
+            @memcpy(
+                response_buf[dirent_start + @sizeOf(FuseDirent) ..][0..entry_val.name.len],
+                entry_val.name,
+            );
+            const pad_start = pos + entry_size;
+            @memset(
+                response_buf[pad_start..][0..(padded_size - entry_size)],
+                0,
+            );
+
             pos += padded_size;
             next_off += 1;
         }
@@ -996,12 +1802,598 @@ pub const VirtioFsDevice = struct {
         return self.sendError(header, 0, response_buf);
     }
 
-    fn handleDestroy(
+    fn handleFsyncdir(
         self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseFsyncIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const fsync_in: *const FuseFsyncIn = @ptrCast(@alignCast(payload.ptr));
+        const handle = self.handles.get(fsync_in.fh) orelse return self.sendError(header, -9, response_buf);
+        if (handle.dir) |d| {
+            std.posix.fsync(d.fd) catch return self.sendError(header, -5, response_buf);
+        }
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleAccess(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseAccessIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const node = self.nodes.get(header.nodeid) orelse {
+            return self.sendError(header, -2, response_buf);
+        };
+
+        const access_in: *const FuseAccessIn = @ptrCast(@alignCast(payload.ptr));
+        const R_OK: u32 = 4;
+        const W_OK: u32 = 2;
+        const X_OK: u32 = 1;
+
+        if ((access_in.mask & W_OK) != 0) {
+            if (self.validateAccess(node.path, .write)) |errno| {
+                return self.sendError(header, errno, response_buf);
+            }
+        } else if ((access_in.mask & R_OK) != 0) {
+            if (self.validateAccess(node.path, .read)) |errno| {
+                return self.sendError(header, errno, response_buf);
+            }
+        }
+        if ((access_in.mask & X_OK) != 0) {
+            const mount = self.mount_manager.getMountByTag(self.tag) orelse return self.sendError(header, -2, response_buf);
+            if (!mount.allow_exec) return self.sendError(header, -13, response_buf);
+        }
+
+        std.posix.faccessat(std.posix.AT.FDCWD, node.path, access_in.mask, 0) catch |e| switch (e) {
+            error.FileNotFound => return self.sendError(header, -2, response_buf),
+            error.AccessDenied => return self.sendError(header, -13, response_buf),
+            else => return self.sendError(header, -5, response_buf),
+        };
+
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleSetxattr(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) {
+            return self.sendError(header, -38, response_buf);
+        }
+        if (payload.len < @sizeOf(FuseSetxattrIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const node = self.nodes.get(header.nodeid) orelse return self.sendError(header, -2, response_buf);
+
+        if (self.validateAccess(node.path, .write)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+
+        const set_in: *const FuseSetxattrIn = @ptrCast(@alignCast(payload.ptr));
+        const name = parseCString(payload, @sizeOf(FuseSetxattrIn)) orelse return self.sendError(header, -22, response_buf);
+        const value_start = name.next;
+        if (value_start + set_in.size > payload.len) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const value = payload[value_start .. value_start + set_in.size];
+
+        const path_z = try toZ(self.allocator, node.path);
+        defer self.allocator.free(path_z);
+        const name_z = try toZ(self.allocator, name.slice);
+        defer self.allocator.free(name_z);
+
+        const rc = if (builtin.os.tag == .macos)
+            c.setxattr(path_z.ptr, name_z.ptr, value.ptr, value.len, 0, @intCast(set_in.flags))
+        else
+            c.setxattr(path_z.ptr, name_z.ptr, value.ptr, value.len, @intCast(set_in.flags));
+
+        if (rc != 0) {
+            return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+        }
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleGetxattr(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) {
+            return self.sendError(header, -38, response_buf);
+        }
+        if (payload.len < @sizeOf(FuseGetxattrIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const node = self.nodes.get(header.nodeid) orelse return self.sendError(header, -2, response_buf);
+
+        if (self.validateAccess(node.path, .read)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+
+        const get_in: *const FuseGetxattrIn = @ptrCast(@alignCast(payload.ptr));
+        const name = parseCString(payload, @sizeOf(FuseGetxattrIn)) orelse return self.sendError(header, -22, response_buf);
+
+        const path_z = try toZ(self.allocator, node.path);
+        defer self.allocator.free(path_z);
+        const name_z = try toZ(self.allocator, name.slice);
+        defer self.allocator.free(name_z);
+
+        if (get_in.size == 0) {
+            const size = if (builtin.os.tag == .macos)
+                c.getxattr(path_z.ptr, name_z.ptr, null, 0, 0, 0)
+            else
+                c.getxattr(path_z.ptr, name_z.ptr, null, 0);
+            if (size < 0) {
+                return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+            }
+            const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseGetxattrOut);
+            if (response_buf.len < total_size) return VirtioFsError.IoError;
+            const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+            out_header.len = @intCast(total_size);
+            out_header.@"error" = 0;
+            out_header.unique = header.unique;
+            const out: *FuseGetxattrOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
+            out.size = @intCast(size);
+            out.padding = 0;
+            return total_size;
+        }
+
+        const out_header_size = @sizeOf(FuseOutHeader);
+        if (response_buf.len < out_header_size + get_in.size) return VirtioFsError.IoError;
+        const data_buf = response_buf[out_header_size .. out_header_size + get_in.size];
+        const size = if (builtin.os.tag == .macos)
+            c.getxattr(path_z.ptr, name_z.ptr, data_buf.ptr, data_buf.len, 0, 0)
+        else
+            c.getxattr(path_z.ptr, name_z.ptr, data_buf.ptr, data_buf.len);
+        if (size < 0) {
+            return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+        }
+
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(out_header_size + @as(usize, @intCast(size)));
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+        return out_header_size + @as(usize, @intCast(size));
+    }
+
+    fn handleListxattr(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) {
+            return self.sendError(header, -38, response_buf);
+        }
+        if (payload.len < @sizeOf(FuseGetxattrIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const node = self.nodes.get(header.nodeid) orelse return self.sendError(header, -2, response_buf);
+        if (self.validateAccess(node.path, .read)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+
+        const list_in: *const FuseGetxattrIn = @ptrCast(@alignCast(payload.ptr));
+        const path_z = try toZ(self.allocator, node.path);
+        defer self.allocator.free(path_z);
+
+        if (list_in.size == 0) {
+            const size = if (builtin.os.tag == .macos)
+                c.listxattr(path_z.ptr, null, 0, 0)
+            else
+                c.listxattr(path_z.ptr, null, 0);
+            if (size < 0) {
+                return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+            }
+            const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseGetxattrOut);
+            if (response_buf.len < total_size) return VirtioFsError.IoError;
+            const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+            out_header.len = @intCast(total_size);
+            out_header.@"error" = 0;
+            out_header.unique = header.unique;
+            const out: *FuseGetxattrOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
+            out.size = @intCast(size);
+            out.padding = 0;
+            return total_size;
+        }
+
+        const out_header_size = @sizeOf(FuseOutHeader);
+        if (response_buf.len < out_header_size + list_in.size) return VirtioFsError.IoError;
+        const data_buf = response_buf[out_header_size .. out_header_size + list_in.size];
+        const size = if (builtin.os.tag == .macos)
+            c.listxattr(path_z.ptr, data_buf.ptr, data_buf.len, 0)
+        else
+            c.listxattr(path_z.ptr, data_buf.ptr, data_buf.len);
+        if (size < 0) {
+            return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+        }
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(out_header_size + @as(usize, @intCast(size)));
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+        return out_header_size + @as(usize, @intCast(size));
+    }
+
+    fn handleRemovexattr(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) {
+            return self.sendError(header, -38, response_buf);
+        }
+        if (header.nodeid == 1) try self.ensureRootNode();
+        const node = self.nodes.get(header.nodeid) orelse return self.sendError(header, -2, response_buf);
+        if (self.validateAccess(node.path, .write)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+        const name = parseCString(payload, 0) orelse return self.sendError(header, -22, response_buf);
+        const path_z = try toZ(self.allocator, node.path);
+        defer self.allocator.free(path_z);
+        const name_z = try toZ(self.allocator, name.slice);
+        defer self.allocator.free(name_z);
+
+        const rc = if (builtin.os.tag == .macos)
+            c.removexattr(path_z.ptr, name_z.ptr, 0)
+        else
+            c.removexattr(path_z.ptr, name_z.ptr);
+        if (rc != 0) {
+            return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+        }
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleGetlk(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
+        if (payload.len < @sizeOf(FuseLkIn)) return self.sendError(header, -22, response_buf);
+        const lk_in: *const FuseLkIn = @ptrCast(@alignCast(payload.ptr));
+        const handle = self.handles.get(lk_in.fh) orelse return self.sendError(header, -9, response_buf);
+        const file = handle.file orelse return self.sendError(header, -9, response_buf);
+
+        var flock: c.struct_flock = lockToFlock(lk_in.lk);
+        if (c.fcntl(file.handle, c.F_GETLK, &flock) == -1) {
+            return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+        }
+
+        const out_header_size = @sizeOf(FuseOutHeader);
+        const out_size = @sizeOf(FuseLkOut);
+        if (response_buf.len < out_header_size + out_size) return VirtioFsError.IoError;
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(out_header_size + out_size);
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+        const out: *FuseLkOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
+        out.lk = flockToLock(flock);
+        return out_header_size + out_size;
+    }
+
+    fn handleSetlk(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
+        if (payload.len < @sizeOf(FuseLkIn)) return self.sendError(header, -22, response_buf);
+        const lk_in: *const FuseLkIn = @ptrCast(@alignCast(payload.ptr));
+        const handle = self.handles.get(lk_in.fh) orelse return self.sendError(header, -9, response_buf);
+        const file = handle.file orelse return self.sendError(header, -9, response_buf);
+
+        var flock: c.struct_flock = lockToFlock(lk_in.lk);
+        if (c.fcntl(file.handle, c.F_SETLK, &flock) == -1) {
+            return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+        }
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleSetlkw(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
+        if (payload.len < @sizeOf(FuseLkIn)) return self.sendError(header, -22, response_buf);
+        const lk_in: *const FuseLkIn = @ptrCast(@alignCast(payload.ptr));
+        const handle = self.handles.get(lk_in.fh) orelse return self.sendError(header, -9, response_buf);
+        const file = handle.file orelse return self.sendError(header, -9, response_buf);
+
+        var flock: c.struct_flock = lockToFlock(lk_in.lk);
+        if (c.fcntl(file.handle, c.F_SETLKW, &flock) == -1) {
+            return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+        }
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleInterrupt(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        _ = payload;
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleBmap(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseBmapIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const out_header_size = @sizeOf(FuseOutHeader);
+        const out_size = @sizeOf(FuseBmapOut);
+        if (response_buf.len < out_header_size + out_size) return VirtioFsError.IoError;
+        const in: *const FuseBmapIn = @ptrCast(@alignCast(payload.ptr));
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(out_header_size + out_size);
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+        const out: *FuseBmapOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
+        out.block = in.block;
+        return out_header_size + out_size;
+    }
+
+    fn handleIoctl(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) {
+            return self.sendError(header, -38, response_buf);
+        }
+        if (payload.len < @sizeOf(FuseIoctlIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const ioctl_in: *const FuseIoctlIn = @ptrCast(@alignCast(payload.ptr));
+        const handle = self.handles.get(ioctl_in.fh) orelse return self.sendError(header, -9, response_buf);
+        const file = handle.file orelse return self.sendError(header, -9, response_buf);
+        if (ioctl_in.flags != 0) {
+            return self.sendError(header, -38, response_buf);
+        }
+
+        const in_size: usize = ioctl_in.in_size;
+        const out_data_size: usize = ioctl_in.out_size;
+        const data_start = @sizeOf(FuseIoctlIn);
+        if (payload.len < data_start + in_size) {
+            return self.sendError(header, -22, response_buf);
+        }
+
+        const out_header_size = @sizeOf(FuseOutHeader);
+        const out_struct_size = @sizeOf(FuseIoctlOut);
+        if (response_buf.len < out_header_size + out_struct_size + out_data_size) return VirtioFsError.IoError;
+
+        const total_io = @max(in_size, out_data_size);
+        var io_buf = try self.allocator.alloc(u8, @max(@as(usize, 1), total_io));
+        defer self.allocator.free(io_buf);
+        if (in_size > 0) {
+            @memcpy(io_buf[0..in_size], payload[data_start .. data_start + in_size]);
+        }
+
+        const rc = c.ioctl(file.handle, ioctl_in.cmd, io_buf.ptr);
+        if (rc == -1) {
+            return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+        }
+
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(out_header_size + out_struct_size + out_data_size);
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+        const out: *FuseIoctlOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
+        out.result = @intCast(rc);
+        out.flags = 0;
+        out.in_iovs = 0;
+        out.out_iovs = 0;
+        if (out_data_size > 0) {
+            @memcpy(
+                response_buf[out_header_size + out_struct_size ..][0..out_data_size],
+                io_buf[0..out_data_size],
+            );
+        }
+        return out_header_size + out_struct_size + out_data_size;
+    }
+
+    fn handlePoll(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FusePollIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const poll_in: *const FusePollIn = @ptrCast(@alignCast(payload.ptr));
+        const out_header_size = @sizeOf(FuseOutHeader);
+        const out_size = @sizeOf(FusePollOut);
+        if (response_buf.len < out_header_size + out_size) return VirtioFsError.IoError;
+
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(out_header_size + out_size);
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+        const out: *FusePollOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
+        out.revents = poll_in.events;
+        out.padding = 0;
+        return out_header_size + out_size;
+    }
+
+    fn handleBatchForget(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseBatchForgetIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const batch_in: *const FuseBatchForgetIn = @ptrCast(@alignCast(payload.ptr));
+        const needed = @sizeOf(FuseBatchForgetIn) + batch_in.count * @sizeOf(FuseForgetOne);
+        if (payload.len < needed) {
+            return self.sendError(header, -22, response_buf);
+        }
+        var offset: usize = @sizeOf(FuseBatchForgetIn);
+        var i: u32 = 0;
+        while (i < batch_in.count) : (i += 1) {
+            const forget_one: *const FuseForgetOne = @ptrCast(@alignCast(payload[offset..].ptr));
+            if (forget_one.nodeid != 1) {
+                if (self.nodes.fetchRemove(forget_one.nodeid)) |kv| {
+                    self.allocator.free(kv.value.path);
+                }
+            }
+            offset += @sizeOf(FuseForgetOne);
+        }
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleLseek(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseLseekIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const lseek_in: *const FuseLseekIn = @ptrCast(@alignCast(payload.ptr));
+        const handle = self.handles.get(lseek_in.fh) orelse return self.sendError(header, -9, response_buf);
+        const file = handle.file orelse return self.sendError(header, -9, response_buf);
+
+        const out_header_size = @sizeOf(FuseOutHeader);
+        const out_size = @sizeOf(FuseLseekOut);
+        if (response_buf.len < out_header_size + out_size) return VirtioFsError.IoError;
+
+        const offset = switch (lseek_in.whence) {
+            0 => blk: {
+                std.posix.lseek_SET(file.handle, lseek_in.offset) catch return self.sendError(header, -5, response_buf);
+                break :blk lseek_in.offset;
+            },
+            1 => blk: {
+                std.posix.lseek_CUR(file.handle, @bitCast(@as(i64, @intCast(lseek_in.offset)))) catch return self.sendError(header, -5, response_buf);
+                break :blk std.posix.lseek_CUR_get(file.handle) catch return self.sendError(header, -5, response_buf);
+            },
+            2 => blk: {
+                std.posix.lseek_END(file.handle, @bitCast(@as(i64, @intCast(lseek_in.offset)))) catch return self.sendError(header, -5, response_buf);
+                break :blk std.posix.lseek_CUR_get(file.handle) catch return self.sendError(header, -5, response_buf);
+            },
+            else => return self.sendError(header, -22, response_buf),
+        };
+
+        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
+        out_header.len = @intCast(out_header_size + out_size);
+        out_header.@"error" = 0;
+        out_header.unique = header.unique;
+
+        const out: *FuseLseekOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
+        out.offset = offset;
+        return out_header_size + out_size;
+    }
+
+    fn handleCopyFileRange(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseCopyFileRangeIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const copy_in: *const FuseCopyFileRangeIn = @ptrCast(@alignCast(payload.ptr));
+        const in_handle = self.handles.get(copy_in.fh_in) orelse return self.sendError(header, -9, response_buf);
+        const out_handle = self.handles.get(copy_in.fh_out) orelse return self.sendError(header, -9, response_buf);
+        const in_file = in_handle.file orelse return self.sendError(header, -9, response_buf);
+        const out_file = out_handle.file orelse return self.sendError(header, -9, response_buf);
+
+        if (self.validateAccess(out_handle.node.path, .write)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+
+        const copied = std.posix.copy_file_range(
+            in_file.handle,
+            copy_in.off_in,
+            out_file.handle,
+            copy_in.off_out,
+            @intCast(copy_in.len),
+            @intCast(copy_in.flags),
+        ) catch return self.sendError(header, -5, response_buf);
+
+        return self.sendWriteOut(header, @intCast(copied), response_buf);
+    }
+
+    fn handleFallocate(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        if (payload.len < @sizeOf(FuseFallocateIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const fallocate_in: *const FuseFallocateIn = @ptrCast(@alignCast(payload.ptr));
+        const handle = self.handles.get(fallocate_in.fh) orelse return self.sendError(header, -9, response_buf);
+        const file = handle.file orelse return self.sendError(header, -9, response_buf);
+
+        if (self.validateAccess(handle.node.path, .write)) |errno| {
+            return self.sendError(header, errno, response_buf);
+        }
+
+        if (fallocate_in.mode != 0) {
+            return self.sendError(header, -38, response_buf);
+        }
+
+        const end_pos = fallocate_in.offset + fallocate_in.length;
+        file.setEndPos(end_pos) catch return self.sendError(header, -5, response_buf);
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleSetupmapping(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        _ = payload;
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleRemovemapping(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+    ) VirtioFsError!usize {
+        _ = payload;
+        return self.sendError(header, 0, response_buf);
+    }
+
+    fn handleDestroy(
+        _: *VirtioFsDevice,
         header: *const FuseInHeader,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = self;
         const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
         out_header.len = @sizeOf(FuseOutHeader);
         out_header.@"error" = 0;
@@ -1010,12 +2402,11 @@ pub const VirtioFsDevice = struct {
     }
 
     fn sendError(
-        self: *VirtioFsDevice,
+        _: *VirtioFsDevice,
         header: *const FuseInHeader,
         err: i32,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = self;
         if (response_buf.len < @sizeOf(FuseOutHeader)) {
             return VirtioFsError.IoError;
         }
@@ -1029,12 +2420,11 @@ pub const VirtioFsDevice = struct {
     }
 
     fn sendAttrOut(
-        self: *VirtioFsDevice,
+        _: *VirtioFsDevice,
         header: *const FuseInHeader,
         stat: *const std.fs.File.Stat,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = self;
         const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseAttrOut);
         if (response_buf.len < total_size) {
             return VirtioFsError.IoError;
@@ -1055,14 +2445,13 @@ pub const VirtioFsDevice = struct {
     }
 
     fn sendCreateOut(
-        self: *VirtioFsDevice,
+        _: *VirtioFsDevice,
         header: *const FuseInHeader,
         nodeid: u64,
         stat: *const std.fs.File.Stat,
         fh: u64,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = self;
         const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut) + @sizeOf(FuseOpenOut);
         if (response_buf.len < total_size) {
             return VirtioFsError.IoError;
@@ -1093,13 +2482,12 @@ pub const VirtioFsDevice = struct {
     }
 
     fn sendEntryOut(
-        self: *VirtioFsDevice,
+        _: *VirtioFsDevice,
         header: *const FuseInHeader,
         nodeid: u64,
         stat: *const std.fs.File.Stat,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = self;
         const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut);
         if (response_buf.len < total_size) {
             return VirtioFsError.IoError;
@@ -1123,12 +2511,11 @@ pub const VirtioFsDevice = struct {
     }
 
     fn sendOpenOut(
-        self: *VirtioFsDevice,
+        _: *VirtioFsDevice,
         header: *const FuseInHeader,
         fh: u64,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = self;
         const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut);
         if (response_buf.len < total_size) {
             return VirtioFsError.IoError;
@@ -1148,12 +2535,11 @@ pub const VirtioFsDevice = struct {
     }
 
     fn sendWriteOut(
-        self: *VirtioFsDevice,
+        _: *VirtioFsDevice,
         header: *const FuseInHeader,
         size: u32,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = self;
         const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseWriteOut);
         if (response_buf.len < total_size) {
             return VirtioFsError.IoError;
@@ -1238,7 +2624,114 @@ pub const VirtioFsDevice = struct {
 
         return fh;
     }
+
+    fn validateAccess(self: *VirtioFsDevice, path: []const u8, op: mounts.FileOperation) ?i32 {
+        const mount = self.mount_manager.getMountByTag(self.tag) orelse return -2;
+        if (!path_util.isWithinRoot(path, mount.host_path)) return -13;
+        const rel = if (path.len > mount.host_path.len) path[mount.host_path.len..] else "";
+        const rel_trim = std.mem.trimLeft(u8, rel, "/");
+        self.mount_manager.validateFileOperation(mount.tag, rel_trim, op) catch |err| {
+            return switch (err) {
+                mounts.MountError.PathTraversal => -1,
+                mounts.MountError.InvalidPath => -2,
+                mounts.MountError.WriteNotAllowed => -30, // EROFS
+                else => -13,
+            };
+        };
+        return null;
+    }
 };
+
+const O_ACCMODE: u32 = 0x3;
+const O_RDONLY: u32 = 0x0;
+const O_WRONLY: u32 = 0x1;
+const O_RDWR: u32 = 0x2;
+
+const ParseResult = struct {
+    slice: []const u8,
+    next: usize,
+};
+
+fn toZ(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf = try allocator.alloc(u8, s.len + 1);
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return buf;
+}
+
+fn parseCString(payload: []const u8, start: usize) ?ParseResult {
+    if (start >= payload.len) return null;
+    const end = std.mem.indexOfScalarPos(u8, payload, start, 0) orelse return null;
+    return .{ .slice = payload[start..end], .next = end + 1 };
+}
+
+fn containsPathSeparator(name: []const u8) bool {
+    for (name) |ch| {
+        if (ch == '/' or ch == '\\') return true;
+    }
+    return false;
+}
+
+fn errnoToFuse(err: std.posix.E) i32 {
+    if (@hasField(std.posix.E, "NOATTR") and err == .NOATTR) return -61;
+    if (@hasField(std.posix.E, "NODATA") and err == .NODATA) return -61;
+    return switch (err) {
+        .SUCCESS => 0,
+        .NOENT => -2,
+        .PERM, .ACCES => -13,
+        .EXIST => -17,
+        .NOTDIR => -20,
+        .ISDIR => -21,
+        .INVAL => -22,
+        .ROFS => -30,
+        .NOSPC => -28,
+        .XDEV => -18,
+        .BUSY => -16,
+        .AGAIN => -11,
+        .NOTTY => -25,
+        .OPNOTSUPP => -95,
+        .NAMETOOLONG => -36,
+        else => -5,
+    };
+}
+
+fn lockToFlock(lock: FuseFileLock) c.struct_flock {
+    const max_end = std.math.maxInt(u64);
+    const len: u64 = if (lock.end == max_end or lock.end < lock.start)
+        0
+    else
+        lock.end - lock.start + 1;
+    const l_type: i16 = switch (lock.type) {
+        0 => c.F_RDLCK,
+        1 => c.F_WRLCK,
+        2 => c.F_UNLCK,
+        else => c.F_UNLCK,
+    };
+    return .{
+        .l_type = l_type,
+        .l_whence = c.SEEK_SET,
+        .l_start = @bitCast(@as(i64, @intCast(lock.start))),
+        .l_len = @bitCast(@as(i64, @intCast(len))),
+        .l_pid = 0,
+    };
+}
+
+fn flockToLock(flock: c.struct_flock) FuseFileLock {
+    const start: u64 = @intCast(@as(u64, @bitCast(flock.l_start)));
+    const len: u64 = @intCast(@as(u64, @bitCast(flock.l_len)));
+    const end: u64 = if (len == 0) std.math.maxInt(u64) else start + len - 1;
+    const typ: u32 = switch (flock.l_type) {
+        c.F_RDLCK => 0,
+        c.F_WRLCK => 1,
+        else => 2,
+    };
+    return .{
+        .start = start,
+        .end = end,
+        .type = typ,
+        .pid = @intCast(flock.l_pid),
+    };
+}
 
 fn statToFuseAttr(nodeid: u64, stat: *const std.fs.File.Stat) FuseAttr {
     var mode: u32 = 0o644;
@@ -1264,7 +2757,7 @@ fn statToFuseAttr(nodeid: u64, stat: *const std.fs.File.Stat) FuseAttr {
         .gid = 0,
         .rdev = 0,
         .blksize = 4096,
-        .padding = 0,
+        .flags = 0,
     };
 }
 
@@ -1308,7 +2801,7 @@ test "virtio_fs: handleInit" {
     var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
-    var request: [@sizeOf(FuseInHeader) + @sizeOf(FuseInitIn)]u8 = undefined;
+    var request: [@sizeOf(FuseInHeader) + @sizeOf(FuseInitIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
     const header: *FuseInHeader = @ptrCast(@alignCast(&request));
     header.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseInitIn),
@@ -1318,6 +2811,7 @@ test "virtio_fs: handleInit" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
 
@@ -1327,6 +2821,8 @@ test "virtio_fs: handleInit" {
         .minor = 31,
         .max_readahead = 131072,
         .flags = 0,
+        .flags2 = 0,
+        .unused = std.mem.zeroes([11]u32),
     };
 
     var response: [256]u8 = undefined;
@@ -1359,6 +2855,7 @@ test "virtio_fs: handleInit accepts unaligned request" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     @memcpy(request[0..@sizeOf(FuseInHeader)], std.mem.asBytes(&header));
@@ -1368,6 +2865,8 @@ test "virtio_fs: handleInit accepts unaligned request" {
         .minor = 31,
         .max_readahead = 131072,
         .flags = 0,
+        .flags2 = 0,
+        .unused = std.mem.zeroes([11]u32),
     };
     @memcpy(
         request[@sizeOf(FuseInHeader)..][0..@sizeOf(FuseInitIn)],
@@ -1395,17 +2894,26 @@ test "virtio_fs: lookup open read write release roundtrip" {
         try f.writeAll("hi");
     }
 
-    const abs = try tmp.dir.realpathAlloc(allocator, "file.txt");
-    defer allocator.free(abs);
-
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
 
     var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
     // LOOKUP
-    const name_len = abs.len;
+    const name = "file.txt";
+    const name_len = name.len;
     const lookup_len = @sizeOf(FuseInHeader) + name_len + 1;
     const lookup_req = try allocator.alloc(u8, lookup_len);
     defer allocator.free(lookup_req);
@@ -1415,13 +2923,14 @@ test "virtio_fs: lookup open read write release roundtrip" {
         .len = @intCast(lookup_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_LOOKUP),
         .unique = 11,
-        .nodeid = 0,
+        .nodeid = 1,
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
-    @memcpy(lookup_req[@sizeOf(FuseInHeader)..][0..name_len], abs);
+    @memcpy(lookup_req[@sizeOf(FuseInHeader)..][0..name_len], name);
     lookup_req[@sizeOf(FuseInHeader) + name_len] = 0;
 
     var lookup_resp: [512]u8 = undefined;
@@ -1436,18 +2945,21 @@ test "virtio_fs: lookup open read write release roundtrip" {
     try std.testing.expectEqual(@as(u64, 2), entry_out.attr.size);
 
     // OPEN
-    var open_req: [@sizeOf(FuseInHeader)]u8 = undefined;
+    var open_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
     const open_hdr: *FuseInHeader = @ptrCast(@alignCast(&open_req));
     open_hdr.* = .{
-        .len = @sizeOf(FuseInHeader),
+        .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
         .unique = 12,
         .nodeid = nodeid,
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
+    const open_in: *FuseOpenIn = @ptrCast(@alignCast(open_req[@sizeOf(FuseInHeader)..]));
+    open_in.* = .{ .flags = O_RDWR, .open_flags = 0 };
     var open_resp: [256]u8 = undefined;
     const open_resp_len = try device.handleRequest(&open_req, &open_resp);
     try std.testing.expect(open_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut));
@@ -1468,6 +2980,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     const write_in: *FuseWriteIn = @ptrCast(@alignCast(write_req[@sizeOf(FuseInHeader)..]));
@@ -1480,7 +2993,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
         .flags = 0,
         .padding = 0,
     };
-    @memcpy(write_req[@sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn)..][0..write_data.len], write_data);
+    @memcpy(write_req[@sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) ..][0..write_data.len], write_data);
     var write_resp: [256]u8 = undefined;
     const write_resp_len = try device.handleRequest(write_req, &write_resp);
     try std.testing.expect(write_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseWriteOut));
@@ -1489,7 +3002,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
 
     // READ back "abc"
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
-    var read_req: [read_len]u8 = undefined;
+    var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
     const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
     read_hdr.* = .{
         .len = read_len,
@@ -1499,6 +3012,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
@@ -1521,7 +3035,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
 
     // RELEASE
     const release_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReleaseIn);
-    var release_req: [release_len]u8 = undefined;
+    var release_req: [release_len]u8 align(@alignOf(FuseInHeader)) = undefined;
     const release_hdr: *FuseInHeader = @ptrCast(@alignCast(&release_req));
     release_hdr.* = .{
         .len = release_len,
@@ -1531,6 +3045,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     const release_in: *FuseReleaseIn = @ptrCast(@alignCast(release_req[@sizeOf(FuseInHeader)..]));
@@ -1555,8 +3070,22 @@ test "virtio_fs: lookup open read write release roundtrip" {
 test "virtio_fs: lookup rejects traversal" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
 
     var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
@@ -1571,10 +3100,11 @@ test "virtio_fs: lookup rejects traversal" {
         .len = @intCast(req_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_LOOKUP),
         .unique = 21,
-        .nodeid = 0,
+        .nodeid = 1,
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     @memcpy(req[@sizeOf(FuseInHeader)..][0..name.len], name);
@@ -1606,6 +3136,7 @@ test "virtio_fs: read rejects short payload" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
 
@@ -1625,24 +3156,83 @@ test "virtio_fs: handleOpen returns not found for missing node" {
     var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
 
-    var req: [@sizeOf(FuseInHeader)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
     const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
     hdr.* = .{
-        .len = @sizeOf(FuseInHeader),
+        .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
         .unique = 32,
         .nodeid = 999,
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
+    const open_in: *FuseOpenIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    open_in.* = .{ .flags = O_RDONLY, .open_flags = 0 };
 
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
     const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
     try std.testing.expectEqual(@as(i32, -2), out.@"error");
+}
+
+test "virtio_fs: handleOpen rejects write on read-only mount" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile("file.txt", .{});
+        defer f.close();
+        try f.writeAll("x");
+    }
+
+    const abs = try tmp.dir.realpathAlloc(allocator, "file.txt");
+    defer allocator.free(abs);
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_only,
+    });
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    const nodeid = try device.allocateNode(abs, false);
+
+    var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    hdr.* = .{
+        .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
+        .unique = 33,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const open_in: *FuseOpenIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    open_in.* = .{ .flags = O_RDWR, .open_flags = 0 };
+
+    var resp: [128]u8 = undefined;
+    const resp_len = try device.handleRequest(&req, &resp);
+    try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
+    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    try std.testing.expectEqual(@as(i32, -30), out.@"error");
 }
 
 test "virtio_fs: handleRead rejects invalid handle" {
@@ -1665,6 +3255,7 @@ test "virtio_fs: handleRead rejects invalid handle" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     const read_in: *FuseReadIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
@@ -1702,6 +3293,17 @@ test "virtio_fs: handleRead errors on short response buffer" {
 
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
 
     var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
@@ -1711,7 +3313,7 @@ test "virtio_fs: handleRead errors on short response buffer" {
     const fh = try device.allocateFileHandle(nodeid, file);
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
-    var read_req: [read_len]u8 = undefined;
+    var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
     const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
     read_hdr.* = .{
         .len = read_len,
@@ -1721,6 +3323,7 @@ test "virtio_fs: handleRead errors on short response buffer" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
@@ -1757,6 +3360,7 @@ test "virtio_fs: handleWrite rejects short payload" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
 
@@ -1784,6 +3388,17 @@ test "virtio_fs: handleRead maps io error on write-only file" {
 
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
 
     var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
@@ -1793,7 +3408,7 @@ test "virtio_fs: handleRead maps io error on write-only file" {
     const fh = try device.allocateFileHandle(nodeid, file);
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
-    var read_req: [read_len]u8 = undefined;
+    var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
     const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
     read_hdr.* = .{
         .len = read_len,
@@ -1803,6 +3418,7 @@ test "virtio_fs: handleRead maps io error on write-only file" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
@@ -1842,6 +3458,17 @@ test "virtio_fs: handleWrite maps io error on read-only file" {
 
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
 
     var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
@@ -1864,6 +3491,7 @@ test "virtio_fs: handleWrite maps io error on read-only file" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     const write_in: *FuseWriteIn = @ptrCast(@alignCast(write_req[@sizeOf(FuseInHeader)..]));
@@ -1877,7 +3505,7 @@ test "virtio_fs: handleWrite maps io error on read-only file" {
         .padding = 0,
     };
     @memcpy(
-        write_req[@sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn)..][0..write_data.len],
+        write_req[@sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) ..][0..write_data.len],
         write_data,
     );
 
@@ -1907,6 +3535,17 @@ test "virtio_fs: handleOpendir rejects non-dir node" {
 
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
 
     var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
@@ -1923,6 +3562,7 @@ test "virtio_fs: handleOpendir rejects non-dir node" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
 
@@ -1952,6 +3592,7 @@ test "virtio_fs: handleReleasedir rejects short payload" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
 
@@ -1998,6 +3639,7 @@ test "virtio_fs: handleRelease closes file handle" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     const release_in: *FuseReleaseIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
@@ -2033,6 +3675,7 @@ test "virtio_fs: handleReaddir rejects short payload" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
 
@@ -2066,6 +3709,17 @@ test "virtio_fs: handleReaddir returns entries" {
 
     var mount_manager = mounts.MountManager.init(allocator);
     defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
 
     var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
     defer device.deinit();
@@ -2073,7 +3727,7 @@ test "virtio_fs: handleReaddir returns entries" {
     const nodeid = try device.allocateNode(abs, true);
 
     // OPENDIR
-    var open_req: [@sizeOf(FuseInHeader)]u8 = undefined;
+    var open_req: [@sizeOf(FuseInHeader)]u8 align(@alignOf(FuseInHeader)) = undefined;
     const open_hdr: *FuseInHeader = @ptrCast(@alignCast(&open_req));
     open_hdr.* = .{
         .len = @sizeOf(FuseInHeader),
@@ -2083,6 +3737,7 @@ test "virtio_fs: handleReaddir returns entries" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
 
@@ -2094,7 +3749,7 @@ test "virtio_fs: handleReaddir returns entries" {
 
     // READDIR
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
-    var read_req: [read_len]u8 = undefined;
+    var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
     const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
     read_hdr.* = .{
         .len = read_len,
@@ -2104,6 +3759,7 @@ test "virtio_fs: handleReaddir returns entries" {
         .uid = 0,
         .gid = 0,
         .pid = 0,
+        .total_extlen = 0,
         .padding = 0,
     };
     const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
@@ -2143,4 +3799,377 @@ test "virtio_fs: handleReaddir returns entries" {
     }
 
     try std.testing.expect(found_a and found_b);
+}
+
+test "virtio_fs: xattr roundtrip" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile("file.txt", .{});
+        defer f.close();
+        try f.writeAll("x");
+    }
+
+    const abs = try tmp.dir.realpathAlloc(allocator, "file.txt");
+    defer allocator.free(abs);
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    const nodeid = try device.allocateNode(abs, false);
+
+    const name = "user.test";
+    const value = "value";
+
+    // SETXATTR
+    const set_len = @sizeOf(FuseInHeader) + @sizeOf(FuseSetxattrIn) + name.len + 1 + value.len;
+    var set_req = try allocator.alloc(u8, set_len);
+    defer allocator.free(set_req);
+    const set_hdr: *FuseInHeader = @ptrCast(@alignCast(set_req.ptr));
+    set_hdr.* = .{
+        .len = @intCast(set_len),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_SETXATTR),
+        .unique = 301,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const set_in: *FuseSetxattrIn = @ptrCast(@alignCast(set_req[@sizeOf(FuseInHeader)..]));
+    set_in.* = .{
+        .size = @intCast(value.len),
+        .flags = 0,
+    };
+    var pos: usize = @sizeOf(FuseInHeader) + @sizeOf(FuseSetxattrIn);
+    @memcpy(set_req[pos..][0..name.len], name);
+    pos += name.len;
+    set_req[pos] = 0;
+    pos += 1;
+    @memcpy(set_req[pos..][0..value.len], value);
+    var set_resp: [256]u8 = undefined;
+    const set_len_resp = try device.handleRequest(set_req, &set_resp);
+    const set_out: *const FuseOutHeader = @ptrCast(@alignCast(&set_resp));
+    if (set_out.@"error" != 0) {
+        if (set_out.@"error" == -95 or set_out.@"error" == -13) return error.SkipZigTest;
+        try std.testing.expectEqual(@as(i32, 0), set_out.@"error");
+    }
+    _ = set_len_resp;
+
+    // GETXATTR size=0
+    const get0_len = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn) + name.len + 1;
+    var get0_req = try allocator.alloc(u8, get0_len);
+    defer allocator.free(get0_req);
+    const get0_hdr: *FuseInHeader = @ptrCast(@alignCast(get0_req.ptr));
+    get0_hdr.* = .{
+        .len = @intCast(get0_len),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_GETXATTR),
+        .unique = 302,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const get0_in: *FuseGetxattrIn = @ptrCast(@alignCast(get0_req[@sizeOf(FuseInHeader)..]));
+    get0_in.* = .{ .size = 0, .padding = 0 };
+    pos = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn);
+    @memcpy(get0_req[pos..][0..name.len], name);
+    get0_req[pos + name.len] = 0;
+    var get0_resp: [256]u8 = undefined;
+    const get0_resp_len = try device.handleRequest(get0_req, &get0_resp);
+    const get0_out: *const FuseOutHeader = @ptrCast(@alignCast(&get0_resp));
+    try std.testing.expectEqual(@as(i32, 0), get0_out.@"error");
+    const get0_payload: *const FuseGetxattrOut = @ptrCast(@alignCast(get0_resp[@sizeOf(FuseOutHeader)..]));
+    const value_len: usize = @intCast(get0_payload.size);
+    try std.testing.expectEqual(value.len, value_len);
+    _ = get0_resp_len;
+
+    // GETXATTR with buffer
+    const get_len = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn) + name.len + 1;
+    var get_req = try allocator.alloc(u8, get_len);
+    defer allocator.free(get_req);
+    const get_hdr: *FuseInHeader = @ptrCast(@alignCast(get_req.ptr));
+    get_hdr.* = .{
+        .len = @intCast(get_len),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_GETXATTR),
+        .unique = 303,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const get_in: *FuseGetxattrIn = @ptrCast(@alignCast(get_req[@sizeOf(FuseInHeader)..]));
+    get_in.* = .{ .size = @intCast(value.len), .padding = 0 };
+    pos = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn);
+    @memcpy(get_req[pos..][0..name.len], name);
+    get_req[pos + name.len] = 0;
+    var get_resp: [256]u8 = undefined;
+    const get_resp_len = try device.handleRequest(get_req, &get_resp);
+    const get_out: *const FuseOutHeader = @ptrCast(@alignCast(&get_resp));
+    try std.testing.expectEqual(@as(i32, 0), get_out.@"error");
+    try std.testing.expectEqualStrings(
+        value,
+        get_resp[@sizeOf(FuseOutHeader)..][0..value.len],
+    );
+    _ = get_resp_len;
+
+    // LISTXATTR size=0
+    const list0_len = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn);
+    var list0_req: [list0_len]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const list0_hdr: *FuseInHeader = @ptrCast(@alignCast(&list0_req));
+    list0_hdr.* = .{
+        .len = list0_len,
+        .opcode = @intFromEnum(FuseOpcode.FUSE_LISTXATTR),
+        .unique = 304,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const list0_in: *FuseGetxattrIn = @ptrCast(@alignCast(list0_req[@sizeOf(FuseInHeader)..]));
+    list0_in.* = .{ .size = 0, .padding = 0 };
+    var list0_resp: [256]u8 = undefined;
+    const list0_resp_len = try device.handleRequest(&list0_req, &list0_resp);
+    const list0_out: *const FuseOutHeader = @ptrCast(@alignCast(&list0_resp));
+    try std.testing.expectEqual(@as(i32, 0), list0_out.@"error");
+    const list0_payload: *const FuseGetxattrOut = @ptrCast(@alignCast(list0_resp[@sizeOf(FuseOutHeader)..]));
+    const list_len: usize = @intCast(list0_payload.size);
+    _ = list0_resp_len;
+
+    // LISTXATTR with buffer
+    var list_req: [list0_len]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const list_hdr: *FuseInHeader = @ptrCast(@alignCast(&list_req));
+    list_hdr.* = .{
+        .len = list0_len,
+        .opcode = @intFromEnum(FuseOpcode.FUSE_LISTXATTR),
+        .unique = 305,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const list_in: *FuseGetxattrIn = @ptrCast(@alignCast(list_req[@sizeOf(FuseInHeader)..]));
+    list_in.* = .{ .size = @intCast(list_len), .padding = 0 };
+    var list_resp: [256]u8 = undefined;
+    const list_resp_len = try device.handleRequest(&list_req, &list_resp);
+    const list_out: *const FuseOutHeader = @ptrCast(@alignCast(&list_resp));
+    try std.testing.expectEqual(@as(i32, 0), list_out.@"error");
+    const list_data = list_resp[@sizeOf(FuseOutHeader)..][0..list_len];
+    try std.testing.expect(std.mem.indexOf(u8, list_data, name) != null);
+    _ = list_resp_len;
+
+    // REMOVEXATTR
+    const rem_len = @sizeOf(FuseInHeader) + name.len + 1;
+    var rem_req = try allocator.alloc(u8, rem_len);
+    defer allocator.free(rem_req);
+    const rem_hdr: *FuseInHeader = @ptrCast(@alignCast(rem_req.ptr));
+    rem_hdr.* = .{
+        .len = @intCast(rem_len),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_REMOVEXATTR),
+        .unique = 306,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    pos = @sizeOf(FuseInHeader);
+    @memcpy(rem_req[pos..][0..name.len], name);
+    rem_req[pos + name.len] = 0;
+    var rem_resp: [256]u8 = undefined;
+    const rem_resp_len = try device.handleRequest(rem_req, &rem_resp);
+    const rem_out: *const FuseOutHeader = @ptrCast(@alignCast(&rem_resp));
+    try std.testing.expectEqual(@as(i32, 0), rem_out.@"error");
+    _ = rem_resp_len;
+}
+
+test "virtio_fs: fcntl locks" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile("file.txt", .{});
+        defer f.close();
+        try f.writeAll("x");
+    }
+
+    const abs = try tmp.dir.realpathAlloc(allocator, "file.txt");
+    defer allocator.free(abs);
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    const nodeid = try device.allocateNode(abs, false);
+    const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
+    const fh = try device.allocateFileHandle(nodeid, file);
+
+    const lk_in = FuseLkIn{
+        .fh = fh,
+        .owner = 0,
+        .lk = .{
+            .start = 0,
+            .end = std.math.maxInt(u64),
+            .type = 1,
+            .pid = 0,
+        },
+        .lk_flags = 0,
+        .padding = 0,
+    };
+    var set_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseLkIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const set_hdr: *FuseInHeader = @ptrCast(@alignCast(&set_req));
+    set_hdr.* = .{
+        .len = @sizeOf(FuseInHeader) + @sizeOf(FuseLkIn),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_SETLK),
+        .unique = 401,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    @memcpy(set_req[@sizeOf(FuseInHeader)..][0..@sizeOf(FuseLkIn)], std.mem.asBytes(&lk_in));
+    var set_resp: [128]u8 = undefined;
+    const set_resp_len = try device.handleRequest(&set_req, &set_resp);
+    const set_out: *const FuseOutHeader = @ptrCast(@alignCast(&set_resp));
+    if (set_out.@"error" != 0) return error.SkipZigTest;
+    _ = set_resp_len;
+
+    var get_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseLkIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const get_hdr: *FuseInHeader = @ptrCast(@alignCast(&get_req));
+    get_hdr.* = .{
+        .len = @sizeOf(FuseInHeader) + @sizeOf(FuseLkIn),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_GETLK),
+        .unique = 402,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    @memcpy(get_req[@sizeOf(FuseInHeader)..][0..@sizeOf(FuseLkIn)], std.mem.asBytes(&lk_in));
+    var get_resp: [256]u8 = undefined;
+    const get_resp_len = try device.handleRequest(&get_req, &get_resp);
+    const get_out: *const FuseOutHeader = @ptrCast(@alignCast(&get_resp));
+    try std.testing.expectEqual(@as(i32, 0), get_out.@"error");
+    _ = get_resp_len;
+}
+
+test "virtio_fs: ioctl with buffers" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile("file.txt", .{});
+        defer f.close();
+        try f.writeAll("x");
+    }
+
+    const abs = try tmp.dir.realpathAlloc(allocator, "file.txt");
+    defer allocator.free(abs);
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    const nodeid = try device.allocateNode(abs, false);
+    const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
+    const fh = try device.allocateFileHandle(nodeid, file);
+
+    const data = [_]u8{0xAB};
+    const req_len = @sizeOf(FuseInHeader) + @sizeOf(FuseIoctlIn) + data.len;
+    var req = try allocator.alloc(u8, req_len);
+    defer allocator.free(req);
+    const hdr: *FuseInHeader = @ptrCast(@alignCast(req.ptr));
+    hdr.* = .{
+        .len = @intCast(req_len),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_IOCTL),
+        .unique = 501,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const ioctl_in: *FuseIoctlIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    ioctl_in.* = .{
+        .fh = fh,
+        .flags = 0,
+        .cmd = 0,
+        .arg = 0,
+        .in_size = data.len,
+        .out_size = data.len,
+    };
+    @memcpy(
+        req[@sizeOf(FuseInHeader) + @sizeOf(FuseIoctlIn) ..][0..data.len],
+        data[0..],
+    );
+
+    var resp: [256]u8 = undefined;
+    const resp_len = try device.handleRequest(req, &resp);
+    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    if (out.@"error" != 0 and out.@"error" != -25) {
+        try std.testing.expectEqual(@as(i32, 0), out.@"error");
+    }
+    _ = resp_len;
 }
