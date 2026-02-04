@@ -147,16 +147,16 @@ pub const MountManager = struct {
             }
         }
 
-        // Validate host path is within allowed roots when strict mode is on.
-        if (self.strict_validation) {
-            if (!self.isPathWithinAllowedRoots(config.host_path)) {
-                return MountError.PathOutsideAllowedRoots;
-            }
-        }
-
         // Check for path traversal (applies even if strict validation is off).
         if (path_util.containsTraversal(config.host_path)) {
             return MountError.PathTraversal;
+        }
+
+        // Validate host path is within allowed roots when strict mode is on.
+        if (self.strict_validation) {
+            if (!try self.isPathWithinAllowedRootsSecure(config.host_path)) {
+                return MountError.PathOutsideAllowedRoots;
+            }
         }
 
         // Clone strings for ownership
@@ -195,6 +195,43 @@ pub const MountManager = struct {
         return false;
     }
 
+    fn isPathWithinAllowedRootsSecure(self: *MountManager, path: []const u8) MountError!bool {
+        if (self.allowed_roots.items.len == 0) return false;
+
+        for (self.allowed_roots.items) |root| {
+            if (!path_util.isWithinRoot(path, root)) continue;
+
+            const validated = path_util.validateSafePath(self.allocator, path, .{
+                .allowed_root = root,
+                .min_depth = 0,
+                .follow_symlinks = false,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return MountError.OutOfMemory,
+                else => return false,
+            };
+            self.allocator.free(validated);
+            return true;
+        }
+        return false;
+    }
+
+    fn validateMountPath(self: *const MountManager, mount: *const MountConfig, path: []const u8) MountError!void {
+        if (!self.strict_validation) return;
+
+        const validated = path_util.validateSafePath(self.allocator, path, .{
+            .allowed_root = mount.host_path,
+            .min_depth = 0,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.PathTraversal => return MountError.PathTraversal,
+            error.PathNotWithinRoot, error.SymlinkEscape => return MountError.PathOutsideAllowedRoots,
+            error.InvalidPath, error.AccessDenied => return MountError.InvalidPath,
+            error.OutOfMemory => return MountError.OutOfMemory,
+            else => return MountError.InvalidPath,
+        };
+        self.allocator.free(validated);
+    }
+
     /// Checks if a path can be accessed with the given write permission.
     /// Returns false if no mount owns the path.
     pub fn isPathAccessAllowed(
@@ -203,8 +240,9 @@ pub const MountManager = struct {
         write_access: bool,
     ) MountError!bool {
         // Find which mount this path belongs to
-        for (self.mounts.items) |mount| {
+        for (self.mounts.items) |*mount| {
             if (path_util.isWithinRoot(path, mount.host_path)) {
+                try self.validateMountPath(mount, path);
                 // Check write permission
                 if (write_access and mount.access == .read_only) {
                     return MountError.WriteNotAllowed;
@@ -247,6 +285,14 @@ pub const MountManager = struct {
         // Check for path traversal in relative path
         if (path_util.containsTraversal(relative_path)) {
             return MountError.PathTraversal;
+        }
+
+        if (relative_path.len == 0) {
+            try self.validateMountPath(mount, mount.host_path);
+        } else {
+            const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ mount.host_path, relative_path });
+            defer self.allocator.free(full_path);
+            try self.validateMountPath(mount, full_path);
         }
 
         // Check write permission for write operations
@@ -380,6 +426,34 @@ test "mounts: strict_validation blocks mounts when no roots" {
     }));
 }
 
+test "mounts: strict_validation rejects symlink escape" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root");
+    try tmp.dir.makePath("outside");
+    try tmp.dir.symLink("../outside", "root/link", .{});
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+    const host_path = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "link" });
+    defer allocator.free(host_path);
+
+    var manager = MountManager.init(allocator);
+    defer manager.deinit();
+    try manager.addAllowedRoot(root_path);
+
+    try std.testing.expectError(MountError.PathOutsideAllowedRoots, manager.addMount(.{
+        .tag = "data",
+        .host_path = host_path,
+        .guest_path = "/mnt/data",
+    }));
+}
+
 test "mounts: non-strict allows mounts outside roots" {
     const allocator = std.testing.allocator;
 
@@ -407,6 +481,36 @@ test "mounts: validateFileOperation rejects unknown tag" {
     );
 }
 
+test "mounts: validateFileOperation rejects symlink escape" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root");
+    try tmp.dir.makePath("outside");
+    try tmp.dir.symLink("../outside", "root/link", .{});
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+
+    var manager = MountManager.init(allocator);
+    defer manager.deinit();
+    try manager.addAllowedRoot(root_path);
+    try manager.addMount(.{
+        .tag = "data",
+        .host_path = root_path,
+        .guest_path = "/mnt/data",
+    });
+
+    try std.testing.expectError(
+        MountError.PathOutsideAllowedRoots,
+        manager.validateFileOperation("data", "link/secret.txt", .read),
+    );
+}
+
 test "mounts: getMountByGuestPath finds entry" {
     const allocator = std.testing.allocator;
 
@@ -427,16 +531,26 @@ test "mounts: getMountByGuestPath finds entry" {
 test "mounts: MountManager basic operations" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root/data");
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+    const data_path = try tmp.dir.realpathAlloc(allocator, "root/data");
+    defer allocator.free(data_path);
+
     var manager = MountManager.init(allocator);
     defer manager.deinit();
 
     // Add allowed root
-    try manager.addAllowedRoot("/home/user");
+    try manager.addAllowedRoot(root_path);
 
     // Add a mount
     try manager.addMount(.{
         .tag = "data",
-        .host_path = "/home/user/data",
+        .host_path = data_path,
         .guest_path = "/mnt/data",
         .access = .read_only,
     });
@@ -444,21 +558,32 @@ test "mounts: MountManager basic operations" {
     try std.testing.expectEqual(@as(usize, 1), manager.mountCount());
 
     const mount = manager.getMountByTag("data").?;
-    try std.testing.expectEqualStrings("/home/user/data", mount.host_path);
+    try std.testing.expectEqualStrings(data_path, mount.host_path);
 }
 
 test "mounts: MountManager rejects paths outside allowed roots" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root");
+    try tmp.dir.makePath("outside");
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+    const outside_path = try tmp.dir.realpathAlloc(allocator, "outside");
+    defer allocator.free(outside_path);
+
     var manager = MountManager.init(allocator);
     defer manager.deinit();
 
-    try manager.addAllowedRoot("/home/user");
+    try manager.addAllowedRoot(root_path);
 
     // Should fail - path outside allowed roots
     try std.testing.expectError(MountError.PathOutsideAllowedRoots, manager.addMount(.{
         .tag = "evil",
-        .host_path = "/etc/passwd",
+        .host_path = outside_path,
         .guest_path = "/mnt/passwd",
     }));
 }
@@ -466,15 +591,27 @@ test "mounts: MountManager rejects paths outside allowed roots" {
 test "mounts: MountManager rejects path traversal" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root");
+    try tmp.dir.makePath("outside");
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+
+    const traversed_path = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "..", "outside" });
+    defer allocator.free(traversed_path);
+
     var manager = MountManager.init(allocator);
     defer manager.deinit();
 
-    try manager.addAllowedRoot("/home/user");
+    try manager.addAllowedRoot(root_path);
 
     // Should fail - path traversal
     try std.testing.expectError(MountError.PathTraversal, manager.addMount(.{
         .tag = "evil",
-        .host_path = "/home/user/../../../etc",
+        .host_path = traversed_path,
         .guest_path = "/mnt/etc",
     }));
 }
@@ -482,21 +619,34 @@ test "mounts: MountManager rejects path traversal" {
 test "mounts: MountManager rejects duplicate tags" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root/data1");
+    try tmp.dir.makePath("root/data2");
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+    const data1_path = try tmp.dir.realpathAlloc(allocator, "root/data1");
+    defer allocator.free(data1_path);
+    const data2_path = try tmp.dir.realpathAlloc(allocator, "root/data2");
+    defer allocator.free(data2_path);
+
     var manager = MountManager.init(allocator);
     defer manager.deinit();
 
-    try manager.addAllowedRoot("/home/user");
+    try manager.addAllowedRoot(root_path);
 
     try manager.addMount(.{
         .tag = "data",
-        .host_path = "/home/user/data1",
+        .host_path = data1_path,
         .guest_path = "/mnt/data1",
     });
 
     // Should fail - duplicate tag
     try std.testing.expectError(MountError.DuplicateTag, manager.addMount(.{
         .tag = "data",
-        .host_path = "/home/user/data2",
+        .host_path = data2_path,
         .guest_path = "/mnt/data2",
     }));
 }
@@ -504,14 +654,24 @@ test "mounts: MountManager rejects duplicate tags" {
 test "mounts: validateFileOperation write to read-only" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root/readonly");
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+    const readonly_path = try tmp.dir.realpathAlloc(allocator, "root/readonly");
+    defer allocator.free(readonly_path);
+
     var manager = MountManager.init(allocator);
     defer manager.deinit();
 
-    try manager.addAllowedRoot("/home/user");
+    try manager.addAllowedRoot(root_path);
 
     try manager.addMount(.{
         .tag = "readonly",
-        .host_path = "/home/user/readonly",
+        .host_path = readonly_path,
         .guest_path = "/mnt/ro",
         .access = .read_only,
     });
@@ -539,36 +699,95 @@ test "mounts: FileOperation isWrite" {
 test "mounts: isPathAccessAllowed returns false for unknown path" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root/data");
+    try tmp.dir.makePath("root/other");
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+    const data_path = try tmp.dir.realpathAlloc(allocator, "root/data");
+    defer allocator.free(data_path);
+
+    const unknown_path = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "other", "file.txt" });
+    defer allocator.free(unknown_path);
+
     var manager = MountManager.init(allocator);
     defer manager.deinit();
 
-    try manager.addAllowedRoot("/home/user");
+    try manager.addAllowedRoot(root_path);
     try manager.addMount(.{
         .tag = "data",
-        .host_path = "/home/user/data",
+        .host_path = data_path,
         .guest_path = "/mnt/data",
         .access = .read_only,
     });
 
-    try std.testing.expectEqual(false, try manager.isPathAccessAllowed("/other/path", false));
+    try std.testing.expectEqual(false, try manager.isPathAccessAllowed(unknown_path, false));
 }
 
 test "mounts: isPathAccessAllowed rejects write on read-only mount" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root/data");
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+    const data_path = try tmp.dir.realpathAlloc(allocator, "root/data");
+    defer allocator.free(data_path);
+    const file_path = try std.fs.path.join(allocator, &[_][]const u8{ data_path, "file.txt" });
+    defer allocator.free(file_path);
+
     var manager = MountManager.init(allocator);
     defer manager.deinit();
 
-    try manager.addAllowedRoot("/home/user");
+    try manager.addAllowedRoot(root_path);
     try manager.addMount(.{
         .tag = "data",
-        .host_path = "/home/user/data",
+        .host_path = data_path,
         .guest_path = "/mnt/data",
         .access = .read_only,
     });
 
     try std.testing.expectError(
         MountError.WriteNotAllowed,
-        manager.isPathAccessAllowed("/home/user/data/file.txt", true),
+        manager.isPathAccessAllowed(file_path, true),
+    );
+}
+
+test "mounts: isPathAccessAllowed rejects symlink escape" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("root");
+    try tmp.dir.makePath("outside");
+    try tmp.dir.symLink("../outside", "root/link", .{});
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, "root");
+    defer allocator.free(root_path);
+
+    var manager = MountManager.init(allocator);
+    defer manager.deinit();
+    try manager.addAllowedRoot(root_path);
+    try manager.addMount(.{
+        .tag = "data",
+        .host_path = root_path,
+        .guest_path = "/mnt/data",
+    });
+
+    const escaped = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "link", "secret.txt" });
+    defer allocator.free(escaped);
+
+    try std.testing.expectError(
+        MountError.PathOutsideAllowedRoots,
+        manager.isPathAccessAllowed(escaped, false),
     );
 }
