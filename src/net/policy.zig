@@ -275,9 +275,12 @@ pub const NetworkPolicy = struct {
         }
 
         // Check resolved IPs from DNS (cache only applies in allowlist mode)
-        const now = std.time.timestamp();
+        @constCast(self).cleanupExpiredEntries();
         for (self.resolved_ips.items) |resolved| {
-          if (resolved.expires_at > now and std.mem.eql(u8, &resolved.address, &ip)) {
+          if (!std.mem.eql(u8, &resolved.address, &ip)) continue;
+          if (port) |p| {
+            if (self.isDomainAllowedOnPort(resolved.domain, p)) return true;
+          } else if (self.isDomainAllowed(resolved.domain)) {
             return true;
           }
         }
@@ -589,6 +592,7 @@ test "policy: NetworkPolicy resolved IP cache and cleanup" {
     defer policy.deinit();
 
     policy.mode = .allowlist;
+    try policy.addDomainRule("example.com");
     try policy.addResolvedIp("example.com", [4]u8{ 1, 2, 3, 4 }, 60);
 
     try std.testing.expect(policy.isIpAllowed([4]u8{ 1, 2, 3, 4 }));
@@ -597,6 +601,19 @@ test "policy: NetworkPolicy resolved IP cache and cleanup" {
     policy.resolved_ips.items[0].expires_at = now - 1;
     policy.cleanupExpiredEntries();
     try std.testing.expect(!policy.isIpAllowed([4]u8{ 1, 2, 3, 4 }));
+}
+
+test "policy: resolved IP allowlist respects port rules" {
+    const allocator = std.testing.allocator;
+
+    var policy = NetworkPolicy.init(allocator);
+    defer policy.deinit();
+    policy.mode = .allowlist;
+    try policy.addDomainRuleWithPorts("example.com", 443, 443);
+    try policy.addResolvedIp("example.com", [4]u8{ 1, 2, 3, 4 }, 60);
+
+    try std.testing.expect(!policy.isIpAllowedOnPort([4]u8{ 1, 2, 3, 4 }, 80));
+    try std.testing.expect(policy.isIpAllowedOnPort([4]u8{ 1, 2, 3, 4 }, 443));
 }
 
 test "policy: validateOpenMode requires env var" {
