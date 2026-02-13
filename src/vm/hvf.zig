@@ -38,12 +38,15 @@ const boot = @import("boot.zig");
 const dtb = @import("dtb.zig");
 const builtin = @import("builtin");
 const virtio = @import("virtio.zig");
+const virtio_fs = @import("../fs/virtio_fs.zig");
 const vmnet = @import("../net/vmnet.zig");
 const SerialIo = serial.SerialIo;
 const IoExit = serial.IoExit;
 
 // Memory size conversion constant
 const mb_to_bytes: u64 = 1024 * 1024;
+const vcpu_stop_signal_attempts: usize = 200;
+const vcpu_stop_signal_interval_ns: u64 = 10 * std.time.ns_per_ms;
 
 // Guest physical memory layout - standard Linux boot offsets (from RAM base)
 const guest_kernel_offset_x86: u64 = 0x100000; // 1 MB - bzImage load offset
@@ -425,10 +428,37 @@ const arm64_bindings = if (builtin.os.tag == .macos and builtin.cpu.arch == .aar
             TTBR0_EL1 = 0xc100,
             TTBR1_EL1 = 0xc101,
             TCR_EL1 = 0xc102,
+            APIAKEYLO_EL1 = 0xc108,
+            APIAKEYHI_EL1 = 0xc109,
+            APIBKEYLO_EL1 = 0xc10a,
+            APIBKEYHI_EL1 = 0xc10b,
+            APDAKEYLO_EL1 = 0xc110,
+            APDAKEYHI_EL1 = 0xc111,
+            APDBKEYLO_EL1 = 0xc112,
+            APDBKEYHI_EL1 = 0xc113,
+            APGAKEYLO_EL1 = 0xc118,
+            APGAKEYHI_EL1 = 0xc119,
             SPSR_EL1 = 0xc200,
             ELR_EL1 = 0xc201,
+            SP_EL0 = 0xc208,
             MAIR_EL1 = 0xc510,
             VBAR_EL1 = 0xc600,
+            TPIDR_EL1 = 0xc684,
+            CNTKCTL_EL1 = 0xc708,
+            TPIDR_EL0 = 0xde82,
+            TPIDRRO_EL0 = 0xde83,
+            CNTV_CTL_EL0 = 0xdf19,
+            CNTV_CVAL_EL0 = 0xdf1a,
+            CNTP_CTL_EL0 = 0xdf11,
+            CNTP_CVAL_EL0 = 0xdf12,
+            CNTP_TVAL_EL0 = 0xdf10,
+            ICC_PMR_EL1 = 0xc230,
+            ICC_BPR0_EL1 = 0xc643,
+            ICC_BPR1_EL1 = 0xc663,
+            ICC_CTLR_EL1 = 0xc664,
+            ICC_SRE_EL1 = 0xc665,
+            ICC_IGRPEN0_EL1 = 0xc666,
+            ICC_IGRPEN1_EL1 = 0xc667,
             SP_EL1 = 0xe208,
         };
 
@@ -439,22 +469,94 @@ const arm64_bindings = if (builtin.os.tag == .macos and builtin.cpu.arch == .aar
         extern "c" fn hv_vcpu_get_reg(vcpu: VcpuId, reg: Reg, value: *u64) HvfReturn;
         extern "c" fn hv_vcpu_set_reg(vcpu: VcpuId, reg: Reg, value: u64) HvfReturn;
         extern "c" fn hv_vcpu_set_sys_reg(vcpu: VcpuId, reg: SysReg, value: u64) HvfReturn;
+        extern "c" fn hv_vcpu_get_sys_reg(vcpu: VcpuId, reg: SysReg, value: *u64) HvfReturn;
+        extern "c" fn hv_vcpu_get_vtimer_offset(vcpu: VcpuId, vtimer_offset: *u64) HvfReturn;
+        extern "c" fn hv_vcpu_set_vtimer_offset(vcpu: VcpuId, vtimer_offset: u64) HvfReturn;
+        extern "c" fn hv_vcpu_get_vtimer_mask(vcpu: VcpuId, vtimer_is_masked: *bool) HvfReturn;
+        extern "c" fn hv_vcpu_set_vtimer_mask(vcpu: VcpuId, vtimer_is_masked: bool) HvfReturn;
 
         fn writeReg(vcpu: VcpuId, reg: Reg, value: u64) Hvf.Error!void {
             const rc = hv_vcpu_set_reg(vcpu, reg, value);
-            if (rc != HV_SUCCESS) return error.HvfFailure;
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_vcpu_set_reg", rc);
+                return error.HvfFailure;
+            }
         }
 
         fn readReg(vcpu: VcpuId, reg: Reg) Hvf.Error!u64 {
             var value: u64 = 0;
             const rc = hv_vcpu_get_reg(vcpu, reg, &value);
-            if (rc != HV_SUCCESS) return error.HvfFailure;
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_vcpu_get_reg", rc);
+                return error.HvfFailure;
+            }
             return value;
         }
 
         fn writeSysReg(vcpu: VcpuId, reg: SysReg, value: u64) Hvf.Error!void {
             const rc = hv_vcpu_set_sys_reg(vcpu, reg, value);
-            if (rc != HV_SUCCESS) return error.HvfFailure;
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_vcpu_set_sys_reg", rc);
+                return error.HvfFailure;
+            }
+        }
+
+        fn readSysReg(vcpu: VcpuId, reg: SysReg) Hvf.Error!u64 {
+            var value: u64 = 0;
+            const rc = hv_vcpu_get_sys_reg(vcpu, reg, &value);
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_vcpu_get_sys_reg", rc);
+                return error.HvfFailure;
+            }
+            return value;
+        }
+
+        fn writeSysRegOptional(vcpu: VcpuId, reg: SysReg, value: u64) bool {
+            const rc = hv_vcpu_set_sys_reg(vcpu, reg, value);
+            return rc == HV_SUCCESS;
+        }
+
+        fn readSysRegOptional(vcpu: VcpuId, reg: SysReg) ?u64 {
+            var value: u64 = 0;
+            const rc = hv_vcpu_get_sys_reg(vcpu, reg, &value);
+            if (rc != HV_SUCCESS) return null;
+            return value;
+        }
+
+        fn getVtimerOffset(vcpu: VcpuId) Hvf.Error!u64 {
+            var value: u64 = 0;
+            const rc = hv_vcpu_get_vtimer_offset(vcpu, &value);
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_vcpu_get_vtimer_offset", rc);
+                return error.HvfFailure;
+            }
+            return value;
+        }
+
+        fn setVtimerOffset(vcpu: VcpuId, value: u64) Hvf.Error!void {
+            const rc = hv_vcpu_set_vtimer_offset(vcpu, value);
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_vcpu_set_vtimer_offset", rc);
+                return error.HvfFailure;
+            }
+        }
+
+        fn getVtimerMask(vcpu: VcpuId) Hvf.Error!bool {
+            var value: bool = false;
+            const rc = hv_vcpu_get_vtimer_mask(vcpu, &value);
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_vcpu_get_vtimer_mask", rc);
+                return error.HvfFailure;
+            }
+            return value;
+        }
+
+        fn setVtimerMask(vcpu: VcpuId, value: bool) Hvf.Error!void {
+            const rc = hv_vcpu_set_vtimer_mask(vcpu, value);
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_vcpu_set_vtimer_mask", rc);
+                return error.HvfFailure;
+            }
         }
 
         fn createVcpu(exit_out: **Exit) Hvf.Error!VcpuId {
@@ -659,6 +761,11 @@ const gic_bindings = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch
         extern "c" fn hv_gic_get_distributor_size(size: *usize) HvfReturn;
         extern "c" fn hv_gic_get_redistributor_size(size: *usize) HvfReturn;
         extern "c" fn hv_gic_get_spi_interrupt_range(base: *u32, count: *u32) HvfReturn;
+        extern "c" fn hv_gic_state_create() ?*anyopaque;
+        extern "c" fn hv_gic_state_get_size(state: ?*anyopaque, gic_state_size: *usize) HvfReturn;
+        extern "c" fn hv_gic_state_get_data(state: ?*anyopaque, gic_state_data: *anyopaque) HvfReturn;
+        extern "c" fn hv_gic_set_state(gic_state_data: *const anyopaque, gic_state_size: usize) HvfReturn;
+        extern "c" fn hv_gic_reset() HvfReturn;
         extern "c" fn os_release(obj: *anyopaque) void;
 
         fn configCreate() Hvf.Error!GicConfig {
@@ -739,6 +846,48 @@ const gic_bindings = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch
             const rc = hv_gic_get_spi_interrupt_range(base, count);
             if (rc != HV_SUCCESS) {
                 logHvfFailure("hv_gic_get_spi_interrupt_range", rc);
+                return error.HvfFailure;
+            }
+        }
+
+        fn stateCreate() ?*anyopaque {
+            return hv_gic_state_create();
+        }
+
+        fn stateRelease(state: ?*anyopaque) void {
+            if (state) |ptr| os_release(ptr);
+        }
+
+        fn stateGetSize(state: ?*anyopaque) Hvf.Error!usize {
+            var size: usize = 0;
+            const rc = hv_gic_state_get_size(state, &size);
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_gic_state_get_size", rc);
+                return error.HvfFailure;
+            }
+            return size;
+        }
+
+        fn stateGetData(state: ?*anyopaque, buf: []u8) Hvf.Error!void {
+            const rc = hv_gic_state_get_data(state, buf.ptr);
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_gic_state_get_data", rc);
+                return error.HvfFailure;
+            }
+        }
+
+        fn setState(buf: []const u8) Hvf.Error!void {
+            const rc = hv_gic_set_state(buf.ptr, buf.len);
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_gic_set_state", rc);
+                return error.HvfFailure;
+            }
+        }
+
+        fn reset() Hvf.Error!void {
+            const rc = hv_gic_reset();
+            if (rc != HV_SUCCESS) {
+                logHvfFailure("hv_gic_reset", rc);
                 return error.HvfFailure;
             }
         }
@@ -922,6 +1071,473 @@ else
     };
 
 // =============================================================================
+// vCPU STATE CAPTURE/RESTORE (for snapshot/restore)
+// =============================================================================
+
+const snapshot = @import("snapshot.zig");
+
+/// Captures the current vCPU state for snapshot.
+/// Only supported on macOS ARM64.
+pub fn captureVcpuState() !snapshot.VcpuState {
+    if (builtin.os.tag != .macos) return error.NotSupported;
+
+    if (builtin.cpu.arch == .aarch64) {
+        const vcpu = active_vcpu_id_arm orelse return error.InvalidState;
+        var state: snapshot.VcpuState = .{ .arm64 = .{} };
+        const read_reg = struct {
+            fn reg(vcpu_id: arm64_bindings.VcpuId, reg_id: arm64_bindings.Reg) !u64 {
+                return arm64_bindings.readReg(vcpu_id, reg_id) catch |e| {
+                    log.warn("snapshot capture: readReg {s} failed: {s}", .{ @tagName(reg_id), @errorName(e) });
+                    return e;
+                };
+            }
+            fn sys(vcpu_id: arm64_bindings.VcpuId, reg_id: arm64_bindings.SysReg) !u64 {
+                return arm64_bindings.readSysReg(vcpu_id, reg_id) catch |e| {
+                    log.warn("snapshot capture: readSysReg {s} failed: {s}", .{ @tagName(reg_id), @errorName(e) });
+                    return e;
+                };
+            }
+            fn sysOptional(vcpu_id: arm64_bindings.VcpuId, reg_id: arm64_bindings.SysReg) u64 {
+                if (arm64_bindings.readSysRegOptional(vcpu_id, reg_id)) |value| {
+                    return value;
+                }
+                log.debug("snapshot capture: optional sysreg {s} unavailable", .{@tagName(reg_id)});
+                return 0;
+            }
+        };
+
+        // GPRs X0-X30
+        state.arm64.x[0] = try read_reg.reg(vcpu, .X0);
+        state.arm64.x[1] = try read_reg.reg(vcpu, .X1);
+        state.arm64.x[2] = try read_reg.reg(vcpu, .X2);
+        state.arm64.x[3] = try read_reg.reg(vcpu, .X3);
+        state.arm64.x[4] = try read_reg.reg(vcpu, .X4);
+        state.arm64.x[5] = try read_reg.reg(vcpu, .X5);
+        state.arm64.x[6] = try read_reg.reg(vcpu, .X6);
+        state.arm64.x[7] = try read_reg.reg(vcpu, .X7);
+        state.arm64.x[8] = try read_reg.reg(vcpu, .X8);
+        state.arm64.x[9] = try read_reg.reg(vcpu, .X9);
+        state.arm64.x[10] = try read_reg.reg(vcpu, .X10);
+        state.arm64.x[11] = try read_reg.reg(vcpu, .X11);
+        state.arm64.x[12] = try read_reg.reg(vcpu, .X12);
+        state.arm64.x[13] = try read_reg.reg(vcpu, .X13);
+        state.arm64.x[14] = try read_reg.reg(vcpu, .X14);
+        state.arm64.x[15] = try read_reg.reg(vcpu, .X15);
+        state.arm64.x[16] = try read_reg.reg(vcpu, .X16);
+        state.arm64.x[17] = try read_reg.reg(vcpu, .X17);
+        state.arm64.x[18] = try read_reg.reg(vcpu, .X18);
+        state.arm64.x[19] = try read_reg.reg(vcpu, .X19);
+        state.arm64.x[20] = try read_reg.reg(vcpu, .X20);
+        state.arm64.x[21] = try read_reg.reg(vcpu, .X21);
+        state.arm64.x[22] = try read_reg.reg(vcpu, .X22);
+        state.arm64.x[23] = try read_reg.reg(vcpu, .X23);
+        state.arm64.x[24] = try read_reg.reg(vcpu, .X24);
+        state.arm64.x[25] = try read_reg.reg(vcpu, .X25);
+        state.arm64.x[26] = try read_reg.reg(vcpu, .X26);
+        state.arm64.x[27] = try read_reg.reg(vcpu, .X27);
+        state.arm64.x[28] = try read_reg.reg(vcpu, .X28);
+        state.arm64.x[29] = try read_reg.reg(vcpu, .X29);
+        state.arm64.x[30] = try read_reg.reg(vcpu, .X30);
+
+        // Special registers
+        state.arm64.pc = try read_reg.reg(vcpu, .PC);
+        state.arm64.cpsr = try read_reg.reg(vcpu, .CPSR);
+        state.arm64.fpcr = try read_reg.reg(vcpu, .FPCR);
+        state.arm64.fpsr = try read_reg.reg(vcpu, .FPSR);
+
+        // System registers
+        state.arm64.sp = try read_reg.sys(vcpu, .SP_EL1);
+        state.arm64.sp_el0 = read_reg.sysOptional(vcpu, .SP_EL0);
+        state.arm64.sp_el1 = try read_reg.sys(vcpu, .SP_EL1);
+        state.arm64.elr_el1 = try read_reg.sys(vcpu, .ELR_EL1);
+        state.arm64.spsr_el1 = try read_reg.sys(vcpu, .SPSR_EL1);
+        state.arm64.sctlr_el1 = try read_reg.sys(vcpu, .SCTLR_EL1);
+        state.arm64.tcr_el1 = try read_reg.sys(vcpu, .TCR_EL1);
+        state.arm64.ttbr0_el1 = try read_reg.sys(vcpu, .TTBR0_EL1);
+        state.arm64.ttbr1_el1 = try read_reg.sys(vcpu, .TTBR1_EL1);
+        state.arm64.mair_el1 = try read_reg.sys(vcpu, .MAIR_EL1);
+        state.arm64.vbar_el1 = try read_reg.sys(vcpu, .VBAR_EL1);
+        state.arm64.mpidr_el1 = try read_reg.sys(vcpu, .MPIDR_EL1);
+        state.arm64.tpidr_el0 = read_reg.sysOptional(vcpu, .TPIDR_EL0);
+        state.arm64.tpidr_el1 = read_reg.sysOptional(vcpu, .TPIDR_EL1);
+        state.arm64.tpidrro_el0 = read_reg.sysOptional(vcpu, .TPIDRRO_EL0);
+        state.arm64.cntkctl_el1 = read_reg.sysOptional(vcpu, .CNTKCTL_EL1);
+        state.arm64.cntv_ctl_el0 = read_reg.sysOptional(vcpu, .CNTV_CTL_EL0);
+        state.arm64.cntv_cval_el0 = read_reg.sysOptional(vcpu, .CNTV_CVAL_EL0);
+        state.arm64.cntp_ctl_el0 = read_reg.sysOptional(vcpu, .CNTP_CTL_EL0);
+        state.arm64.cntp_cval_el0 = read_reg.sysOptional(vcpu, .CNTP_CVAL_EL0);
+        state.arm64.cntp_tval_el0 = read_reg.sysOptional(vcpu, .CNTP_TVAL_EL0);
+        state.arm64.icc_pmr_el1 = read_reg.sysOptional(vcpu, .ICC_PMR_EL1);
+        state.arm64.icc_bpr0_el1 = read_reg.sysOptional(vcpu, .ICC_BPR0_EL1);
+        state.arm64.icc_bpr1_el1 = read_reg.sysOptional(vcpu, .ICC_BPR1_EL1);
+        state.arm64.icc_ctlr_el1 = read_reg.sysOptional(vcpu, .ICC_CTLR_EL1);
+        state.arm64.icc_sre_el1 = read_reg.sysOptional(vcpu, .ICC_SRE_EL1);
+        state.arm64.icc_igrpen0_el1 = read_reg.sysOptional(vcpu, .ICC_IGRPEN0_EL1);
+        state.arm64.icc_igrpen1_el1 = read_reg.sysOptional(vcpu, .ICC_IGRPEN1_EL1);
+        state.arm64.apia_key_lo = read_reg.sysOptional(vcpu, .APIAKEYLO_EL1);
+        state.arm64.apia_key_hi = read_reg.sysOptional(vcpu, .APIAKEYHI_EL1);
+        state.arm64.apib_key_lo = read_reg.sysOptional(vcpu, .APIBKEYLO_EL1);
+        state.arm64.apib_key_hi = read_reg.sysOptional(vcpu, .APIBKEYHI_EL1);
+        state.arm64.apda_key_lo = read_reg.sysOptional(vcpu, .APDAKEYLO_EL1);
+        state.arm64.apda_key_hi = read_reg.sysOptional(vcpu, .APDAKEYHI_EL1);
+        state.arm64.apdb_key_lo = read_reg.sysOptional(vcpu, .APDBKEYLO_EL1);
+        state.arm64.apdb_key_hi = read_reg.sysOptional(vcpu, .APDBKEYHI_EL1);
+        state.arm64.apga_key_lo = read_reg.sysOptional(vcpu, .APGAKEYLO_EL1);
+        state.arm64.apga_key_hi = read_reg.sysOptional(vcpu, .APGAKEYHI_EL1);
+
+        var vtimer_valid = true;
+        const vtimer_offset: u64 = arm64_bindings.getVtimerOffset(vcpu) catch |e| blk: {
+            log.debug("snapshot capture: vtimer offset unavailable: {s}", .{@errorName(e)});
+            vtimer_valid = false;
+            break :blk 0;
+        };
+        const vtimer_masked: bool = arm64_bindings.getVtimerMask(vcpu) catch |e| blk: {
+            log.debug("snapshot capture: vtimer mask unavailable: {s}", .{@errorName(e)});
+            vtimer_valid = false;
+            break :blk false;
+        };
+        state.arm64.vtimer_offset = vtimer_offset;
+        state.arm64.vtimer_masked = if (vtimer_masked) 1 else 0;
+        state.arm64.vtimer_valid = if (vtimer_valid) 1 else 0;
+
+        return state;
+    }
+
+    if (builtin.cpu.arch == .x86_64) {
+        const vcpu = active_vcpu_id_x86 orelse return error.InvalidState;
+        var state: snapshot.VcpuState = .{ .x86 = .{} };
+
+        state.x86.rax = try hvfReadReg(vcpu, .RAX);
+        state.x86.rbx = try hvfReadReg(vcpu, .RBX);
+        state.x86.rcx = try hvfReadReg(vcpu, .RCX);
+        state.x86.rdx = try hvfReadReg(vcpu, .RDX);
+        state.x86.rsi = try hvfReadReg(vcpu, .RSI);
+        state.x86.rdi = try hvfReadReg(vcpu, .RDI);
+        state.x86.rbp = try hvfReadReg(vcpu, .RBP);
+        state.x86.rsp = try hvfReadReg(vcpu, .RSP);
+        state.x86.r8 = try hvfReadReg(vcpu, .R8);
+        state.x86.r9 = try hvfReadReg(vcpu, .R9);
+        state.x86.r10 = try hvfReadReg(vcpu, .R10);
+        state.x86.r11 = try hvfReadReg(vcpu, .R11);
+        state.x86.r12 = try hvfReadReg(vcpu, .R12);
+        state.x86.r13 = try hvfReadReg(vcpu, .R13);
+        state.x86.r14 = try hvfReadReg(vcpu, .R14);
+        state.x86.r15 = try hvfReadReg(vcpu, .R15);
+        state.x86.rip = try hvfReadReg(vcpu, .RIP);
+        state.x86.rflags = try hvfReadReg(vcpu, .RFLAGS);
+
+        state.x86.cs = @intCast(try hvfReadReg(vcpu, .CS));
+        state.x86.ds = @intCast(try hvfReadReg(vcpu, .DS));
+        state.x86.es = @intCast(try hvfReadReg(vcpu, .ES));
+        state.x86.fs = @intCast(try hvfReadReg(vcpu, .FS));
+        state.x86.gs = @intCast(try hvfReadReg(vcpu, .GS));
+        state.x86.ss = @intCast(try hvfReadReg(vcpu, .SS));
+
+        state.x86.gdt_base = try hvfReadReg(vcpu, .GDT_BASE);
+        state.x86.gdt_limit = @intCast(try hvfReadReg(vcpu, .GDT_LIMIT));
+        state.x86.idt_base = try hvfReadReg(vcpu, .IDT_BASE);
+        state.x86.idt_limit = @intCast(try hvfReadReg(vcpu, .IDT_LIMIT));
+
+        state.x86.cr0 = try hvfReadReg(vcpu, .CR0);
+        state.x86.cr3 = try hvfReadReg(vcpu, .CR3);
+        state.x86.cr4 = try hvfReadReg(vcpu, .CR4);
+
+        return state;
+    }
+
+    return error.NotSupported;
+}
+
+/// Restores vCPU state from a snapshot.
+/// Only supported on macOS ARM64.
+pub fn restoreVcpuState(state: snapshot.VcpuState) !void {
+    if (builtin.os.tag != .macos) return error.NotSupported;
+
+    if (builtin.cpu.arch == .aarch64) {
+        const vcpu = active_vcpu_id_arm orelse return error.InvalidState;
+        const write_sys_optional = struct {
+            fn writeIfNonZero(vcpu_id: arm64_bindings.VcpuId, reg_id: arm64_bindings.SysReg, value: u64) void {
+                if (value == 0) return;
+                if (!arm64_bindings.writeSysRegOptional(vcpu_id, reg_id, value)) {
+                    log.debug("snapshot restore: optional sysreg {s} unavailable", .{@tagName(reg_id)});
+                }
+            }
+            fn write(vcpu_id: arm64_bindings.VcpuId, reg_id: arm64_bindings.SysReg, value: u64) void {
+                if (!arm64_bindings.writeSysRegOptional(vcpu_id, reg_id, value)) {
+                    log.debug("snapshot restore: optional sysreg {s} unavailable", .{@tagName(reg_id)});
+                }
+            }
+        };
+
+        // GPRs X0-X30
+        try arm64_bindings.writeReg(vcpu, .X0, state.arm64.x[0]);
+        try arm64_bindings.writeReg(vcpu, .X1, state.arm64.x[1]);
+        try arm64_bindings.writeReg(vcpu, .X2, state.arm64.x[2]);
+        try arm64_bindings.writeReg(vcpu, .X3, state.arm64.x[3]);
+        try arm64_bindings.writeReg(vcpu, .X4, state.arm64.x[4]);
+        try arm64_bindings.writeReg(vcpu, .X5, state.arm64.x[5]);
+        try arm64_bindings.writeReg(vcpu, .X6, state.arm64.x[6]);
+        try arm64_bindings.writeReg(vcpu, .X7, state.arm64.x[7]);
+        try arm64_bindings.writeReg(vcpu, .X8, state.arm64.x[8]);
+        try arm64_bindings.writeReg(vcpu, .X9, state.arm64.x[9]);
+        try arm64_bindings.writeReg(vcpu, .X10, state.arm64.x[10]);
+        try arm64_bindings.writeReg(vcpu, .X11, state.arm64.x[11]);
+        try arm64_bindings.writeReg(vcpu, .X12, state.arm64.x[12]);
+        try arm64_bindings.writeReg(vcpu, .X13, state.arm64.x[13]);
+        try arm64_bindings.writeReg(vcpu, .X14, state.arm64.x[14]);
+        try arm64_bindings.writeReg(vcpu, .X15, state.arm64.x[15]);
+        try arm64_bindings.writeReg(vcpu, .X16, state.arm64.x[16]);
+        try arm64_bindings.writeReg(vcpu, .X17, state.arm64.x[17]);
+        try arm64_bindings.writeReg(vcpu, .X18, state.arm64.x[18]);
+        try arm64_bindings.writeReg(vcpu, .X19, state.arm64.x[19]);
+        try arm64_bindings.writeReg(vcpu, .X20, state.arm64.x[20]);
+        try arm64_bindings.writeReg(vcpu, .X21, state.arm64.x[21]);
+        try arm64_bindings.writeReg(vcpu, .X22, state.arm64.x[22]);
+        try arm64_bindings.writeReg(vcpu, .X23, state.arm64.x[23]);
+        try arm64_bindings.writeReg(vcpu, .X24, state.arm64.x[24]);
+        try arm64_bindings.writeReg(vcpu, .X25, state.arm64.x[25]);
+        try arm64_bindings.writeReg(vcpu, .X26, state.arm64.x[26]);
+        try arm64_bindings.writeReg(vcpu, .X27, state.arm64.x[27]);
+        try arm64_bindings.writeReg(vcpu, .X28, state.arm64.x[28]);
+        try arm64_bindings.writeReg(vcpu, .X29, state.arm64.x[29]);
+        try arm64_bindings.writeReg(vcpu, .X30, state.arm64.x[30]);
+
+        // Special registers
+        try arm64_bindings.writeReg(vcpu, .PC, state.arm64.pc);
+        try arm64_bindings.writeReg(vcpu, .CPSR, state.arm64.cpsr);
+        try arm64_bindings.writeReg(vcpu, .FPCR, state.arm64.fpcr);
+        try arm64_bindings.writeReg(vcpu, .FPSR, state.arm64.fpsr);
+        log.debug("snapshot restore: arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}", .{
+            state.arm64.pc,
+            state.arm64.sp_el1,
+            state.arm64.elr_el1,
+        });
+
+        // System registers
+        write_sys_optional.writeIfNonZero(vcpu, .SP_EL0, state.arm64.sp_el0);
+        try arm64_bindings.writeSysReg(vcpu, .SP_EL1, state.arm64.sp_el1);
+        try arm64_bindings.writeSysReg(vcpu, .ELR_EL1, state.arm64.elr_el1);
+        try arm64_bindings.writeSysReg(vcpu, .SPSR_EL1, state.arm64.spsr_el1);
+        try arm64_bindings.writeSysReg(vcpu, .SCTLR_EL1, state.arm64.sctlr_el1);
+        try arm64_bindings.writeSysReg(vcpu, .TCR_EL1, state.arm64.tcr_el1);
+        try arm64_bindings.writeSysReg(vcpu, .TTBR0_EL1, state.arm64.ttbr0_el1);
+        try arm64_bindings.writeSysReg(vcpu, .TTBR1_EL1, state.arm64.ttbr1_el1);
+        try arm64_bindings.writeSysReg(vcpu, .MAIR_EL1, state.arm64.mair_el1);
+        try arm64_bindings.writeSysReg(vcpu, .VBAR_EL1, state.arm64.vbar_el1);
+        try arm64_bindings.writeSysReg(vcpu, .MPIDR_EL1, state.arm64.mpidr_el1);
+        write_sys_optional.writeIfNonZero(vcpu, .TPIDR_EL0, state.arm64.tpidr_el0);
+        write_sys_optional.writeIfNonZero(vcpu, .TPIDR_EL1, state.arm64.tpidr_el1);
+        write_sys_optional.writeIfNonZero(vcpu, .TPIDRRO_EL0, state.arm64.tpidrro_el0);
+        write_sys_optional.writeIfNonZero(vcpu, .CNTKCTL_EL1, state.arm64.cntkctl_el1);
+        write_sys_optional.writeIfNonZero(vcpu, .CNTV_CTL_EL0, state.arm64.cntv_ctl_el0);
+        write_sys_optional.writeIfNonZero(vcpu, .CNTV_CVAL_EL0, state.arm64.cntv_cval_el0);
+        write_sys_optional.writeIfNonZero(vcpu, .CNTP_CTL_EL0, state.arm64.cntp_ctl_el0);
+        write_sys_optional.writeIfNonZero(vcpu, .CNTP_CVAL_EL0, state.arm64.cntp_cval_el0);
+        write_sys_optional.writeIfNonZero(vcpu, .CNTP_TVAL_EL0, state.arm64.cntp_tval_el0);
+        write_sys_optional.write(vcpu, .ICC_SRE_EL1, state.arm64.icc_sre_el1);
+        write_sys_optional.write(vcpu, .ICC_CTLR_EL1, state.arm64.icc_ctlr_el1);
+        write_sys_optional.write(vcpu, .ICC_BPR0_EL1, state.arm64.icc_bpr0_el1);
+        write_sys_optional.write(vcpu, .ICC_BPR1_EL1, state.arm64.icc_bpr1_el1);
+        write_sys_optional.write(vcpu, .ICC_PMR_EL1, state.arm64.icc_pmr_el1);
+        write_sys_optional.write(vcpu, .ICC_IGRPEN0_EL1, state.arm64.icc_igrpen0_el1);
+        write_sys_optional.write(vcpu, .ICC_IGRPEN1_EL1, state.arm64.icc_igrpen1_el1);
+        write_sys_optional.writeIfNonZero(vcpu, .APIAKEYLO_EL1, state.arm64.apia_key_lo);
+        write_sys_optional.writeIfNonZero(vcpu, .APIAKEYHI_EL1, state.arm64.apia_key_hi);
+        write_sys_optional.writeIfNonZero(vcpu, .APIBKEYLO_EL1, state.arm64.apib_key_lo);
+        write_sys_optional.writeIfNonZero(vcpu, .APIBKEYHI_EL1, state.arm64.apib_key_hi);
+        write_sys_optional.writeIfNonZero(vcpu, .APDAKEYLO_EL1, state.arm64.apda_key_lo);
+        write_sys_optional.writeIfNonZero(vcpu, .APDAKEYHI_EL1, state.arm64.apda_key_hi);
+        write_sys_optional.writeIfNonZero(vcpu, .APDBKEYLO_EL1, state.arm64.apdb_key_lo);
+        write_sys_optional.writeIfNonZero(vcpu, .APDBKEYHI_EL1, state.arm64.apdb_key_hi);
+        write_sys_optional.writeIfNonZero(vcpu, .APGAKEYLO_EL1, state.arm64.apga_key_lo);
+        write_sys_optional.writeIfNonZero(vcpu, .APGAKEYHI_EL1, state.arm64.apga_key_hi);
+        if (state.arm64.vtimer_valid != 0) {
+            arm64_bindings.setVtimerOffset(vcpu, state.arm64.vtimer_offset) catch |e| {
+                log.debug("snapshot restore: vtimer offset set failed: {s}", .{@errorName(e)});
+            };
+            arm64_bindings.setVtimerMask(vcpu, state.arm64.vtimer_masked != 0) catch |e| {
+                log.debug("snapshot restore: vtimer mask set failed: {s}", .{@errorName(e)});
+            };
+        }
+
+        return;
+    }
+
+    if (builtin.cpu.arch == .x86_64) {
+        const vcpu = active_vcpu_id_x86 orelse return error.InvalidState;
+
+        try hvfWriteReg(vcpu, .RAX, state.x86.rax);
+        try hvfWriteReg(vcpu, .RBX, state.x86.rbx);
+        try hvfWriteReg(vcpu, .RCX, state.x86.rcx);
+        try hvfWriteReg(vcpu, .RDX, state.x86.rdx);
+        try hvfWriteReg(vcpu, .RSI, state.x86.rsi);
+        try hvfWriteReg(vcpu, .RDI, state.x86.rdi);
+        try hvfWriteReg(vcpu, .RBP, state.x86.rbp);
+        try hvfWriteReg(vcpu, .RSP, state.x86.rsp);
+        try hvfWriteReg(vcpu, .R8, state.x86.r8);
+        try hvfWriteReg(vcpu, .R9, state.x86.r9);
+        try hvfWriteReg(vcpu, .R10, state.x86.r10);
+        try hvfWriteReg(vcpu, .R11, state.x86.r11);
+        try hvfWriteReg(vcpu, .R12, state.x86.r12);
+        try hvfWriteReg(vcpu, .R13, state.x86.r13);
+        try hvfWriteReg(vcpu, .R14, state.x86.r14);
+        try hvfWriteReg(vcpu, .R15, state.x86.r15);
+        try hvfWriteReg(vcpu, .RIP, state.x86.rip);
+        try hvfWriteReg(vcpu, .RFLAGS, state.x86.rflags);
+
+        try hvfWriteReg(vcpu, .CS, state.x86.cs);
+        try hvfWriteReg(vcpu, .DS, state.x86.ds);
+        try hvfWriteReg(vcpu, .ES, state.x86.es);
+        try hvfWriteReg(vcpu, .FS, state.x86.fs);
+        try hvfWriteReg(vcpu, .GS, state.x86.gs);
+        try hvfWriteReg(vcpu, .SS, state.x86.ss);
+
+        try hvfWriteReg(vcpu, .GDT_BASE, state.x86.gdt_base);
+        try hvfWriteReg(vcpu, .GDT_LIMIT, state.x86.gdt_limit);
+        try hvfWriteReg(vcpu, .IDT_BASE, state.x86.idt_base);
+        try hvfWriteReg(vcpu, .IDT_LIMIT, state.x86.idt_limit);
+
+        try hvfWriteReg(vcpu, .CR0, state.x86.cr0);
+        try hvfWriteReg(vcpu, .CR3, state.x86.cr3);
+        try hvfWriteReg(vcpu, .CR4, state.x86.cr4);
+
+        return;
+    }
+
+    return error.NotSupported;
+}
+
+/// Pauses the vCPU by forcing an exit.
+/// Used for live snapshot: pause -> capture state -> resume.
+pub fn pauseVcpu() !void {
+    if (builtin.os.tag != .macos) return error.NotSupported;
+
+    vcpu_pause_requested.store(true, .seq_cst);
+
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        if (!vcpu_running.load(.seq_cst)) {
+            log.warn("snapshot pause: vcpu_running=false active_arm={} active_x86={}", .{
+                active_vcpu_id_arm != null,
+                active_vcpu_id_x86 != null,
+            });
+            return error.NotRunning;
+        }
+        const active = switch (builtin.cpu.arch) {
+            .aarch64 => active_vcpu_id_arm != null,
+            .x86_64 => active_vcpu_id_x86 != null,
+            else => return error.NotSupported,
+        };
+        if (active) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    switch (builtin.cpu.arch) {
+        .aarch64 => {
+            const vcpu = active_vcpu_id_arm orelse {
+                log.warn("snapshot pause: active vcpu missing after wait", .{});
+                return error.NotRunning;
+            };
+            arm64_bindings.exit(vcpu) catch |e| {
+                log.warn("snapshot pause: arm64 exit failed: {s}", .{@errorName(e)});
+                return e;
+            };
+        },
+        .x86_64 => {
+            const vcpu = active_vcpu_id_x86 orelse {
+                log.warn("snapshot pause: active vcpu missing after wait", .{});
+                return error.NotRunning;
+            };
+            x86_vcpu_bindings.interrupt(vcpu) catch |e| {
+                log.warn("snapshot pause: x86 interrupt failed: {s}", .{@errorName(e)});
+                return e;
+            };
+        },
+        else => return error.NotSupported,
+    }
+
+    while (true) {
+        if (vcpu_paused.load(.seq_cst)) return;
+        if (!vcpu_running.load(.seq_cst)) return error.NotRunning;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+}
+
+/// Resumes the vCPU after a pause.
+/// The vCPU will continue execution from where it was paused.
+pub fn resumeVcpu() void {
+    vcpu_pause_requested.store(false, .seq_cst);
+    while (vcpu_paused.load(.seq_cst)) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    paused_vcpu_state_mutex.lock();
+    paused_vcpu_state = null;
+    paused_vcpu_state_error = null;
+    paused_vcpu_state_mutex.unlock();
+
+    vcpu_pause_requested.store(false, .seq_cst);
+    vcpu_paused.store(false, .seq_cst);
+    vcpu_running.store(true, .seq_cst);
+}
+
+/// Checks if the vCPU is currently running.
+pub fn isVcpuRunning() bool {
+    return vcpu_running.load(.seq_cst);
+}
+
+/// Returns true if a vCPU has been created for the active VM.
+pub fn hasActiveVcpu() bool {
+    return switch (builtin.cpu.arch) {
+        .aarch64 => active_vcpu_id_arm != null,
+        .x86_64 => active_vcpu_id_x86 != null,
+        else => false,
+    };
+}
+
+pub fn takePausedVcpuState() !snapshot.VcpuState {
+    paused_vcpu_state_mutex.lock();
+    defer paused_vcpu_state_mutex.unlock();
+
+    if (paused_vcpu_state_error) |e| return e;
+    const state = paused_vcpu_state orelse return error.InvalidState;
+    paused_vcpu_state = null;
+    return state;
+}
+
+pub fn applyPausedVcpuState(state: snapshot.VcpuState) !void {
+    paused_vcpu_state_mutex.lock();
+    restore_vcpu_state = state;
+    restore_vcpu_state_error = null;
+    paused_vcpu_state_mutex.unlock();
+
+    var attempts: usize = 0;
+    while (attempts < 2000) : (attempts += 1) {
+        paused_vcpu_state_mutex.lock();
+        const pending = restore_vcpu_state != null;
+        const err = restore_vcpu_state_error;
+        paused_vcpu_state_mutex.unlock();
+
+        if (!pending) {
+            if (err) |e| return e;
+            return;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+/// Returns the active guest memory for snapshot.
+pub fn getGuestMemory() ?[]u8 {
+    return active_guest_memory;
+}
+
+/// Returns the guest memory size for snapshot.
+pub fn getGuestMemorySize() usize {
+    return active_memory_size;
+}
+
+// =============================================================================
 // GLOBAL STATE
 // =============================================================================
 // m80 currently supports a single active VM at a time.
@@ -945,6 +1561,20 @@ var active_vcpu_id_arm: ?arm64_bindings.VcpuId = null;
 
 /// Atomic flag: true while vCPU should keep running
 var vcpu_running = std.atomic.Value(bool).init(false);
+/// Atomic flag: true when the vCPU thread has fully exited
+var vcpu_thread_exited = std.atomic.Value(bool).init(true);
+
+/// Atomic flag: pause requested for vCPU run loop
+var vcpu_pause_requested = std.atomic.Value(bool).init(false);
+
+/// Atomic flag: vCPU run loop is currently paused
+var vcpu_paused = std.atomic.Value(bool).init(false);
+
+var paused_vcpu_state: ?snapshot.VcpuState = null;
+var paused_vcpu_state_error: ?anyerror = null;
+var restore_vcpu_state: ?snapshot.VcpuState = null;
+var restore_vcpu_state_error: ?anyerror = null;
+var paused_vcpu_state_mutex = std.Thread.Mutex{};
 
 /// Atomic flag: trigger simulated I/O for testing
 var simulate_io = std.atomic.Value(bool).init(false);
@@ -956,12 +1586,13 @@ var serial_input_running = std.atomic.Value(bool).init(false);
 var console_socket_thread: ?std.Thread = null;
 var console_socket_running = std.atomic.Value(bool).init(false);
 var console_socket_path: ?[]u8 = null;
+var console_rx_logged = std.atomic.Value(bool).init(false);
 
 /// Active vmnet interface for networking (macOS only)
 var active_vmnet_iface: ?vmnet.VmnetInterface = null;
 var vmnet_rx_thread: ?std.Thread = null;
 var vmnet_rx_running = std.atomic.Value(bool).init(false);
-
+var arm64_unknown_sysreg_trap_count = std.atomic.Value(u32).init(0);
 
 /// GIC wiring for arm64 interrupt injection
 var gic_enabled = false;
@@ -981,7 +1612,6 @@ fn virtioInterruptHandler(intid: u32, level: bool) void {
         log.warn("hvf gic set virtio spi failed: {s}", .{@errorName(e)});
     };
 }
-
 
 // =============================================================================
 // VM EXIT HANDLING
@@ -1475,6 +2105,56 @@ const Pl011State = struct {
 var pl011_state = Pl011State{};
 var pl011_seen = std.atomic.Value(bool).init(false);
 
+pub fn capturePl011State() snapshot.Pl011SnapshotState {
+    return .{
+        .cr = pl011_state.cr,
+        .lcrh = pl011_state.lcrh,
+        .ibrd = pl011_state.ibrd,
+        .fbrd = pl011_state.fbrd,
+        .imsc = pl011_state.imsc,
+        .pending = pl011_state.pending,
+    };
+}
+
+pub fn restorePl011State(state: snapshot.Pl011SnapshotState) void {
+    pl011_state = .{
+        .cr = state.cr,
+        .lcrh = state.lcrh,
+        .ibrd = state.ibrd,
+        .fbrd = state.fbrd,
+        .imsc = state.imsc,
+        .pending = state.pending,
+    };
+    pl011_seen.store(true, .seq_cst);
+    updateUartInterrupt();
+}
+
+pub fn captureGicState(allocator: std.mem.Allocator) !?[]u8 {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return null;
+    if (!gic_enabled) return null;
+    const state = gic_bindings.stateCreate() orelse return null;
+    defer gic_bindings.stateRelease(state);
+    const size = gic_bindings.stateGetSize(state) catch return null;
+    if (size == 0) return null;
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    gic_bindings.stateGetData(state, buf) catch |e| {
+        allocator.free(buf);
+        return e;
+    };
+    return buf;
+}
+
+pub fn restoreGicState(data: []const u8) !void {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.NotSupported;
+    if (!gic_enabled) return error.InvalidState;
+    if (data.len == 0) return;
+    gic_bindings.setState(data) catch |e| {
+        log.warn("hvf gic set state failed: {s}", .{@errorName(e)});
+        return e;
+    };
+}
+
 fn arm64RegFromIndex(index: u5) !arm64_bindings.Reg {
     return switch (index) {
         0 => .X0,
@@ -1600,19 +2280,19 @@ fn serialInputLoop() void {
     }
 }
 
-fn startSerialInputThread() void {
-    if (serial_input_running.load(.seq_cst)) return;
+fn startSerialInputThread() bool {
+    if (serial_input_running.load(.seq_cst)) return true;
     serial_input_running.store(true, .seq_cst);
     serial_input_thread = std.Thread.spawn(.{}, serialInputLoop, .{}) catch |e| {
         serial_input_running.store(false, .seq_cst);
         log.warn("hvf serial stdin thread failed: {s}", .{@errorName(e)});
-        return;
+        return false;
     };
     log.info("hvf serial stdin enabled", .{});
+    return true;
 }
 
 fn stopSerialInputThread() void {
-    if (!serial_input_running.load(.seq_cst)) return;
     serial_input_running.store(false, .seq_cst);
     if (serial_input_thread) |thread| {
         thread.join();
@@ -1627,11 +2307,15 @@ fn shouldEnableSerialStdin(allocator: std.mem.Allocator) bool {
 
 fn appendSerialInput(bytes: []const u8) void {
     if (virtio.virtio_console_state.enabled) {
+        const queue = &virtio.virtio_console_state.queues[0];
         virtio.appendVirtioConsoleInput(bytes);
         virtio.processVirtioConsoleRxQueue() catch |e| {
-            log.warn("hvf virtio-console rx process failed: {s}", .{@errorName(e)});
+            log.warn("hvf virtio-console rx process failed: {s} ready={} num={d}", .{
+                @errorName(e),
+                queue.ready,
+                queue.num,
+            });
         };
-        return;
     }
     serial_io.append(std.heap.page_allocator, bytes);
 }
@@ -1646,10 +2330,9 @@ fn vmnetTxCallback(frame: []const u8) void {
     const iface = active_vmnet_iface orelse return;
     if (frame.len == 0 or frame.len > iface.max_packet_size) return;
 
-
     // Set up packet descriptor for vmnet_write
     var iov: vmnet.c_types.iovec = .{
-        .iov_base = @constCast(@ptrCast(frame.ptr)),
+        .iov_base = @ptrCast(@constCast(frame.ptr)),
         .iov_len = frame.len,
     };
     var pkt: vmnet.c_types.vmpktdesc = .{
@@ -1714,19 +2397,18 @@ fn vmnetRxLoop() void {
     }
 }
 
-fn startVmnetRxThread() void {
+fn startVmnetRxThread() !void {
     if (vmnet_rx_running.load(.seq_cst)) return;
     vmnet_rx_running.store(true, .seq_cst);
     vmnet_rx_thread = std.Thread.spawn(.{}, vmnetRxLoop, .{}) catch |e| {
         vmnet_rx_running.store(false, .seq_cst);
         log.warn("hvf vmnet rx thread failed: {s}", .{@errorName(e)});
-        return;
+        return e;
     };
     log.info("hvf vmnet rx thread started", .{});
 }
 
 fn stopVmnetRxThread() void {
-    if (!vmnet_rx_running.load(.seq_cst)) return;
     vmnet_rx_running.store(false, .seq_cst);
     if (vmnet_rx_thread) |thread| {
         thread.join();
@@ -1748,6 +2430,7 @@ fn stopVmnetInterface() void {
 
 fn consoleSocketLoop() void {
     const path = console_socket_path orelse return;
+    defer console_socket_running.store(false, .seq_cst);
     std.fs.cwd().deleteFile(path) catch {};
 
     const address = std.net.Address.initUnix(path) catch |e| {
@@ -1780,6 +2463,7 @@ fn consoleSocketLoop() void {
             },
         };
         defer conn.stream.close();
+        console_rx_logged.store(false, .seq_cst);
 
         if (builtin.os.tag != .windows) {
             const flags = std.posix.fcntl(conn.stream.handle, std.posix.F.GETFL, 0) catch 0;
@@ -1801,16 +2485,25 @@ fn consoleSocketLoop() void {
             if ((fds[0].revents & std.posix.POLL.IN) == 0) break;
             const n = std.posix.read(conn.stream.handle, &buf) catch break;
             if (n <= 0) break;
+            if (!console_rx_logged.swap(true, .seq_cst)) {
+                const queue = &virtio.virtio_console_state.queues[0];
+                log.info("hvf console socket rx bytes={d} virtio_console={} queue_ready={} num={d}", .{
+                    n,
+                    virtio.virtio_console_state.enabled,
+                    queue.ready,
+                    queue.num,
+                });
+            }
             const chunk = buf[0..@intCast(n)];
             appendSerialInput(chunk);
         }
     }
 }
 
-fn startConsoleSocketServer(allocator: std.mem.Allocator) void {
-    if (console_socket_running.load(.seq_cst)) return;
+fn startConsoleSocketServer(allocator: std.mem.Allocator) bool {
+    if (console_socket_running.load(.seq_cst)) return true;
     const env = std.process.getEnvVarOwned(allocator, "M80_CONSOLE_SOCKET") catch null;
-    if (env == null) return;
+    if (env == null) return false;
     console_socket_path = env;
     console_socket_running.store(true, .seq_cst);
     console_socket_thread = std.Thread.spawn(.{}, consoleSocketLoop, .{}) catch |e| {
@@ -1820,13 +2513,13 @@ fn startConsoleSocketServer(allocator: std.mem.Allocator) void {
             console_socket_path = null;
         }
         log.warn("hvf console socket thread failed: {s}", .{@errorName(e)});
-        return;
+        return false;
     };
     log.info("hvf console socket enabled", .{});
+    return true;
 }
 
 fn stopConsoleSocketServer(allocator: std.mem.Allocator) void {
-    if (!console_socket_running.load(.seq_cst)) return;
     console_socket_running.store(false, .seq_cst);
     if (console_socket_thread) |thread| {
         thread.join();
@@ -1998,10 +2691,14 @@ fn handleArm64SysRegTrap(vcpu: arm64_bindings.VcpuId, exit: HvfArmExitException)
         return true;
     }
 
-    log.err(
-        "hvf arm64 sysreg trap op0={d} op1={d} crn={d} crm={d} op2={d} dir={s} rt={d}",
-        .{ op0, op1, crn, crm, op2, if (is_read) "read" else "write", rt },
-    );
+    const trap_count = arm64_unknown_sysreg_trap_count.fetchAdd(1, .seq_cst) + 1;
+    if (trap_count <= 5 or trap_count % 100 == 0) {
+        const pc = arm64_bindings.readReg(vcpu, .PC) catch 0;
+        log.err(
+            "hvf arm64 unknown sysreg trap count={d} syndrome=0x{x} ec=0x{x} op0={d} op1={d} crn={d} crm={d} op2={d} dir={s} rt={d} pc=0x{x}",
+            .{ trap_count, esr, ec, op0, op1, crn, crm, op2, if (is_read) "read" else "write", rt, pc },
+        );
+    }
     return false;
 }
 
@@ -2053,6 +2750,20 @@ fn handleVmxIoExit(vcpu: HvfVcpuId) !void {
     try hvfWriteReg(vcpu, .RIP, rip + instr_len);
 }
 
+const ArmExceptionInfo = struct {
+    ec: u8,
+    il: u1,
+    iss: u32,
+};
+
+fn decodeArmExceptionSyndrome(syndrome: u64) ArmExceptionInfo {
+    return .{
+        .ec = @intCast((syndrome >> 26) & 0x3F),
+        .il = @intCast((syndrome >> 25) & 0x1),
+        .iss = @intCast(syndrome & 0x1FFFFFF),
+    };
+}
+
 const VcpuInit = struct {
     x86_regset: ?HvfRegSet = null,
     arm_regset: ?HvfArmRegSet = null,
@@ -2070,9 +2781,47 @@ fn runVcpu(index: u32, init: VcpuInit) void {
     }
 }
 
+fn maybePauseVcpu() void {
+    if (!vcpu_pause_requested.load(.seq_cst)) return;
+
+    vcpu_paused.store(true, .seq_cst);
+    defer vcpu_paused.store(false, .seq_cst);
+    paused_vcpu_state_mutex.lock();
+    paused_vcpu_state_error = null;
+    paused_vcpu_state = null;
+    restore_vcpu_state_error = null;
+    const state = captureVcpuState() catch |e| {
+        paused_vcpu_state_error = e;
+        paused_vcpu_state_mutex.unlock();
+        return;
+    };
+    paused_vcpu_state = state;
+    if (restore_vcpu_state) |pending_state| {
+        restoreVcpuState(pending_state) catch |e| {
+            restore_vcpu_state_error = e;
+        };
+        restore_vcpu_state = null;
+    }
+    paused_vcpu_state_mutex.unlock();
+
+    while (vcpu_pause_requested.load(.seq_cst) and vcpu_running.load(.seq_cst)) {
+        paused_vcpu_state_mutex.lock();
+        if (restore_vcpu_state) |pending_state| {
+            restore_vcpu_state_error = null;
+            restoreVcpuState(pending_state) catch |e| {
+                restore_vcpu_state_error = e;
+            };
+            restore_vcpu_state = null;
+        }
+        paused_vcpu_state_mutex.unlock();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+}
+
 const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)
     struct {
         fn run(index: u32, init: VcpuInit) void {
+            defer vcpu_thread_exited.store(true, .seq_cst);
             log.info("hvf arm64 vcpu {d} run loop entered", .{index});
             var exit_ptr: *arm64_bindings.Exit = undefined;
             const vcpu = arm64_bindings.createVcpu(&exit_ptr) catch |e| {
@@ -2087,6 +2836,7 @@ const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64
                 };
                 active_vcpu_id_arm = null;
             }
+            var last_heartbeat_ns: i128 = std.time.nanoTimestamp();
 
             const regset = init.arm_regset orelse {
                 log.err("hvf arm64 missing regset", .{});
@@ -2105,13 +2855,21 @@ const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64
             };
 
             while (vcpu_running.load(.seq_cst)) {
+                maybePauseVcpu();
+                if (!vcpu_running.load(.seq_cst)) break;
                 arm64_bindings.run(vcpu) catch |e| {
                     log.err("hvf arm64 vcpu run failed: {s}", .{@errorName(e)});
                     break;
                 };
+                const now_ns = std.time.nanoTimestamp();
+                if (now_ns - last_heartbeat_ns > std.time.ns_per_s) {
+                    last_heartbeat_ns = now_ns;
+                    const pc = arm64_bindings.readReg(vcpu, .PC) catch 0;
+                    log.info("hvf arm64 vcpu heartbeat pc=0x{x}", .{pc});
+                }
                 const exit = exit_ptr.*;
                 switch (exit.reason) {
-                    .Canceled => break,
+                    .Canceled => continue,
                     .VtimerActivated => {
                         log.debug("hvf arm64 vtimer activated", .{});
                         continue;
@@ -2127,9 +2885,19 @@ const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64
                             break;
                         };
                         if (handled_mmio) continue;
+                        const info = decodeArmExceptionSyndrome(exit.exception.syndrome);
+                        const pc = arm64_bindings.readReg(vcpu, .PC) catch 0;
                         log.err(
-                            "hvf arm64 exception syndrome=0x{x} ipa=0x{x} va=0x{x}",
-                            .{ exit.exception.syndrome, exit.exception.physical_address, exit.exception.virtual_address },
+                            "hvf arm64 exception syndrome=0x{x} ec=0x{x} il={d} iss=0x{x} pc=0x{x} ipa=0x{x} va=0x{x}",
+                            .{
+                                exit.exception.syndrome,
+                                info.ec,
+                                info.il,
+                                info.iss,
+                                pc,
+                                exit.exception.physical_address,
+                                exit.exception.virtual_address,
+                            },
                         );
                         break;
                     },
@@ -2155,6 +2923,7 @@ else
 const runVcpuX86 = if (builtin.os.tag == .macos and builtin.cpu.arch == .x86_64)
     struct {
         fn run(index: u32, init: VcpuInit) void {
+            defer vcpu_thread_exited.store(true, .seq_cst);
             log.info("hvf x86 vcpu {d} run loop entered", .{index});
             const vcpu = x86_vcpu_bindings.createVcpu() catch |e| {
                 log.err("hvf x86 vcpu create failed: {s}", .{@errorName(e)});
@@ -2186,6 +2955,8 @@ const runVcpuX86 = if (builtin.os.tag == .macos and builtin.cpu.arch == .x86_64)
             };
 
             while (vcpu_running.load(.seq_cst)) {
+                maybePauseVcpu();
+                if (!vcpu_running.load(.seq_cst)) break;
                 if (simulate_io.swap(false, .seq_cst)) {
                     _ = handleIoExit(.{ .port = 0x3F8, .is_write = true, .size = 1, .rax = '>', .is_string = false, .has_rep = false });
                     _ = handleIoExit(.{ .port = 0x3FD, .is_write = false, .size = 1, .rax = 0, .is_string = false, .has_rep = false });
@@ -2453,6 +3224,62 @@ fn unmapActiveGuestMemory() void {
     }
 }
 
+fn mapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64, fd: std.posix.fd_t, file_offset: u64, writable: bool) !void {
+    if (len == 0) return;
+    const memory = active_guest_memory orelse return error.NoGuestMemory;
+    const base = guestMemoryBase();
+    if (guest_addr < base) return error.InvalidGuestLayout;
+    const offset = guest_addr - base;
+    if (offset + len > memory.len) return error.InvalidGuestLayout;
+    if (len > std.math.maxInt(usize)) return error.InvalidGuestLayout;
+
+    const host_addr = @intFromPtr(memory.ptr) + @as(usize, @intCast(offset));
+    const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
+    const prot: u32 = @intCast(if (writable) (std.posix.PROT.READ | std.posix.PROT.WRITE) else std.posix.PROT.READ);
+    const flags = std.posix.MAP{
+        .TYPE = .SHARED,
+        .FIXED = true,
+    };
+    _ = try std.posix.mmap(host_ptr, @intCast(len), prot, flags, fd, @intCast(file_offset));
+    if (builtin.os.tag == .macos) {
+        if (host_ptr) |ptr| {
+            std.posix.madvise(ptr, @intCast(len), std.posix.MADV.WILLNEED) catch {};
+            std.posix.madvise(ptr, @intCast(len), std.posix.MADV.SEQUENTIAL) catch {};
+        }
+    }
+}
+
+fn unmapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64) !void {
+    if (len == 0) return;
+    const memory = active_guest_memory orelse return error.NoGuestMemory;
+    const base = guestMemoryBase();
+    if (guest_addr < base) return error.InvalidGuestLayout;
+    const offset = guest_addr - base;
+    if (offset + len > memory.len) return error.InvalidGuestLayout;
+    if (len > std.math.maxInt(usize)) return error.InvalidGuestLayout;
+
+    const host_addr = @intFromPtr(memory.ptr) + @as(usize, @intCast(offset));
+    const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
+    const prot: u32 = @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE);
+    const flags = std.posix.MAP{
+        .TYPE = .PRIVATE,
+        .FIXED = true,
+        .ANONYMOUS = true,
+    };
+    _ = try std.posix.mmap(host_ptr, @intCast(len), prot, flags, -1, 0);
+}
+
+fn buildDaxMapper(memory_size_bytes: u64) virtio_fs.DaxMapper {
+    return .{
+        .ctx = null,
+        .window_base = guestMemoryBase(),
+        .window_size = memory_size_bytes,
+        .page_size = std.heap.page_size_min,
+        .map = mapDaxRegion,
+        .unmap = unmapDaxRegion,
+    };
+}
+
 fn writeGuestBytes(guest_addr: u64, data: []const u8) !void {
     // Caller must ensure guest memory has been mapped and registered via
     // setActiveGuestMemory (or future HVF memory mapping hooks).
@@ -2689,6 +3516,27 @@ fn loadKernelAndInitrd(
     };
 }
 
+fn signalActiveVcpuForStop() void {
+    if (builtin.os.tag != .macos) return;
+
+    if (builtin.cpu.arch == .aarch64) {
+        if (active_vcpu_id_arm) |vcpu| {
+            arm64_bindings.exit(vcpu) catch |e| {
+                log.warn("failed to exit arm64 vcpu: {s}", .{@errorName(e)});
+            };
+        }
+        return;
+    }
+
+    if (builtin.cpu.arch == .x86_64) {
+        if (active_vcpu_id_x86) |vcpu| {
+            x86_vcpu_bindings.interrupt(vcpu) catch |e| {
+                log.warn("failed to interrupt x86 vcpu: {s}", .{@errorName(e)});
+            };
+        }
+    }
+}
+
 /// Starts a VM with the HVF backend.
 ///
 /// This function performs the following steps:
@@ -2709,6 +3557,8 @@ fn loadKernelAndInitrd(
 pub fn start(cfg: config.VmConfig) !void {
     boot_timing.start_us = bootTimestamp();
     log.info("hvf backend starting", .{});
+    arm64_unknown_sysreg_trap_count.store(0, .seq_cst);
+    vcpu_thread_exited.store(true, .seq_cst);
 
     // Ensure no VM is already running (single VM at a time)
     if (vcpu_running.load(.seq_cst) or active_vm != null or active_vcpu_thread != null) return error.AlreadyRunning;
@@ -2727,11 +3577,25 @@ pub fn start(cfg: config.VmConfig) !void {
         return e;
     };
     active_vm = handle;
+    errdefer active_vm = null;
     boot_timing.vm_create_us = bootTimestamp();
 
     const size_bytes_u64 = try std.math.mul(u64, cfg.memory_mb, mb_to_bytes);
     if (size_bytes_u64 > std.math.maxInt(usize)) return error.MemoryTooLarge;
     const size_bytes: usize = @intCast(size_bytes_u64);
+    var vmnet_started = false;
+    var console_server_started = false;
+    var serial_stdin_started = false;
+
+    errdefer {
+        if (serial_stdin_started) stopSerialInputThread();
+        if (console_server_started) stopConsoleSocketServer(std.heap.page_allocator);
+        if (vmnet_started) {
+            stopVmnetInterface();
+            virtio.resetVirtioNetState();
+            vmnet_started = false;
+        }
+    }
 
     // Allocate guest memory using mmap for lazy (demand-paged) allocation.
     // This avoids committing physical memory until pages are actually accessed,
@@ -2798,7 +3662,8 @@ pub fn start(cfg: config.VmConfig) !void {
         (cfg.kernel_cmdline != null and std.mem.indexOf(u8, cfg.kernel_cmdline.?, "hvc0") != null);
     virtio.setupVirtioConsole(enable_virtio_console);
     virtio.setupVirtioRng(true);
-    virtio.setupVirtioFs(std.heap.page_allocator, cfg) catch |e| {
+    const dax_mapper = buildDaxMapper(size_bytes_u64);
+    virtio.setupVirtioFs(std.heap.page_allocator, cfg, dax_mapper) catch |e| {
         log.err("hvf virtio-fs setup failed: {s}", .{@errorName(e)});
         return e;
     };
@@ -2807,6 +3672,7 @@ pub fn start(cfg: config.VmConfig) !void {
         // Start vmnet interface in shared mode
         if (vmnet.startShared()) |vmnet_iface| {
             active_vmnet_iface = vmnet_iface;
+            vmnet_started = true;
             log.info(
                 "hvf vmnet started mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} mtu={d}",
                 .{
@@ -2816,16 +3682,27 @@ pub fn start(cfg: config.VmConfig) !void {
                 },
             );
             virtio.setupVirtioNet(true, vmnet_iface.mac);
-            virtio.setNetTxCallback(vmnetTxCallback);
             virtio.initNetworkPolicy(cfg) catch |e| {
                 log.err("hvf network policy init failed: {s}", .{@errorName(e)});
+                stopVmnetInterface();
+                vmnet_started = false;
+                virtio.resetVirtioNetState();
                 return e;
             };
-            startVmnetRxThread();
+            virtio.setNetTxCallback(vmnetTxCallback);
+            startVmnetRxThread() catch |e| {
+                log.err("hvf vmnet rx thread start failed: {s}", .{@errorName(e)});
+                stopVmnetInterface();
+                vmnet_started = false;
+                virtio.resetVirtioNetState();
+                return e;
+            };
         } else |e| {
             if (e == vmnet.VmnetError.NotAuthorized or e == vmnet.VmnetError.StartFailed) {
-                // vmnet returns VMNET_FAILURE (not NOT_AUTHORIZED) when missing entitlement
-                log.warn("hvf vmnet failed (run with sudo for networking)", .{});
+                log.warn(
+                    "hvf vmnet unavailable (check vmnet entitlement/codesign; enable with M80_VMNET_ENTITLEMENTS=1 at build)",
+                    .{},
+                );
             } else {
                 log.warn("hvf vmnet start failed: {s}", .{@errorName(e)});
             }
@@ -3086,6 +3963,7 @@ pub fn start(cfg: config.VmConfig) !void {
         vcpu_init.x86_regset = hvf_regset;
     }
     active_memory_size = @intCast(size_bytes_u64);
+    errdefer active_memory_size = 0;
 
     if (cfg.kernel_path == null) {
         log.warn("hvf kernel path not set; skipping vcpu run (set kernel_path in m80.conf)", .{});
@@ -3094,6 +3972,9 @@ pub fn start(cfg: config.VmConfig) !void {
     }
 
     vcpu_running.store(true, .seq_cst);
+    if (envFlagPresent(std.heap.page_allocator, "M80_START_PAUSED")) {
+        vcpu_pause_requested.store(true, .seq_cst);
+    }
     if (builtin.cpu.arch == .aarch64) {
         setupGic();
     }
@@ -3106,16 +3987,25 @@ pub fn start(cfg: config.VmConfig) !void {
     }
     serial.setCaptureFromEnv(std.heap.page_allocator);
     serial.clearConsoleBacklog();
-    startConsoleSocketServer(std.heap.page_allocator);
+    if (startConsoleSocketServer(std.heap.page_allocator)) {
+        console_server_started = true;
+    }
     if (shouldEnableSerialStdin(std.heap.page_allocator)) {
-        startSerialInputThread();
+        if (startSerialInputThread()) {
+            serial_stdin_started = true;
+        }
     }
     if (builtin.cpu.arch == .aarch64) {
         resetPl011State();
     }
     boot_timing.vcpu_start_us = bootTimestamp();
     logBootTiming();
-    active_vcpu_thread = try std.Thread.spawn(.{}, runVcpu, .{ 0, vcpu_init });
+    vcpu_thread_exited.store(false, .seq_cst);
+    active_vcpu_thread = std.Thread.spawn(.{}, runVcpu, .{ 0, vcpu_init }) catch |e| {
+        vcpu_running.store(false, .seq_cst);
+        vcpu_thread_exited.store(true, .seq_cst);
+        return e;
+    };
     log.info("hvf backend ready", .{});
 }
 
@@ -3129,32 +4019,33 @@ pub fn start(cfg: config.VmConfig) !void {
 pub fn stop() !void {
     log.info("hvf backend stopping", .{});
 
-    // Signal vCPU thread to stop
+    // Request vCPU shutdown.
+    vcpu_pause_requested.store(false, .seq_cst);
+    vcpu_paused.store(false, .seq_cst);
     vcpu_running.store(false, .seq_cst);
-    stopSerialInputThread();
-    stopConsoleSocketServer(std.heap.page_allocator);
 
-    if (builtin.os.tag == .macos) {
-        if (builtin.cpu.arch == .aarch64) {
-            if (active_vcpu_id_arm) |vcpu| {
-                arm64_bindings.exit(vcpu) catch |e| {
-                    log.warn("failed to exit arm64 vcpu: {s}", .{@errorName(e)});
-                };
-            }
-        } else if (builtin.cpu.arch == .x86_64) {
-            if (active_vcpu_id_x86) |vcpu| {
-                x86_vcpu_bindings.interrupt(vcpu) catch |e| {
-                    log.warn("failed to interrupt x86 vcpu: {s}", .{@errorName(e)});
-                };
-            }
+    if (active_vcpu_thread != null) {
+        var attempts: usize = 0;
+        while (!vcpu_thread_exited.load(.seq_cst) and attempts < vcpu_stop_signal_attempts) : (attempts += 1) {
+            signalActiveVcpuForStop();
+            std.Thread.sleep(vcpu_stop_signal_interval_ns);
+        }
+
+        if (!vcpu_thread_exited.load(.seq_cst)) {
+            log.err("hvf stop timed out waiting for vcpu thread exit", .{});
+            return error.VcpuStopTimeout;
         }
     }
+
+    stopSerialInputThread();
+    stopConsoleSocketServer(std.heap.page_allocator);
 
     // Wait for vCPU thread to exit
     if (active_vcpu_thread) |t| {
         t.join();
         active_vcpu_thread = null;
     }
+    vcpu_thread_exited.store(true, .seq_cst);
 
     // Clean up serial I/O state
     serial_io.clear(std.heap.page_allocator);
@@ -3197,6 +4088,7 @@ pub fn stop() !void {
     virtio.gic_virtio_net_intid = null;
     virtio.gic_virtio_fs_intid = null;
     gic_layout = null;
+    arm64_unknown_sysreg_trap_count.store(0, .seq_cst);
 }
 
 // =============================================================================
@@ -3427,6 +4319,35 @@ test "hvf: start rejects already running state" {
     try std.testing.expectError(error.AlreadyRunning, start(cfg_mut));
 }
 
+test "hvf: maybePauseVcpu clears paused flag when capture fails" {
+    const old_pause_requested = vcpu_pause_requested.load(.seq_cst);
+    const old_running = vcpu_running.load(.seq_cst);
+    const old_paused = vcpu_paused.load(.seq_cst);
+    defer {
+        vcpu_pause_requested.store(old_pause_requested, .seq_cst);
+        vcpu_running.store(old_running, .seq_cst);
+        vcpu_paused.store(old_paused, .seq_cst);
+    }
+
+    vcpu_pause_requested.store(true, .seq_cst);
+    vcpu_running.store(false, .seq_cst);
+    vcpu_paused.store(false, .seq_cst);
+
+    paused_vcpu_state_mutex.lock();
+    paused_vcpu_state = null;
+    paused_vcpu_state_error = null;
+    restore_vcpu_state = null;
+    restore_vcpu_state_error = null;
+    paused_vcpu_state_mutex.unlock();
+
+    maybePauseVcpu();
+    try std.testing.expect(!vcpu_paused.load(.seq_cst));
+
+    paused_vcpu_state_mutex.lock();
+    defer paused_vcpu_state_mutex.unlock();
+    try std.testing.expect(paused_vcpu_state_error != null);
+}
+
 test "hvf: loadGuestKernel errors on missing file" {
     try std.testing.expectError(error.FileNotFound, loadGuestKernel(64 * 1024 * 1024, "missing-kernel"));
 }
@@ -3475,7 +4396,7 @@ test "hvf: loadGuestKernel inflates gzip image" {
     try std.testing.expect(result.entry == null);
 
     const offset = guestKernelBase() - guestMemoryBase();
-    try std.testing.expectEqualStrings("KERN", guest_memory[@intCast(offset) .. @intCast(offset + 4)]);
+    try std.testing.expectEqualStrings("KERN", guest_memory[@intCast(offset)..@intCast(offset + 4)]);
 }
 
 test "hvf: copyFileToGuest uses mmap on supported platforms" {
@@ -3510,7 +4431,7 @@ test "hvf: copyFileToGuest uses mmap on supported platforms" {
     try std.testing.expectEqual(@as(u64, test_data.len), size);
 
     const offset = guest_base - guestMemoryBase();
-    try std.testing.expectEqualStrings(test_data, guest_memory[@intCast(offset) .. @intCast(offset + test_data.len)]);
+    try std.testing.expectEqualStrings(test_data, guest_memory[@intCast(offset)..@intCast(offset + test_data.len)]);
 }
 
 test "hvf: copyFileMmapToGuest loads file correctly" {
@@ -3548,7 +4469,7 @@ test "hvf: copyFileMmapToGuest loads file correctly" {
     try std.testing.expectEqual(@as(u64, test_content.len), size);
 
     const offset = guest_base - guestMemoryBase();
-    try std.testing.expectEqualStrings(test_content, guest_memory[@intCast(offset) .. @intCast(offset + test_content.len)]);
+    try std.testing.expectEqualStrings(test_content, guest_memory[@intCast(offset)..@intCast(offset + test_content.len)]);
 }
 
 test "hvf: allocateGuestMemoryLazy returns demand-paged memory" {
@@ -3725,13 +4646,119 @@ test "smoke: hvf arm64 boot emits serial output" {
     try std.testing.expect(found);
 }
 
+test "smoke: hvf arm64 repeated start-stop reliability" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
+    const enabled = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_HVF_RELIABILITY") catch null;
+    defer if (enabled) |v| std.testing.allocator.free(v);
+    if (enabled == null or !std.mem.eql(u8, enabled.?, "1")) return error.SkipZigTest;
+
+    const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    defer if (kernel) |k| std.testing.allocator.free(k);
+    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    defer if (initrd) |i| std.testing.allocator.free(i);
+    const disk = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
+    defer if (disk) |d| std.testing.allocator.free(d);
+    const expect = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_SERIAL_EXPECT") catch null;
+    defer if (expect) |e| std.testing.allocator.free(e);
+    if (kernel == null or (initrd == null and disk == null)) return error.SkipZigTest;
+
+    var reliability_cycles: usize = 20;
+    const cycles_text = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_HVF_RELIABILITY_CYCLES") catch null;
+    defer if (cycles_text) |v| std.testing.allocator.free(v);
+    if (cycles_text) |value| {
+        reliability_cycles = std.fmt.parseInt(usize, value, 10) catch 20;
+        if (reliability_cycles == 0) reliability_cycles = 20;
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
+    defer std.testing.allocator.free(out_path);
+
+    var out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+    out_file.close();
+
+    const serial_out_z = try allocZ(std.testing.allocator, "M80_SERIAL_OUT");
+    defer std.testing.allocator.free(serial_out_z);
+    const serial_out_path_z = try allocZ(std.testing.allocator, out_path);
+    defer std.testing.allocator.free(serial_out_path_z);
+    if (setenv(serial_out_z, serial_out_path_z, 1) != 0) return error.SkipZigTest;
+    defer _ = unsetenv(serial_out_z);
+
+    const console_z = try allocZ(std.testing.allocator, "M80_VIRTIO_CONSOLE");
+    defer std.testing.allocator.free(console_z);
+    const console_val_z = try allocZ(std.testing.allocator, "1");
+    defer std.testing.allocator.free(console_val_z);
+    _ = setenv(console_z, console_val_z, 1);
+    defer _ = unsetenv(console_z);
+
+    const cfg = try config.defaultConfig(std.testing.allocator, "test");
+    var cfg_mut = cfg;
+    defer config.freeConfig(std.testing.allocator, &cfg_mut);
+    cfg_mut.kernel_path = try std.testing.allocator.dupe(u8, kernel.?);
+    if (initrd) |path| {
+        cfg_mut.initrd_path = try std.testing.allocator.dupe(u8, path);
+    }
+    if (disk) |path| {
+        cfg_mut.disk_path = try std.testing.allocator.dupe(u8, path);
+        cfg_mut.disk_readonly = false;
+    }
+    cfg_mut.kernel_cmdline = try std.testing.allocator.dupe(
+        u8,
+        if (disk != null)
+            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8"
+        else
+            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 loglevel=8",
+    );
+
+    var cycle: usize = 0;
+    while (cycle < reliability_cycles) : (cycle += 1) {
+        var started = false;
+        start(cfg_mut) catch |e| {
+            std.debug.print("hvf reliability start cycle={d} failed: {s}\n", .{ cycle, @errorName(e) });
+            return error.SkipZigTest;
+        };
+        started = true;
+
+        var found = false;
+        var tries: usize = 0;
+        while (tries < 20) : (tries += 1) {
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+            if (expect) |needle| {
+                if (serial.captureContains(needle)) {
+                    found = true;
+                    break;
+                }
+            } else if (serial.captureLen() > 0) {
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            if (started) stop() catch {};
+            std.debug.print("hvf reliability serial missing cycle={d} len={d}\n", .{ cycle, serial.captureLen() });
+        }
+        try std.testing.expect(found);
+
+        try stop();
+    }
+}
+
 test "hvf: arm64 boot accepts console input" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
     const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
     defer if (kernel) |k| std.testing.allocator.free(k);
+    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    defer if (initrd) |i| std.testing.allocator.free(i);
     const disk = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
     defer if (disk) |d| std.testing.allocator.free(d);
+    const cmdline = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_CMDLINE") catch null;
+    defer if (cmdline) |c| std.testing.allocator.free(c);
     const login_input = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_LOGIN_INPUT") catch null;
     defer if (login_input) |v| std.testing.allocator.free(v);
     const login_expect = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_LOGIN_EXPECT") catch null;
@@ -3766,11 +4793,14 @@ test "hvf: arm64 boot accepts console input" {
     var cfg_mut = cfg;
     defer config.freeConfig(std.testing.allocator, &cfg_mut);
     cfg_mut.kernel_path = try std.testing.allocator.dupe(u8, kernel.?);
+    if (initrd) |path| {
+        cfg_mut.initrd_path = try std.testing.allocator.dupe(u8, path);
+    }
     cfg_mut.disk_path = try std.testing.allocator.dupe(u8, disk.?);
     cfg_mut.disk_readonly = false;
     cfg_mut.kernel_cmdline = try std.testing.allocator.dupe(
         u8,
-        "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8",
+        if (cmdline) |value| value else "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8",
     );
 
     var started = false;
