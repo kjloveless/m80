@@ -4,3 +4,15 @@ entitlements/
 images/
 codesign.conf
 docs/codesigning_hell.md
+
+# Generated VM/runtime artifacts
+.tmp/
+lib/modules/
+*.ko
+*.log
+*.deb
+*.zip
+.e2fsck/
+/sbin/
+/init
+/hello_dave
