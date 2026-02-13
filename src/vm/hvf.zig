@@ -47,6 +47,7 @@ const IoExit = serial.IoExit;
 const mb_to_bytes: u64 = 1024 * 1024;
 const vcpu_stop_signal_attempts: usize = 200;
 const vcpu_stop_signal_interval_ns: u64 = 10 * std.time.ns_per_ms;
+const vcpu_forced_stop_timeout_test_extra_ns: u64 = 250 * std.time.ns_per_ms;
 
 // Guest physical memory layout - standard Linux boot offsets (from RAM base)
 const guest_kernel_offset_x86: u64 = 0x100000; // 1 MB - bzImage load offset
@@ -2818,6 +2819,24 @@ fn maybePauseVcpu() void {
     }
 }
 
+fn stopTimeoutWindowNs() u64 {
+    return @as(u64, @intCast(vcpu_stop_signal_attempts)) * vcpu_stop_signal_interval_ns;
+}
+
+fn forceStopTimeoutTestDelayNs() u64 {
+    return stopTimeoutWindowNs() + vcpu_forced_stop_timeout_test_extra_ns;
+}
+
+fn shouldForceStopTimeoutForTests() bool {
+    if (!builtin.is_test) return false;
+    return envFlagPresent(std.heap.page_allocator, "M80_TEST_HVF_FORCE_STOP_TIMEOUT");
+}
+
+fn maybeDelayVcpuThreadExitForTests() void {
+    if (!shouldForceStopTimeoutForTests()) return;
+    std.Thread.sleep(forceStopTimeoutTestDelayNs());
+}
+
 const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)
     struct {
         fn run(index: u32, init: VcpuInit) void {
@@ -2908,6 +2927,7 @@ const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64
                 }
             }
             vcpu_running.store(false, .seq_cst);
+            maybeDelayVcpuThreadExitForTests();
             log.info("hvf arm64 vcpu {d} run loop exited", .{index});
         }
     }.run
@@ -2981,6 +3001,7 @@ const runVcpuX86 = if (builtin.os.tag == .macos and builtin.cpu.arch == .x86_64)
                 break;
             }
             vcpu_running.store(false, .seq_cst);
+            maybeDelayVcpuThreadExitForTests();
             log.info("hvf x86 vcpu {d} run loop exited", .{index});
         }
     }.run
@@ -4106,6 +4127,22 @@ fn allocZ(allocator: std.mem.Allocator, value: []const u8) ![:0]u8 {
     return buf[0..value.len :0];
 }
 
+fn expectLifecycleReset() !void {
+    try std.testing.expect(active_vm == null);
+    try std.testing.expect(active_guest_memory == null);
+    try std.testing.expect(active_vcpu_thread == null);
+    try std.testing.expect(!vcpu_running.load(.seq_cst));
+    try std.testing.expect(vcpu_thread_exited.load(.seq_cst));
+    try std.testing.expect(serial_input_thread == null);
+    try std.testing.expect(!serial_input_running.load(.seq_cst));
+    try std.testing.expect(console_socket_thread == null);
+    try std.testing.expect(!console_socket_running.load(.seq_cst));
+    try std.testing.expect(active_vmnet_iface == null);
+    try std.testing.expect(vmnet_rx_thread == null);
+    try std.testing.expect(!vmnet_rx_running.load(.seq_cst));
+    try std.testing.expect(active_memory_size == 0);
+}
+
 test "smoke: hvf backend start/stop" {
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
@@ -4117,6 +4154,7 @@ test "smoke: hvf backend start/stop" {
         else => return e,
     };
     try stop();
+    try expectLifecycleReset();
 }
 
 test "hvf: handleIoExit reads serial data" {
@@ -4745,7 +4783,66 @@ test "smoke: hvf arm64 repeated start-stop reliability" {
         try std.testing.expect(found);
 
         try stop();
+        try expectLifecycleReset();
     }
+}
+
+test "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
+    const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    defer if (kernel) |k| std.testing.allocator.free(k);
+    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    defer if (initrd) |i| std.testing.allocator.free(i);
+    const disk = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
+    defer if (disk) |d| std.testing.allocator.free(d);
+    if (kernel == null or (initrd == null and disk == null)) return error.SkipZigTest;
+
+    const force_timeout_z = try allocZ(std.testing.allocator, "M80_TEST_HVF_FORCE_STOP_TIMEOUT");
+    defer std.testing.allocator.free(force_timeout_z);
+    const one_z = try allocZ(std.testing.allocator, "1");
+    defer std.testing.allocator.free(one_z);
+    if (setenv(force_timeout_z, one_z, 1) != 0) return error.SkipZigTest;
+    defer _ = unsetenv(force_timeout_z);
+
+    const console_z = try allocZ(std.testing.allocator, "M80_VIRTIO_CONSOLE");
+    defer std.testing.allocator.free(console_z);
+    _ = setenv(console_z, one_z, 1);
+    defer _ = unsetenv(console_z);
+
+    const cfg = try config.defaultConfig(std.testing.allocator, "test");
+    var cfg_mut = cfg;
+    defer config.freeConfig(std.testing.allocator, &cfg_mut);
+    cfg_mut.kernel_path = try std.testing.allocator.dupe(u8, kernel.?);
+    if (initrd) |path| {
+        cfg_mut.initrd_path = try std.testing.allocator.dupe(u8, path);
+    }
+    if (disk) |path| {
+        cfg_mut.disk_path = try std.testing.allocator.dupe(u8, path);
+        cfg_mut.disk_readonly = false;
+    }
+    cfg_mut.kernel_cmdline = try std.testing.allocator.dupe(
+        u8,
+        if (disk != null)
+            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8"
+        else
+            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 loglevel=8",
+    );
+
+    var started = false;
+    start(cfg_mut) catch |e| {
+        std.debug.print("hvf forced-timeout test start failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    started = true;
+    defer if (started) stop() catch {};
+
+    try std.testing.expectError(error.VcpuStopTimeout, stop());
+
+    std.Thread.sleep(forceStopTimeoutTestDelayNs() + (100 * std.time.ns_per_ms));
+    try stop();
+    started = false;
+    try expectLifecycleReset();
 }
 
 test "hvf: arm64 boot accepts console input" {

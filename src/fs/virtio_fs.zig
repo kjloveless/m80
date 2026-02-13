@@ -184,6 +184,17 @@ pub const FuseSetattrIn = extern struct {
     unused5: u64,
 };
 
+// FUSE SETATTR valid bits
+const FATTR_MODE: u32 = 1 << 0;
+const FATTR_UID: u32 = 1 << 1;
+const FATTR_GID: u32 = 1 << 2;
+const FATTR_SIZE: u32 = 1 << 3;
+const FATTR_ATIME: u32 = 1 << 4;
+const FATTR_MTIME: u32 = 1 << 5;
+const FATTR_ATIME_NOW: u32 = 1 << 7;
+const FATTR_MTIME_NOW: u32 = 1 << 8;
+const FATTR_CTIME: u32 = 1 << 10;
+
 pub const FuseAttr = extern struct {
     ino: u64,
     size: u64,
@@ -201,6 +212,21 @@ pub const FuseAttr = extern struct {
     rdev: u32,
     blksize: u32,
     flags: u32,
+};
+
+const StatView = struct {
+    size: u64,
+    blocks: u64,
+    atime_ns: i128,
+    mtime_ns: i128,
+    ctime_ns: i128,
+    mode: u32,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u32,
+    blksize: u32,
+    kind: std.fs.File.Kind,
 };
 
 pub const FuseAttrOut = extern struct {
@@ -242,6 +268,41 @@ pub const FuseCreateIn = extern struct {
     mode: u32,
     umask: u32,
     open_flags: u32,
+};
+
+pub const FuseSetupmappingIn = extern struct {
+    fh: u64,
+    foffset: u64,
+    len: u64,
+    flags: u64,
+    moffset: u64,
+};
+
+pub const FuseRemovemappingIn = extern struct {
+    count: u32,
+    padding: u32,
+};
+
+pub const FuseRemovemappingOne = extern struct {
+    moffset: u64,
+    len: u64,
+};
+
+pub const DaxMapper = struct {
+    ctx: ?*anyopaque,
+    window_base: u64,
+    window_size: u64,
+    page_size: u64,
+    map: *const fn (ctx: ?*anyopaque, guest_addr: u64, len: u64, fd: std.posix.fd_t, file_offset: u64, writable: bool) anyerror!void,
+    unmap: *const fn (ctx: ?*anyopaque, guest_addr: u64, len: u64) anyerror!void,
+};
+
+const DaxMapping = struct {
+    moffset: u64,
+    len: u64,
+    foffset: u64,
+    fh: u64,
+    writable: bool,
 };
 
 pub const FuseOpenOut = extern struct {
@@ -466,6 +527,7 @@ pub const NodeHandle = struct {
     inode: u64,
     path: []const u8,
     is_dir: bool,
+    generation: u64,
 };
 
 pub const FileHandle = struct {
@@ -473,6 +535,9 @@ pub const FileHandle = struct {
     node: *NodeHandle,
     file: ?std.fs.File,
     dir: ?std.fs.Dir,
+    open_flags: u32,
+    append: bool,
+    sync_mode: SyncMode,
 };
 
 pub const VirtioFsDevice = struct {
@@ -481,10 +546,13 @@ pub const VirtioFsDevice = struct {
     tag: []const u8,
     cache_mode: CacheMode,
     next_nodeid: u64,
+    next_generation: u64,
     next_fh: u64,
     nodes: std.AutoHashMap(u64, NodeHandle),
     handles: std.AutoHashMap(u64, FileHandle),
     features: u64,
+    dax: ?DaxMapper,
+    dax_mappings: std.ArrayListUnmanaged(DaxMapping),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -499,11 +567,18 @@ pub const VirtioFsDevice = struct {
             .tag = tag,
             .cache_mode = cache_mode,
             .next_nodeid = 2,
+            .next_generation = 2,
             .next_fh = 1,
             .nodes = std.AutoHashMap(u64, NodeHandle).init(allocator),
             .handles = std.AutoHashMap(u64, FileHandle).init(allocator),
             .features = VirtioFeatures.VIRTIO_F_VERSION_1,
+            .dax = null,
+            .dax_mappings = .{},
         };
+    }
+
+    pub fn configureDax(self: *VirtioFsDevice, dax: DaxMapper) void {
+        self.dax = dax;
     }
 
     pub fn deinit(self: *VirtioFsDevice) void {
@@ -522,6 +597,7 @@ pub const VirtioFsDevice = struct {
             }
         }
         self.handles.deinit();
+        self.dax_mappings.deinit(self.allocator);
     }
 
     pub fn handleRequest(
@@ -685,15 +761,15 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        const stat = std.fs.cwd().statFile(full_path) catch {
+        const stat = statPath(full_path, false) catch {
             return self.sendError(header, -2, response_buf);
         };
 
         const nodeid = self.allocateNode(full_path, stat.kind == .directory) catch {
             return self.sendError(header, -12, response_buf);
         };
-
-        return self.sendEntryOut(header, nodeid, &stat, response_buf);
+        const generation = self.nodeGeneration(nodeid);
+        return self.sendEntryOut(header, nodeid, generation, &stat, response_buf);
     }
 
     fn handleForget(
@@ -780,9 +856,10 @@ pub const VirtioFsDevice = struct {
             else => return self.sendError(header, -5, response_buf),
         };
 
-        const stat = std.fs.cwd().statFile(full_path) catch return self.sendError(header, -5, response_buf);
+        const stat = statPath(full_path, false) catch return self.sendError(header, -5, response_buf);
         const nodeid = self.allocateNode(full_path, false) catch return self.sendError(header, -12, response_buf);
-        return self.sendEntryOut(header, nodeid, &stat, response_buf);
+        const generation = self.nodeGeneration(nodeid);
+        return self.sendEntryOut(header, nodeid, generation, &stat, response_buf);
     }
 
     fn handleRename(
@@ -886,7 +963,7 @@ pub const VirtioFsDevice = struct {
         defer self.allocator.free(new_path);
 
         if (rename2_in.flags == RENAME_NOREPLACE) {
-            if (std.fs.cwd().statFile(new_path)) |_| {
+            if (statPath(new_path, true)) |_| {
                 return self.sendError(header, -17, response_buf);
             } else |_| {}
         }
@@ -943,9 +1020,10 @@ pub const VirtioFsDevice = struct {
             else => return self.sendError(header, -5, response_buf),
         };
 
-        const stat = std.fs.cwd().statFile(new_path) catch return self.sendError(header, -5, response_buf);
+        const stat = statPath(new_path, true) catch return self.sendError(header, -5, response_buf);
         const nodeid = self.allocateNode(new_path, stat.kind == .directory) catch return self.sendError(header, -12, response_buf);
-        return self.sendEntryOut(header, nodeid, &stat, response_buf);
+        const generation = self.nodeGeneration(nodeid);
+        return self.sendEntryOut(header, nodeid, generation, &stat, response_buf);
     }
 
     fn handleGetattr(
@@ -962,20 +1040,12 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        const stat = std.fs.cwd().statFile(node.path) catch {
+        const stat = statPath(node.path, false) catch {
             return self.sendError(header, -2, response_buf);
         };
 
         return self.sendAttrOut(header, &stat, response_buf);
     }
-
-    // FUSE SETATTR valid bits
-    const FATTR_MODE: u32 = 1 << 0;
-    const FATTR_SIZE: u32 = 1 << 3;
-    const FATTR_ATIME: u32 = 1 << 4;
-    const FATTR_MTIME: u32 = 1 << 5;
-    const FATTR_ATIME_NOW: u32 = 1 << 7;
-    const FATTR_MTIME_NOW: u32 = 1 << 8;
 
     fn handleSetattr(
         self: *VirtioFsDevice,
@@ -996,7 +1066,7 @@ pub const VirtioFsDevice = struct {
         var setattr_in: FuseSetattrIn = std.mem.zeroes(FuseSetattrIn);
         @memcpy(std.mem.asBytes(&setattr_in)[0..payload.len], payload);
         const valid = setattr_in.valid;
-        const wants_write = (valid & (FATTR_SIZE | FATTR_MODE | FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW)) != 0;
+        const wants_write = (valid & (FATTR_SIZE | FATTR_MODE | FATTR_UID | FATTR_GID | FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW | FATTR_CTIME)) != 0;
         if (wants_write) {
             if (self.validateAccess(node.path, .write)) |errno| {
                 return self.sendError(header, errno, response_buf);
@@ -1022,12 +1092,34 @@ pub const VirtioFsDevice = struct {
             };
         }
 
+        if (valid & (FATTR_UID | FATTR_GID) != 0) {
+            const stat_before = statPath(node.path, true) catch {
+                return self.sendError(header, -2, response_buf);
+            };
+            var flags = std.posix.O{ .ACCMODE = .RDONLY };
+            flags.CLOEXEC = true;
+            if ((stat_before.mode & std.posix.S.IFMT) == std.posix.S.IFDIR) {
+                flags.DIRECTORY = true;
+            }
+            const fd = std.posix.openat(std.fs.cwd().fd, node.path, flags, 0) catch {
+                return self.sendError(header, -13, response_buf);
+            };
+            defer std.posix.close(fd);
+            const uid: ?std.posix.uid_t = if (valid & FATTR_UID != 0) @intCast(setattr_in.uid) else null;
+            const gid: ?std.posix.gid_t = if (valid & FATTR_GID != 0) @intCast(setattr_in.gid) else null;
+            std.posix.fchown(fd, uid, gid) catch |e| switch (e) {
+                error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => return self.sendError(header, -13, response_buf),
+                error.FileNotFound => return self.sendError(header, -2, response_buf),
+                else => return self.sendError(header, -5, response_buf),
+            };
+        }
+
         // Apply timestamp changes (utime/utimes)
         const has_atime = (valid & FATTR_ATIME != 0) or (valid & FATTR_ATIME_NOW != 0);
         const has_mtime = (valid & FATTR_MTIME != 0) or (valid & FATTR_MTIME_NOW != 0);
         if (has_atime or has_mtime) {
             // Get current stat for OMIT cases and UTIME_NOW
-            const current_stat = std.fs.cwd().statFile(node.path) catch {
+            const current_stat = statPath(node.path, true) catch {
                 return self.sendError(header, -2, response_buf); // ENOENT
             };
             const now = std.time.nanoTimestamp();
@@ -1040,7 +1132,7 @@ pub const VirtioFsDevice = struct {
                 atime_ns = @as(i128, setattr_in.atime) * std.time.ns_per_s + setattr_in.atimensec;
             } else {
                 // OMIT: keep current atime
-                atime_ns = current_stat.atime;
+                atime_ns = current_stat.atime_ns;
             }
 
             // Compute mtime in nanoseconds
@@ -1051,7 +1143,7 @@ pub const VirtioFsDevice = struct {
                 mtime_ns = @as(i128, setattr_in.mtime) * std.time.ns_per_s + setattr_in.mtimensec;
             } else {
                 // OMIT: keep current mtime
-                mtime_ns = current_stat.mtime;
+                mtime_ns = current_stat.mtime_ns;
             }
 
             // Open file and update times
@@ -1065,7 +1157,7 @@ pub const VirtioFsDevice = struct {
         }
 
         // Return updated attributes
-        const stat = std.fs.cwd().statFile(node.path) catch {
+        const stat = statPath(node.path, true) catch {
             return self.sendError(header, -2, response_buf); // ENOENT
         };
 
@@ -1094,6 +1186,9 @@ pub const VirtioFsDevice = struct {
         const open_in: *const FuseOpenIn = @ptrCast(@alignCast(payload.ptr));
         const accmode = open_in.flags & O_ACCMODE;
         const write_access = accmode != O_RDONLY;
+        if ((open_in.flags & O_TRUNC) != 0 and !write_access) {
+            return self.sendError(header, -13, response_buf);
+        }
         if (write_access) {
             if (self.validateAccess(node.path, .write)) |errno| {
                 return self.sendError(header, errno, response_buf);
@@ -1111,7 +1206,14 @@ pub const VirtioFsDevice = struct {
             else => return self.sendError(header, -5, response_buf),
         };
 
-        const fh = self.allocateFileHandle(header.nodeid, file) catch {
+        if ((open_in.flags & O_TRUNC) != 0) {
+            file.setEndPos(0) catch {
+                file.close();
+                return self.sendError(header, -13, response_buf);
+            };
+        }
+
+        const fh = self.allocateFileHandle(header.nodeid, file, open_in.flags) catch {
             file.close();
             return self.sendError(header, -12, response_buf);
         };
@@ -1160,9 +1262,10 @@ pub const VirtioFsDevice = struct {
             else => return self.sendError(header, -5, response_buf),
         };
 
-        const stat = std.fs.cwd().statFile(full_path) catch return self.sendError(header, -5, response_buf);
+        const stat = statPath(full_path, true) catch return self.sendError(header, -5, response_buf);
         const nodeid = self.allocateNode(full_path, true) catch return self.sendError(header, -12, response_buf);
-        return self.sendEntryOut(header, nodeid, &stat, response_buf);
+        const generation = self.nodeGeneration(nodeid);
+        return self.sendEntryOut(header, nodeid, generation, &stat, response_buf);
     }
 
     fn handleMknod(
@@ -1211,9 +1314,10 @@ pub const VirtioFsDevice = struct {
         };
         defer file.close();
 
-        const stat = std.fs.cwd().statFile(full_path) catch return self.sendError(header, -5, response_buf);
+        const stat = statPath(full_path, true) catch return self.sendError(header, -5, response_buf);
         const nodeid = self.allocateNode(full_path, false) catch return self.sendError(header, -12, response_buf);
-        return self.sendEntryOut(header, nodeid, &stat, response_buf);
+        const generation = self.nodeGeneration(nodeid);
+        return self.sendEntryOut(header, nodeid, generation, &stat, response_buf);
     }
 
     fn handleRead(
@@ -1287,8 +1391,16 @@ pub const VirtioFsDevice = struct {
         const data = payload[data_offset..][0..write_in.size];
 
         var f = file;
-        f.seekTo(write_in.offset) catch return self.sendError(header, -5, response_buf);
+        if (handle.append) {
+            const end_pos = f.getEndPos() catch return self.sendError(header, -5, response_buf);
+            f.seekTo(end_pos) catch return self.sendError(header, -5, response_buf);
+        } else {
+            f.seekTo(write_in.offset) catch return self.sendError(header, -5, response_buf);
+        }
         const bytes_written = f.write(data) catch return self.sendError(header, -5, response_buf);
+        if (handle.sync_mode != .none) {
+            syncFile(&f, handle.sync_mode) catch return self.sendError(header, -5, response_buf);
+        }
 
         return self.sendWriteOut(header, @intCast(bytes_written), response_buf);
     }
@@ -1401,6 +1513,9 @@ pub const VirtioFsDevice = struct {
         const create_in: *const FuseCreateIn = @ptrCast(@alignCast(payload.ptr));
         const accmode = create_in.flags & O_ACCMODE;
         const read_enabled = accmode != O_WRONLY;
+        if ((create_in.flags & O_TRUNC) != 0 and accmode == O_RDONLY) {
+            return self.sendError(header, -13, response_buf);
+        }
         const file_mode: std.fs.File.OpenMode = if (accmode == O_WRONLY) .write_only else if (accmode == O_RDWR) .read_write else .read_only;
         const file = std.fs.cwd().createFile(full_path, .{ .read = read_enabled, .truncate = false }) catch |e| switch (e) {
             error.PathAlreadyExists => std.fs.cwd().openFile(full_path, .{ .mode = file_mode }) catch |open_err| switch (open_err) {
@@ -1413,7 +1528,14 @@ pub const VirtioFsDevice = struct {
             else => return self.sendError(header, -5, response_buf),
         };
 
-        const stat = file.stat() catch {
+        if ((create_in.flags & O_TRUNC) != 0) {
+            file.setEndPos(0) catch {
+                file.close();
+                return self.sendError(header, -13, response_buf);
+            };
+        }
+
+        const stat = statPath(full_path, true) catch {
             file.close();
             return self.sendError(header, -5, response_buf);
         };
@@ -1422,12 +1544,13 @@ pub const VirtioFsDevice = struct {
             file.close();
             return self.sendError(header, -12, response_buf);
         };
-        const fh = self.allocateFileHandle(nodeid, file) catch {
+        const fh = self.allocateFileHandle(nodeid, file, create_in.flags) catch {
             file.close();
             return self.sendError(header, -12, response_buf);
         };
 
-        return self.sendCreateOut(header, nodeid, &stat, fh, response_buf);
+        const generation = self.nodeGeneration(nodeid);
+        return self.sendCreateOut(header, nodeid, generation, &stat, fh, response_buf);
     }
 
     fn handleUnlink(
@@ -1727,16 +1850,17 @@ pub const VirtioFsDevice = struct {
             };
             defer self.allocator.free(full_path);
 
-            const stat = std.fs.cwd().statFile(full_path) catch {
-                return self.sendError(header, -2, response_buf);
-            };
+        const stat = statPath(full_path, false) catch {
+            return self.sendError(header, -2, response_buf);
+        };
             const nodeid = self.allocateNode(full_path, stat.kind == .directory) catch {
                 return self.sendError(header, -12, response_buf);
             };
+            const generation = self.nodeGeneration(nodeid);
 
             var entry_out = FuseEntryOut{
                 .nodeid = nodeid,
-                .generation = 1,
+                .generation = generation,
                 .entry_valid = 1,
                 .attr_valid = 1,
                 .entry_valid_nsec = 0,
@@ -2360,13 +2484,36 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        if (fallocate_in.mode != 0) {
-            return self.sendError(header, -38, response_buf);
+        const keep_size = (fallocate_in.mode & FALLOC_FL_KEEP_SIZE) != 0;
+        const punch_hole = (fallocate_in.mode & FALLOC_FL_PUNCH_HOLE) != 0;
+        const unsupported = (fallocate_in.mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE)) != 0;
+        if (unsupported) {
+            return self.sendError(header, -95, response_buf);
+        }
+        if (punch_hole and !keep_size) {
+            return self.sendError(header, -22, response_buf);
         }
 
-        const end_pos = fallocate_in.offset + fallocate_in.length;
-        file.setEndPos(end_pos) catch return self.sendError(header, -5, response_buf);
-        return self.sendError(header, 0, response_buf);
+        if (fallocate_in.mode == 0) {
+            const end_pos = fallocate_in.offset + fallocate_in.length;
+            file.setEndPos(end_pos) catch return self.sendError(header, -5, response_buf);
+            return self.sendError(header, 0, response_buf);
+        }
+
+        if (builtin.os.tag == .linux) {
+            const rc = c.fallocate(
+                file.handle,
+                @intCast(fallocate_in.mode),
+                @intCast(fallocate_in.offset),
+                @intCast(fallocate_in.length),
+            );
+            if (rc != 0) {
+                return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
+            }
+            return self.sendError(header, 0, response_buf);
+        }
+
+        return self.sendError(header, -95, response_buf);
     }
 
     fn handleSetupmapping(
@@ -2375,7 +2522,36 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = payload;
+        if (payload.len < @sizeOf(FuseSetupmappingIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const setup_in: *const FuseSetupmappingIn = @ptrCast(@alignCast(payload.ptr));
+        const handle = self.handles.get(setup_in.fh) orelse return self.sendError(header, -9, response_buf);
+        const file = handle.file orelse return self.sendError(header, -9, response_buf);
+        const dax = self.dax orelse return self.sendError(header, -95, response_buf);
+        if (setup_in.len == 0) return self.sendError(header, 0, response_buf);
+
+        const page_size = if (dax.page_size != 0) dax.page_size else std.heap.page_size_min;
+        if ((setup_in.foffset % page_size) != 0 or (setup_in.moffset % page_size) != 0 or (setup_in.len % page_size) != 0) {
+            return self.sendError(header, -22, response_buf);
+        }
+
+        const end_offset = setup_in.moffset + setup_in.len;
+        if (end_offset > dax.window_size) {
+            return self.sendError(header, -22, response_buf);
+        }
+
+        const writable = (setup_in.flags & FUSE_SETUPMAPPING_FLAG_WRITE) != 0;
+        const guest_addr = dax.window_base + setup_in.moffset;
+        if (self.isDaxMappingCached(setup_in.moffset, setup_in.len, setup_in.foffset, setup_in.fh, writable)) {
+            return self.sendError(header, 0, response_buf);
+        }
+        dax.map(dax.ctx, guest_addr, setup_in.len, file.handle, setup_in.foffset, writable) catch {
+            return self.sendError(header, -5, response_buf);
+        };
+        self.cacheDaxMapping(setup_in.moffset, setup_in.len, setup_in.foffset, setup_in.fh, writable) catch {
+            return self.sendError(header, -12, response_buf);
+        };
         return self.sendError(header, 0, response_buf);
     }
 
@@ -2385,7 +2561,34 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        _ = payload;
+        if (payload.len < @sizeOf(FuseRemovemappingIn)) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const remove_in: *const FuseRemovemappingIn = @ptrCast(@alignCast(payload.ptr));
+        const needed = @sizeOf(FuseRemovemappingIn) + @as(usize, @intCast(remove_in.count)) * @sizeOf(FuseRemovemappingOne);
+        if (payload.len < needed) {
+            return self.sendError(header, -22, response_buf);
+        }
+        const dax = self.dax orelse return self.sendError(header, -95, response_buf);
+        if (remove_in.count == 0) return self.sendError(header, 0, response_buf);
+
+        var offset: usize = @sizeOf(FuseRemovemappingIn);
+        var i: u32 = 0;
+        while (i < remove_in.count) : (i += 1) {
+            const one: *const FuseRemovemappingOne = @ptrCast(@alignCast(payload[offset..].ptr));
+            if (one.len == 0) {
+                offset += @sizeOf(FuseRemovemappingOne);
+                continue;
+            }
+            const end_offset = one.moffset + one.len;
+            if (end_offset > dax.window_size) return self.sendError(header, -22, response_buf);
+            const guest_addr = dax.window_base + one.moffset;
+            dax.unmap(dax.ctx, guest_addr, one.len) catch {
+                return self.sendError(header, -5, response_buf);
+            };
+            self.dropDaxMappings(one.moffset, one.len);
+            offset += @sizeOf(FuseRemovemappingOne);
+        }
         return self.sendError(header, 0, response_buf);
     }
 
@@ -2422,7 +2625,7 @@ pub const VirtioFsDevice = struct {
     fn sendAttrOut(
         _: *VirtioFsDevice,
         header: *const FuseInHeader,
-        stat: *const std.fs.File.Stat,
+        stat: *const StatView,
         response_buf: []u8,
     ) VirtioFsError!usize {
         const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseAttrOut);
@@ -2448,7 +2651,8 @@ pub const VirtioFsDevice = struct {
         _: *VirtioFsDevice,
         header: *const FuseInHeader,
         nodeid: u64,
-        stat: *const std.fs.File.Stat,
+        generation: u64,
+        stat: *const StatView,
         fh: u64,
         response_buf: []u8,
     ) VirtioFsError!usize {
@@ -2464,7 +2668,7 @@ pub const VirtioFsDevice = struct {
 
         const entry_out: *FuseEntryOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
         entry_out.nodeid = nodeid;
-        entry_out.generation = 1;
+        entry_out.generation = generation;
         entry_out.entry_valid = 1;
         entry_out.attr_valid = 1;
         entry_out.entry_valid_nsec = 0;
@@ -2485,7 +2689,8 @@ pub const VirtioFsDevice = struct {
         _: *VirtioFsDevice,
         header: *const FuseInHeader,
         nodeid: u64,
-        stat: *const std.fs.File.Stat,
+        generation: u64,
+        stat: *const StatView,
         response_buf: []u8,
     ) VirtioFsError!usize {
         const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut);
@@ -2500,7 +2705,7 @@ pub const VirtioFsDevice = struct {
 
         const entry_out: *FuseEntryOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
         entry_out.nodeid = nodeid;
-        entry_out.generation = 1;
+        entry_out.generation = generation;
         entry_out.entry_valid = 1;
         entry_out.attr_valid = 1;
         entry_out.entry_valid_nsec = 0;
@@ -2561,15 +2766,23 @@ pub const VirtioFsDevice = struct {
         // Nodes are reference-counted by kernel; we store path and type.
         const nodeid = self.next_nodeid;
         self.next_nodeid += 1;
+        const generation = self.next_generation;
+        self.next_generation += 1;
 
         const owned_path = try self.allocator.dupe(u8, path);
         try self.nodes.put(nodeid, .{
             .inode = nodeid,
             .path = owned_path,
             .is_dir = is_dir,
+            .generation = generation,
         });
 
         return nodeid;
+    }
+
+    fn nodeGeneration(self: *VirtioFsDevice, nodeid: u64) u64 {
+        if (self.nodes.get(nodeid)) |node| return node.generation;
+        return 0;
     }
 
     fn ensureRootNode(self: *VirtioFsDevice) VirtioFsError!void {
@@ -2579,7 +2792,7 @@ pub const VirtioFsDevice = struct {
             return VirtioFsError.NotFound;
         };
 
-        const stat = std.fs.cwd().statFile(mount.host_path) catch {
+        const stat = statPath(mount.host_path, true) catch {
             return VirtioFsError.NotFound;
         };
 
@@ -2592,19 +2805,24 @@ pub const VirtioFsDevice = struct {
             .inode = 1,
             .path = owned_path,
             .is_dir = stat.kind == .directory,
+            .generation = 1,
         }) catch return VirtioFsError.OutOfMemory;
     }
 
-    fn allocateFileHandle(self: *VirtioFsDevice, nodeid: u64, file: std.fs.File) !u64 {
+    fn allocateFileHandle(self: *VirtioFsDevice, nodeid: u64, file: std.fs.File, open_flags: u32) !u64 {
         const fh = self.next_fh;
         self.next_fh += 1;
 
         const node = self.nodes.getPtr(nodeid) orelse return error.InvalidHandle;
+        const open_state = parseOpenFlags(open_flags);
         try self.handles.put(fh, .{
             .handle_id = fh,
             .node = node,
             .file = file,
             .dir = null,
+            .open_flags = open_flags,
+            .append = open_state.append,
+            .sync_mode = open_state.sync_mode,
         });
 
         return fh;
@@ -2620,6 +2838,9 @@ pub const VirtioFsDevice = struct {
             .node = node,
             .file = null,
             .dir = dir,
+            .open_flags = 0,
+            .append = false,
+            .sync_mode = .none,
         });
 
         return fh;
@@ -2640,17 +2861,138 @@ pub const VirtioFsDevice = struct {
         };
         return null;
     }
+
+    fn isDaxMappingCached(
+        self: *VirtioFsDevice,
+        moffset: u64,
+        len: u64,
+        foffset: u64,
+        fh: u64,
+        writable: bool,
+    ) bool {
+        for (self.dax_mappings.items) |mapping| {
+            if (mapping.moffset == moffset and mapping.len == len and mapping.foffset == foffset and mapping.fh == fh and mapping.writable == writable) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn cacheDaxMapping(self: *VirtioFsDevice, moffset: u64, len: u64, foffset: u64, fh: u64, writable: bool) !void {
+        if (len == 0) return;
+        const delta: i128 = @as(i128, @intCast(moffset)) - @as(i128, @intCast(foffset));
+        var i: usize = 0;
+        while (i < self.dax_mappings.items.len) {
+            var mapping = &self.dax_mappings.items[i];
+            if (mapping.fh != fh or mapping.writable != writable) {
+                i += 1;
+                continue;
+            }
+            const mapping_delta: i128 = @as(i128, @intCast(mapping.moffset)) - @as(i128, @intCast(mapping.foffset));
+            if (mapping_delta != delta) {
+                i += 1;
+                continue;
+            }
+            const new_start = @min(moffset, mapping.moffset);
+            const new_end = @max(moffset + len, mapping.moffset + mapping.len);
+            const overlaps = moffset <= mapping.moffset + mapping.len and mapping.moffset <= moffset + len;
+            const adjacent = (moffset + len == mapping.moffset) or (mapping.moffset + mapping.len == moffset);
+            if (!overlaps and !adjacent) {
+                i += 1;
+                continue;
+            }
+            if (new_start == mapping.moffset and new_end == mapping.moffset + mapping.len) {
+                return;
+            }
+            mapping.moffset = new_start;
+            mapping.len = new_end - new_start;
+            mapping.foffset = @intCast(@as(i128, @intCast(mapping.moffset)) - delta);
+            // Restart scan to coalesce with any newly-adjacent mappings.
+            i = 0;
+            continue;
+        }
+
+        try self.dax_mappings.append(self.allocator, .{
+            .moffset = moffset,
+            .len = len,
+            .foffset = foffset,
+            .fh = fh,
+            .writable = writable,
+        });
+    }
+
+    fn dropDaxMappings(self: *VirtioFsDevice, moffset: u64, len: u64) void {
+        if (self.dax_mappings.items.len == 0) return;
+        const end = moffset + len;
+        var i: usize = 0;
+        while (i < self.dax_mappings.items.len) {
+            const mapping = self.dax_mappings.items[i];
+            const map_end = mapping.moffset + mapping.len;
+            const overlaps = moffset < map_end and mapping.moffset < end;
+            if (overlaps) {
+                _ = self.dax_mappings.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
 };
 
 const O_ACCMODE: u32 = 0x3;
 const O_RDONLY: u32 = 0x0;
 const O_WRONLY: u32 = 0x1;
 const O_RDWR: u32 = 0x2;
+const O_TRUNC: u32 = 0x200;
+const O_APPEND: u32 = 0x400;
+const O_DSYNC: u32 = 0x1000;
+const O_SYNC: u32 = 0x101000;
+
+const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+const FUSE_SETUPMAPPING_FLAG_WRITE: u64 = 0x01;
 
 const ParseResult = struct {
     slice: []const u8,
     next: usize,
 };
+
+const OpenFlagState = struct {
+    append: bool,
+    sync_mode: SyncMode,
+};
+
+const SyncMode = enum {
+    none,
+    data,
+    full,
+};
+
+fn parseOpenFlags(flags: u32) OpenFlagState {
+    var sync_mode: SyncMode = .none;
+    if ((flags & O_SYNC) != 0) {
+        sync_mode = .full;
+    } else if ((flags & O_DSYNC) != 0) {
+        sync_mode = .data;
+    }
+    return .{
+        .append = (flags & O_APPEND) != 0,
+        .sync_mode = sync_mode,
+    };
+}
+
+fn syncFile(file: *std.fs.File, mode: SyncMode) !void {
+    switch (mode) {
+        .none => return,
+        .full => try file.sync(),
+        .data => {
+            if (builtin.os.tag == .windows) {
+                try file.sync();
+                return;
+            }
+            try std.posix.fdatasync(file.handle);
+        },
+    }
+}
 
 fn toZ(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var buf = try allocator.alloc(u8, s.len + 1);
@@ -2733,30 +3075,69 @@ fn flockToLock(flock: c.struct_flock) FuseFileLock {
     };
 }
 
-fn statToFuseAttr(nodeid: u64, stat: *const std.fs.File.Stat) FuseAttr {
-    var mode: u32 = 0o644;
-    if (stat.kind == .directory) {
-        mode = 0o755 | 0o040000;
-    } else {
-        mode = 0o644 | 0o100000;
+fn statPath(path: []const u8, follow: bool) !StatView {
+    if (builtin.os.tag == .windows) {
+        const stat = try std.fs.cwd().statFile(path);
+        const mode: u32 = switch (stat.kind) {
+            .directory => 0o040000 | 0o755,
+            else => 0o100000 | 0o644,
+        };
+        return .{
+            .size = stat.size,
+            .blocks = (stat.size + 511) / 512,
+            .atime_ns = stat.atime,
+            .mtime_ns = stat.mtime,
+            .ctime_ns = stat.ctime,
+            .mode = mode,
+            .nlink = 1,
+            .uid = 0,
+            .gid = 0,
+            .rdev = 0,
+            .blksize = 4096,
+            .kind = stat.kind,
+        };
     }
+
+    const flags: u32 = if (follow) 0 else @as(u32, std.posix.AT.SYMLINK_NOFOLLOW);
+    const st = try std.posix.fstatat(std.posix.AT.FDCWD, path, flags);
+    const atime = st.atime();
+    const mtime = st.mtime();
+    const ctime = st.ctime();
+    const kind: std.fs.File.Kind = std.fs.File.Stat.fromPosix(st).kind;
+    return .{
+        .size = @bitCast(st.size),
+        .blocks = @bitCast(st.blocks),
+        .atime_ns = @as(i128, atime.sec) * std.time.ns_per_s + atime.nsec,
+        .mtime_ns = @as(i128, mtime.sec) * std.time.ns_per_s + mtime.nsec,
+        .ctime_ns = @as(i128, ctime.sec) * std.time.ns_per_s + ctime.nsec,
+        .mode = @intCast(st.mode),
+        .nlink = @intCast(st.nlink),
+        .uid = @intCast(st.uid),
+        .gid = @intCast(st.gid),
+        .rdev = @intCast(st.rdev),
+        .blksize = @intCast(st.blksize),
+        .kind = kind,
+    };
+}
+
+fn statToFuseAttr(nodeid: u64, stat: *const StatView) FuseAttr {
 
     return .{
         .ino = nodeid,
         .size = stat.size,
-        .blocks = (stat.size + 511) / 512,
-        .atime = @intCast(@divFloor(stat.atime, std.time.ns_per_s)),
-        .mtime = @intCast(@divFloor(stat.mtime, std.time.ns_per_s)),
-        .ctime = @intCast(@divFloor(stat.ctime, std.time.ns_per_s)),
-        .atimensec = @intCast(@mod(stat.atime, std.time.ns_per_s)),
-        .mtimensec = @intCast(@mod(stat.mtime, std.time.ns_per_s)),
-        .ctimensec = @intCast(@mod(stat.ctime, std.time.ns_per_s)),
-        .mode = mode,
-        .nlink = 1,
-        .uid = 0,
-        .gid = 0,
-        .rdev = 0,
-        .blksize = 4096,
+        .blocks = stat.blocks,
+        .atime = @intCast(@divFloor(stat.atime_ns, std.time.ns_per_s)),
+        .mtime = @intCast(@divFloor(stat.mtime_ns, std.time.ns_per_s)),
+        .ctime = @intCast(@divFloor(stat.ctime_ns, std.time.ns_per_s)),
+        .atimensec = @intCast(@mod(stat.atime_ns, std.time.ns_per_s)),
+        .mtimensec = @intCast(@mod(stat.mtime_ns, std.time.ns_per_s)),
+        .ctimensec = @intCast(@mod(stat.ctime_ns, std.time.ns_per_s)),
+        .mode = stat.mode,
+        .nlink = stat.nlink,
+        .uid = stat.uid,
+        .gid = stat.gid,
+        .rdev = stat.rdev,
+        .blksize = stat.blksize,
         .flags = 0,
     };
 }
@@ -2942,6 +3323,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
     const entry_out: *const FuseEntryOut = @ptrCast(@alignCast(lookup_resp[@sizeOf(FuseOutHeader)..]));
     const nodeid = entry_out.nodeid;
     try std.testing.expectEqual(@as(u64, 2), nodeid);
+    try std.testing.expect(entry_out.generation != 0);
     try std.testing.expectEqual(@as(u64, 2), entry_out.attr.size);
 
     // OPEN
@@ -3235,6 +3617,318 @@ test "virtio_fs: handleOpen rejects write on read-only mount" {
     try std.testing.expectEqual(@as(i32, -30), out.@"error");
 }
 
+test "virtio_fs: handleOpen honors O_TRUNC" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile("file.txt", .{});
+        defer f.close();
+        try f.writeAll("abc");
+    }
+
+    const abs = try tmp.dir.realpathAlloc(allocator, "file.txt");
+    defer allocator.free(abs);
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    const nodeid = try device.allocateNode(abs, false);
+
+    var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    hdr.* = .{
+        .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
+        .unique = 34,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const open_in: *FuseOpenIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    open_in.* = .{ .flags = O_RDWR | O_TRUNC, .open_flags = 0 };
+
+    var resp: [128]u8 = undefined;
+    const resp_len = try device.handleRequest(&req, &resp);
+    try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut)), resp_len);
+    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    try std.testing.expectEqual(@as(i32, 0), out.@"error");
+
+    var check = try std.fs.cwd().openFile(abs, .{ .mode = .read_only });
+    defer check.close();
+    const size = try check.getEndPos();
+    try std.testing.expectEqual(@as(u64, 0), size);
+}
+
+test "virtio_fs: handleWrite appends with O_APPEND" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile("file.txt", .{});
+        defer f.close();
+        try f.writeAll("abc");
+    }
+
+    const abs = try tmp.dir.realpathAlloc(allocator, "file.txt");
+    defer allocator.free(abs);
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    const nodeid = try device.allocateNode(abs, false);
+
+    var open_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const open_hdr: *FuseInHeader = @ptrCast(@alignCast(&open_req));
+    open_hdr.* = .{
+        .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
+        .unique = 35,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const open_in: *FuseOpenIn = @ptrCast(@alignCast(open_req[@sizeOf(FuseInHeader)..]));
+    open_in.* = .{ .flags = O_WRONLY | O_APPEND, .open_flags = 0 };
+
+    var open_resp: [128]u8 = undefined;
+    const open_resp_len = try device.handleRequest(&open_req, &open_resp);
+    try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut)), open_resp_len);
+    const open_hdr_out: *const FuseOutHeader = @ptrCast(@alignCast(&open_resp));
+    try std.testing.expectEqual(@as(i32, 0), open_hdr_out.@"error");
+    const open_out: *const FuseOpenOut = @ptrCast(@alignCast(open_resp[@sizeOf(FuseOutHeader)..]));
+
+    const write_data = "z";
+    const write_len = @sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) + write_data.len;
+    var write_req = try allocator.alloc(u8, write_len);
+    defer allocator.free(write_req);
+    const write_hdr: *FuseInHeader = @ptrCast(@alignCast(write_req.ptr));
+    write_hdr.* = .{
+        .len = @intCast(write_len),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_WRITE),
+        .unique = 36,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const write_in: *FuseWriteIn = @ptrCast(@alignCast(write_req[@sizeOf(FuseInHeader)..]));
+    write_in.* = .{
+        .fh = open_out.fh,
+        .offset = 0,
+        .size = @intCast(write_data.len),
+        .write_flags = 0,
+        .lock_owner = 0,
+        .flags = 0,
+        .padding = 0,
+    };
+    @memcpy(
+        write_req[@sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) ..][0..write_data.len],
+        write_data,
+    );
+
+    var write_resp: [128]u8 = undefined;
+    const write_resp_len = try device.handleRequest(write_req, &write_resp);
+    try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader) + @sizeOf(FuseWriteOut)), write_resp_len);
+    const write_out: *const FuseOutHeader = @ptrCast(@alignCast(&write_resp));
+    try std.testing.expectEqual(@as(i32, 0), write_out.@"error");
+
+    var check = try std.fs.cwd().openFile(abs, .{ .mode = .read_only });
+    defer check.close();
+    var buf: [4]u8 = undefined;
+    const bytes = try check.readAll(&buf);
+    try std.testing.expectEqual(@as(usize, 4), bytes);
+    try std.testing.expectEqualStrings("abcz", buf[0..4]);
+}
+
+test "virtio_fs: handleFallocate keep size" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile("file.txt", .{});
+        defer f.close();
+        try f.writeAll("data");
+    }
+
+    const abs = try tmp.dir.realpathAlloc(allocator, "file.txt");
+    defer allocator.free(abs);
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    const nodeid = try device.allocateNode(abs, false);
+    const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
+    const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
+
+    var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseFallocateIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    hdr.* = .{
+        .len = @sizeOf(FuseInHeader) + @sizeOf(FuseFallocateIn),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_FALLOCATE),
+        .unique = 37,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const falloc_in: *FuseFallocateIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    falloc_in.* = .{
+        .fh = fh,
+        .offset = 0,
+        .length = 4096,
+        .mode = FALLOC_FL_KEEP_SIZE,
+    };
+
+    var resp: [128]u8 = undefined;
+    const resp_len = try device.handleRequest(&req, &resp);
+    try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
+    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    try std.testing.expectEqual(@as(i32, 0), out.@"error");
+
+    var check = try std.fs.cwd().openFile(abs, .{ .mode = .read_only });
+    defer check.close();
+    const size = try check.getEndPos();
+    try std.testing.expectEqual(@as(u64, 4), size);
+}
+
+test "virtio_fs: handleSetupmapping validates payload" {
+    const allocator = std.testing.allocator;
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    var req: [@sizeOf(FuseInHeader) + 1]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    hdr.* = .{
+        .len = req.len,
+        .opcode = @intFromEnum(FuseOpcode.FUSE_SETUPMAPPING),
+        .unique = 38,
+        .nodeid = 0,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+
+    var resp: [128]u8 = undefined;
+    const resp_len = try device.handleRequest(&req, &resp);
+    try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
+    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    try std.testing.expectEqual(@as(i32, -22), out.@"error");
+}
+
+test "virtio_fs: handleRemovemapping validates payload" {
+    const allocator = std.testing.allocator;
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseRemovemappingIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    hdr.* = .{
+        .len = req.len,
+        .opcode = @intFromEnum(FuseOpcode.FUSE_REMOVEMAPPING),
+        .unique = 39,
+        .nodeid = 0,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const remove_in: *FuseRemovemappingIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    remove_in.* = .{
+        .count = 1,
+        .padding = 0,
+    };
+
+    var resp: [128]u8 = undefined;
+    const resp_len = try device.handleRequest(&req, &resp);
+    try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
+    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    try std.testing.expectEqual(@as(i32, -22), out.@"error");
+}
+
+test "virtio_fs: dax mapping cache coalesces mappings" {
+    const allocator = std.testing.allocator;
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    try device.cacheDaxMapping(0, 4096, 0, 1, false);
+    try device.cacheDaxMapping(4096, 4096, 4096, 1, false);
+    try std.testing.expectEqual(@as(usize, 1), device.dax_mappings.items.len);
+    try std.testing.expectEqual(@as(u64, 0), device.dax_mappings.items[0].moffset);
+    try std.testing.expectEqual(@as(u64, 8192), device.dax_mappings.items[0].len);
+}
+
 test "virtio_fs: handleRead rejects invalid handle" {
     const allocator = std.testing.allocator;
 
@@ -3310,7 +4004,7 @@ test "virtio_fs: handleRead errors on short response buffer" {
 
     const nodeid = try device.allocateNode(abs, false);
     const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
-    const fh = try device.allocateFileHandle(nodeid, file);
+    const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
     var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -3405,7 +4099,7 @@ test "virtio_fs: handleRead maps io error on write-only file" {
 
     const nodeid = try device.allocateNode(abs, false);
     const file = try std.fs.cwd().openFile(abs, .{ .mode = .write_only });
-    const fh = try device.allocateFileHandle(nodeid, file);
+    const fh = try device.allocateFileHandle(nodeid, file, O_WRONLY);
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
     var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -3475,7 +4169,7 @@ test "virtio_fs: handleWrite maps io error on read-only file" {
 
     const nodeid = try device.allocateNode(abs, false);
     const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_only });
-    const fh = try device.allocateFileHandle(nodeid, file);
+    const fh = try device.allocateFileHandle(nodeid, file, O_RDONLY);
 
     const write_data = "x";
     const write_len = @sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) + write_data.len;
@@ -3626,7 +4320,7 @@ test "virtio_fs: handleRelease closes file handle" {
 
     const nodeid = try device.allocateNode(abs, false);
     const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
-    const fh = try device.allocateFileHandle(nodeid, file);
+    const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
     try std.testing.expect(device.handles.contains(fh));
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseReleaseIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -3799,6 +4493,115 @@ test "virtio_fs: handleReaddir returns entries" {
     }
 
     try std.testing.expect(found_a and found_b);
+}
+
+test "virtio_fs: readdirplus returns generation" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        try tmp.dir.makeDir("data");
+        var f = try tmp.dir.createFile("data/a.txt", .{});
+        defer f.close();
+        try f.writeAll("a");
+    }
+
+    const abs = try tmp.dir.realpathAlloc(allocator, "data");
+    defer allocator.free(abs);
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    const nodeid = try device.allocateNode(abs, true);
+
+    var open_req: [@sizeOf(FuseInHeader)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const open_hdr: *FuseInHeader = @ptrCast(@alignCast(&open_req));
+    open_hdr.* = .{
+        .len = @sizeOf(FuseInHeader),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_OPENDIR),
+        .unique = 211,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+
+    var open_resp: [256]u8 = undefined;
+    const open_resp_len = try device.handleRequest(&open_req, &open_resp);
+    try std.testing.expect(open_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut));
+    const open_out: *const FuseOpenOut = @ptrCast(@alignCast(open_resp[@sizeOf(FuseOutHeader)..]));
+    const fh = open_out.fh;
+
+    const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
+    var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
+    read_hdr.* = .{
+        .len = read_len,
+        .opcode = @intFromEnum(FuseOpcode.FUSE_READDIRPLUS),
+        .unique = 212,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
+    read_in.* = .{
+        .fh = fh,
+        .offset = 0,
+        .size = 512,
+        .read_flags = 0,
+        .lock_owner = 0,
+        .flags = 0,
+        .padding = 0,
+    };
+
+    var read_resp: [512]u8 = undefined;
+    const read_resp_len = try device.handleRequest(&read_req, &read_resp);
+    try std.testing.expect(read_resp_len >= @sizeOf(FuseOutHeader));
+
+    var found_a = false;
+    var pos: usize = @sizeOf(FuseOutHeader);
+    while (pos + @sizeOf(FuseDirentPlus) <= read_resp_len) {
+        var entry_plus: FuseDirentPlus = undefined;
+        @memcpy(
+            std.mem.asBytes(&entry_plus),
+            read_resp[pos..][0..@sizeOf(FuseDirentPlus)],
+        );
+        const name_start = pos + @sizeOf(FuseDirentPlus);
+        const name_end = name_start + entry_plus.dirent.namelen;
+        if (name_end > read_resp_len) break;
+        const name = read_resp[name_start..name_end];
+        if (std.mem.eql(u8, name, "a.txt")) {
+            found_a = true;
+            try std.testing.expect(entry_plus.entry_out.generation != 0);
+            break;
+        }
+        const entry_size = @sizeOf(FuseDirentPlus) + entry_plus.dirent.namelen;
+        const entry_end = pos + entry_size;
+        pos = std.mem.alignForward(usize, entry_end, 8);
+    }
+
+    try std.testing.expect(found_a);
 }
 
 test "virtio_fs: xattr roundtrip" {
@@ -4010,6 +4813,151 @@ test "virtio_fs: xattr roundtrip" {
     _ = rem_resp_len;
 }
 
+test "virtio_fs: statPath reports posix metadata" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const filename = "meta.txt";
+    {
+        var f = try tmp.dir.createFile(filename, .{});
+        defer f.close();
+        try f.writeAll("meta");
+    }
+
+    const full_path = try tmp.dir.realpathAlloc(allocator, filename);
+    defer allocator.free(full_path);
+
+    const stat = try statPath(full_path, true);
+    const attr = statToFuseAttr(2, &stat);
+    try std.testing.expectEqual(@as(u32, @intCast(std.posix.getuid())), attr.uid);
+    try std.testing.expectEqual(@as(u32, @intCast(c.getgid())), attr.gid);
+    try std.testing.expectEqual(stat.mode, attr.mode);
+    try std.testing.expectEqual(stat.nlink, attr.nlink);
+}
+
+test "virtio_fs: statPath respects symlinks" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const filename = "target.txt";
+    const linkname = "link.txt";
+    {
+        var f = try tmp.dir.createFile(filename, .{});
+        defer f.close();
+        try f.writeAll("link");
+    }
+
+    try tmp.dir.symLink(filename, linkname, .{});
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const link_path = try std.fs.path.join(allocator, &[_][]const u8{ root, linkname });
+    defer allocator.free(link_path);
+
+    const stat_link = try statPath(link_path, false);
+    try std.testing.expectEqual(
+        std.posix.S.IFLNK,
+        @as(u32, @intCast(stat_link.mode & std.posix.S.IFMT)),
+    );
+
+    const stat_follow = try statPath(link_path, true);
+    try std.testing.expectEqual(
+        std.posix.S.IFREG,
+        @as(u32, @intCast(stat_follow.mode & std.posix.S.IFMT)),
+    );
+}
+
+test "virtio_fs: setattr ctime no-op succeeds" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile("file.txt", .{});
+        defer f.close();
+        try f.writeAll("data");
+    }
+
+    var mount_manager = mounts.MountManager.init(allocator);
+    defer mount_manager.deinit();
+    mount_manager.strict_validation = false;
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try mount_manager.addAllowedRoot(root);
+    try mount_manager.addMount(.{
+        .tag = "test",
+        .host_path = root,
+        .guest_path = "/mnt/test",
+        .access = .read_write,
+    });
+
+    var device = VirtioFsDevice.init(allocator, &mount_manager, "test", .auto);
+    defer device.deinit();
+
+    const name = "file.txt";
+    const lookup_len = @sizeOf(FuseInHeader) + name.len + 1;
+    const lookup_req = try allocator.alloc(u8, lookup_len);
+    defer allocator.free(lookup_req);
+    const lookup_hdr: *FuseInHeader = @ptrCast(@alignCast(lookup_req.ptr));
+    lookup_hdr.* = .{
+        .len = @intCast(lookup_len),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_LOOKUP),
+        .unique = 41,
+        .nodeid = 1,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    @memcpy(lookup_req[@sizeOf(FuseInHeader)..][0..name.len], name);
+    lookup_req[@sizeOf(FuseInHeader) + name.len] = 0;
+
+    var lookup_resp: [512]u8 = undefined;
+    const lookup_resp_len = try device.handleRequest(lookup_req, &lookup_resp);
+    try std.testing.expect(lookup_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut));
+    const entry_out: *const FuseEntryOut = @ptrCast(@alignCast(lookup_resp[@sizeOf(FuseOutHeader)..]));
+    const nodeid = entry_out.nodeid;
+
+    var set_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseSetattrIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
+    const set_hdr: *FuseInHeader = @ptrCast(@alignCast(&set_req));
+    set_hdr.* = .{
+        .len = @sizeOf(FuseInHeader) + @sizeOf(FuseSetattrIn),
+        .opcode = @intFromEnum(FuseOpcode.FUSE_SETATTR),
+        .unique = 42,
+        .nodeid = nodeid,
+        .uid = 0,
+        .gid = 0,
+        .pid = 0,
+        .total_extlen = 0,
+        .padding = 0,
+    };
+    const set_in: *FuseSetattrIn = @ptrCast(@alignCast(set_req[@sizeOf(FuseInHeader)..]));
+    set_in.* = std.mem.zeroes(FuseSetattrIn);
+    set_in.valid = FATTR_CTIME;
+    set_in.ctime = 0;
+    set_in.ctimensec = 0;
+
+    var set_resp: [256]u8 = undefined;
+    const set_len = try device.handleRequest(&set_req, &set_resp);
+    try std.testing.expect(set_len >= @sizeOf(FuseOutHeader));
+    const out_hdr: *const FuseOutHeader = @ptrCast(@alignCast(&set_resp));
+    try std.testing.expectEqual(@as(i32, 0), out_hdr.@"error");
+}
+
 test "virtio_fs: fcntl locks" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -4044,7 +4992,7 @@ test "virtio_fs: fcntl locks" {
 
     const nodeid = try device.allocateNode(abs, false);
     const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
-    const fh = try device.allocateFileHandle(nodeid, file);
+    const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
 
     const lk_in = FuseLkIn{
         .fh = fh,
@@ -4133,7 +5081,7 @@ test "virtio_fs: ioctl with buffers" {
 
     const nodeid = try device.allocateNode(abs, false);
     const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
-    const fh = try device.allocateFileHandle(nodeid, file);
+    const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
 
     const data = [_]u8{0xAB};
     const req_len = @sizeOf(FuseInHeader) + @sizeOf(FuseIoctlIn) + data.len;

@@ -58,7 +58,7 @@ Principles:
 - HVF backend wired with real VM create/map + vCPU run loop (arm64 + x86) (done)
 - HVF arm64 register setup + DTB builder + MMU preconfig + guest memory mapping (done)
 - HVF arm64 PL011 MMIO + GIC SPI wiring for serial (done)
-- POSIX backend stubs + vCPU/layout parity (done)
+- POSIX backend KVM path + vCPU/layout parity wired (partial)
 - Platform-specific backend smoke tests added (done)
 - HVF/KVM IO exit decoding into IoExit (done)
 - Boot state computation + cmdline/stack prep + Windows register init wired (partial)
@@ -70,15 +70,15 @@ Principles:
 - No background services required
 
 ### Notes
-- Current backends are still stubbed; Phase 1 “done” items reflect scaffolding, not full boot.
+- Backend maturity is mixed: core bring-up exists, but full cross-platform lifecycle validation is still incomplete.
 
 ### Testing Notes (2026-01-19)
 - `zig build test`: 200 passed, 8 skipped, 0 failed (re-verified).
 - Skips are OS/integration gated (HVF/POSIX/WHP integration).
 
 ### Remaining (Phase 1)
-- Wire real guest RAM mapping + vCPU create/run loop for KVM (beyond stubs)
-- Finalize kernel/initrd loading into KVM guest memory
+- Validate KVM guest RAM mapping + vCPU create/run loop on real Linux hosts/CI
+- Finalize kernel/initrd loading and boot handoff parity for KVM/HVF paths
 - Verify deterministic start/stop on real WHP/HVF backends with real boot payloads
 
 ---

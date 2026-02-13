@@ -13,23 +13,23 @@ m80 supports both **persistent microVMs (default)** and **ephemeral microVMs (op
 m80 is **not** a general-purpose VM manager and explicitly avoids heavyweight virtualization features.
 
 ### Current Status
-- Phase 1 in progress (backend scaffolding and tests in place; full boot still pending)
-- WHP partition lifecycle stubbed with dynamic loading and error mapping (done)
-- WHP guest memory allocation + GPA mapping stubbed (done)
-- WHP vCPU create/delete + run loop skeleton added (done)
-- Kernel/initrd layout + load stubs wired (done)
+- Phase 1 in progress (substantial backend implementation and tests in place; cross-platform determinism still pending)
+- WHP partition lifecycle wiring with dynamic loading and error mapping (done)
+- WHP guest memory allocation + GPA mapping wiring (done)
+- WHP vCPU create/delete + run loop wiring (done)
+- Kernel/initrd layout + load path wiring (done)
 - Windows kernel/initrd file loading into guest memory wired (done)
 - WHP vCPU run loop with exit handling (CPUID + IO port) wired (done)
 - Serial IO (COM1) read/write handling + shared IoExit scaffolding across backends (done)
-- HVF backend selected and stubbed for macOS (done)
-- HVF vCPU + layout stubs wired (done)
-- POSIX backend stubs + vCPU/layout parity (done)
+- HVF backend wired for macOS (done)
+- HVF vCPU + layout bring-up wired (done)
+- POSIX backend KVM path + vCPU/layout parity wired (partial)
 - Platform-specific backend smoke tests added (done)
 
 ### Phase 1 Remaining
-- Implement register setup + real boot flow (entry point, cmdline, stack)
-- Decode real HVF/KVM exit structs into IoExit (current mapping is stubbed)
-- Verify deterministic start/stop on real WHP/HVF backends
+- Finalize register/boot-flow parity validation across backends with real payloads
+- Complete deterministic lifecycle verification on real WHP/HVF/KVM hosts
+- Close remaining integration-gated smoke gaps in CI/host validation
 
 ---
 

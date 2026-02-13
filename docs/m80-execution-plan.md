@@ -35,21 +35,21 @@
 - Windows kernel/initrd file loading into guest memory wired (done)
 - WHP vCPU run loop with exit handling (CPUID + IO port) wired (done)
 - Serial IO (COM1) read/write handling + shared IoExit scaffolding across backends (done)
-- HVF backend selected and stubbed for macOS (done)
-- HVF vCPU + layout stubs wired (done)
+- HVF backend selected and wired for macOS (done)
+- HVF vCPU + layout bring-up wired (done)
 - HVF arm64 register setup + DTB builder + MMU preconfig + guest memory mapping (done)
-- POSIX backend stubs + vCPU/layout parity (done)
+- POSIX backend KVM path + vCPU/layout parity wired (partial)
 - Platform-specific backend smoke tests added (done)
 - HVF/KVM IO exit decoding into IoExit (done)
 - Boot state computation + cmdline/stack prep + Windows register init wired (partial)
 
 **Remaining**
-- Wire real guest RAM mapping + vCPU create/run loop for HVF/KVM (beyond stubs)
-- Finalize kernel/initrd loading into HVF/KVM guest memory (Windows wired; HVF/KVM pending)
+- Validate guest RAM mapping + vCPU create/run loops on real HVF/KVM hosts
+- Finalize kernel/initrd loading and boot-handoff parity for HVF/KVM (Windows wired)
 - Verify deterministic start/stop on real WHP/HVF backends
 
 **Notes**
-- Current Phase 1 “done” items reflect scaffolding; full boot is still pending.
+- Phase 1 has substantial implementation, but deterministic cross-platform validation is still pending.
 
 ## Testing Notes (2026-01-19)
 - `zig build test`: 198 passed, 6 skipped, 0 failed (re-verified).

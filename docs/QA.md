@@ -3,12 +3,26 @@
 This file tracks test coverage work, key behavior validations, and remaining QA tasks.
 It is intended to be a living checklist for correctness and regression prevention.
 
-## Current Status (This Session)
+## Current Status (Historical Session Snapshot: 2026-01-19)
 
 ### Test Runs
 - `zig build test` executed repeatedly after each change.
 - Latest run: **176 passed, 5 skipped, 0 failed**.
 - Skipped tests are OS‑gated/integration‑gated (see “Skipped Tests”).
+
+### Latest Local Validation (2026-02-13)
+- `zig build` passed.
+- `zig build test` passed: **314 passed, 15 skipped, 0 failed**.
+
+### Recent Reliability/Hardening Updates (2026-02-13)
+- Detached stop path now writes `stop.request` and waits for graceful runner exit before signal fallback.
+- `waitForStopOrSnapshot` now consumes `stop.request` alongside snapshot/restore control files.
+- Jailer runtime prepare path now calls platform hardening hooks (Linux seccomp, macOS sandbox, Windows job object) with enforcement mode:
+  - `M80_JAILER_ENFORCEMENT=observe|strict|off` (default `observe`).
+- Allowlist validation now rejects malformed:
+  - `allowed_domains` entries (supports `domain`, `*.domain`, and `domain:port`).
+  - `allowed_ips` entries (IPv4/CIDR).
+- Blocked DNS queries now produce synthetic DNS `REFUSED` responses consistently in virtio-net logs/behavior.
 
 ### Key Fixes Made
 - **DNS parsing alignment bug fixed**: `parseResponse` now uses `std.mem.readInt` instead of unaligned pointer reads.
@@ -74,7 +88,7 @@ Comments added across:
 ## Skipped Tests (Expected)
 
 These skips are **expected and correct** due to host platform or integration dependencies:
-- `vm.hvf` smoke tests: require macOS + HVF implementation (currently stubbed).
+- `vm.hvf` smoke tests: require macOS + HVF support + integration test env vars.
 - `vm.posix` smoke tests: require Linux/BSD host.
 - `vm.vm` smoke test: delegates to backend (skips for same reasons).
 - `vm.windows` smoke/integration: require Windows + WHP + integration env vars and test kernel/initrd.
@@ -123,8 +137,15 @@ _None currently listed._
 - **Windows WHP integration tests**
   - Run with `M80_WHP_INTEGRATION=1` + `M80_TEST_KERNEL`/`M80_TEST_INITRD`.
 - **Mac HVF integration tests**
-  - Run boot/login/reliability loops on entitled arm64 hosts.
-  - Use `M80_TEST_HVF_RELIABILITY=1` and `M80_TEST_HVF_RELIABILITY_CYCLES=20` for lifecycle stress.
+  - PR cadence: 20-cycle reliability run.
+  - Nightly cadence: 200-cycle reliability run.
+  - Commands:
+    - `make hvf-reliability KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz`
+    - `make hvf-reliability-nightly KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz`
+  - Deterministic timeout-path test:
+    - `M80_TEST_HVF_FORCE_STOP_TIMEOUT=1 ... zig build test -- --test-filter "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled"`
+  - CI workflow: `.github/workflows/hvf-reliability.yml` (self-hosted `macOS` + `ARM64` runner).
+  - CI network profile: default locked-down/no vmnet entitlement required.
 - **Linux KVM integration tests**
   - Wire real KVM exit parsing, run smoke tests on Linux CI.
 
@@ -133,6 +154,21 @@ _None currently listed._
 - Some tests use filesystem side effects (tmpDir). They should remain isolated but ensure no reliance on fixed paths.
 - Jailer tests log resource limit setup; benign but can be noisy.
 - Virtio‑FS tests rely on internal helpers (allocateNode/allocateFileHandle) to simulate kernel behavior.
+
+## HVF Trap Triage Runbook
+
+Strict-fail policy remains in effect for unknown arm64 sysreg traps.
+
+Log extraction:
+- `grep -c "VcpuStopTimeout" artifacts/hvf-reliability.log`
+- `grep -c "unknown sysreg trap" artifacts/hvf-reliability.log`
+- `awk '/unknown sysreg trap/ {print}' artifacts/hvf-reliability.log`
+
+Intake checklist for a new signature:
+1. Record decoded trap fields (`syndrome`, `ec`, `op0/op1/crn/crm/op2`, `pc`).
+2. Record exact repro command (`kernel`, `initrd`/`disk`, cmdline, cycle count).
+3. File a follow-up issue with the first-occurrence log line and repro.
+4. Implement only targeted trap support and add a regression test.
 
 ## Suggested Next Steps
 

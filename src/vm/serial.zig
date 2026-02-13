@@ -117,6 +117,26 @@ fn writeToConsole(size: usize, rax: u64) bool {
   return true;
 }
 
+pub fn writeConsoleBytes(bytes: []const u8) void {
+  if (bytes.len == 0) return;
+  console_mutex.lock();
+  defer console_mutex.unlock();
+  console_backlog.appendSlice(std.heap.page_allocator, bytes) catch return;
+  if (console_backlog.items.len > console_backlog_limit) {
+    const start = console_backlog.items.len - console_backlog_limit;
+    const remaining = console_backlog.items[start..];
+    std.mem.copyForwards(u8, console_backlog.items[0..remaining.len], remaining);
+    console_backlog.items.len = remaining.len;
+  }
+  const fd = console_fd orelse return;
+  writeAllFd(fd, bytes) catch |e| switch (e) {
+    error.BrokenPipe, error.ConnectionResetByPeer => {
+      console_fd = null;
+    },
+    else => {},
+  };
+}
+
 /// Serial port emulation state.
 /// Handles reads/writes to COM1 ports (0x3F8-0x3FF).
 pub const SerialIo = struct {

@@ -65,15 +65,15 @@ pub const Protocol = enum {
 
 /// A domain-based access rule
 pub const DomainRule = struct {
-  /// Domain pattern (supports wildcards like *.example.com)
-  pattern: []const u8,
-  /// Allowed port range (null = all ports)
-  port_min: ?u16 = null,
-  port_max: ?u16 = null,
-  /// Protocol filter
-  protocol: Protocol = .any,
-  /// Whether this is an allow or deny rule
-  allow: bool = true,
+    /// Domain pattern (supports wildcards like *.example.com)
+    pattern: []const u8,
+    /// Allowed port range (null = all ports)
+    port_min: ?u16 = null,
+    port_max: ?u16 = null,
+    /// Protocol filter
+    protocol: Protocol = .any,
+    /// Whether this is an allow or deny rule
+    allow: bool = true,
 
     /// Checks if a domain matches this rule
     pub fn matches(self: *const DomainRule, domain: []const u8) bool {
@@ -91,10 +91,10 @@ pub const DomainRule = struct {
 
 /// An IP-based access rule (CIDR notation)
 pub const IpRule = struct {
-  /// IP address (IPv4 as 4 bytes)
-  address: [4]u8,
-  /// CIDR prefix length (0-32)
-  prefix_len: u8,
+    /// IP address (IPv4 as 4 bytes)
+    address: [4]u8,
+    /// CIDR prefix length (0-32)
+    prefix_len: u8,
     /// Allowed port range
     port_min: ?u16 = null,
     port_max: ?u16 = null,
@@ -149,9 +149,9 @@ pub const ResolvedIp = struct {
 
 /// Main network policy configuration
 pub const NetworkPolicy = struct {
-  allocator: std.mem.Allocator,
-  /// Current network mode
-  mode: NetworkMode = .locked_down,
+    allocator: std.mem.Allocator,
+    /// Current network mode
+    mode: NetworkMode = .locked_down,
     /// DNS-based domain rules
     allowed_domains: std.ArrayList(DomainRule),
     /// Direct IP/CIDR rules
@@ -233,19 +233,19 @@ pub const NetworkPolicy = struct {
         return self.isDomainAllowedOnPort(domain, null);
     }
 
-  /// Checks if a domain is allowed on a specific port
-  pub fn isDomainAllowedOnPort(self: *const NetworkPolicy, domain: []const u8, port: ?u16) bool {
-    switch (self.mode) {
-      .locked_down => return false,
-      .open => return true,
-      .allowlist => {
-        // First matching rule wins.
-        for (self.allowed_domains.items) |rule| {
-          if (rule.matches(domain)) {
-            const port_ok = if (port) |p| rule.portAllowed(p) else true;
-            if (port_ok) {
-              return rule.allow;
-            }
+    /// Checks if a domain is allowed on a specific port
+    pub fn isDomainAllowedOnPort(self: *const NetworkPolicy, domain: []const u8, port: ?u16) bool {
+        switch (self.mode) {
+            .locked_down => return false,
+            .open => return true,
+            .allowlist => {
+                // First matching rule wins.
+                for (self.allowed_domains.items) |rule| {
+                    if (rule.matches(domain)) {
+                        const port_ok = if (port) |p| rule.portAllowed(p) else true;
+                        if (port_ok) {
+                            return rule.allow;
+                        }
                     }
                 }
                 return false;
@@ -259,31 +259,31 @@ pub const NetworkPolicy = struct {
     }
 
     /// Checks if an IP is allowed on a specific port
-  pub fn isIpAllowedOnPort(self: *const NetworkPolicy, ip: [4]u8, port: ?u16) bool {
-    switch (self.mode) {
-      .locked_down => return false,
-      .open => return true,
-      .allowlist => {
-        // Check direct IP rules first
-        for (self.allowed_ips.items) |rule| {
-          if (rule.matches(ip)) {
-            const port_ok = if (port) |p| rule.portAllowed(p) else true;
-            if (port_ok) {
-              return rule.allow;
-            }
-          }
-        }
+    pub fn isIpAllowedOnPort(self: *const NetworkPolicy, ip: [4]u8, port: ?u16) bool {
+        switch (self.mode) {
+            .locked_down => return false,
+            .open => return true,
+            .allowlist => {
+                // Check direct IP rules first
+                for (self.allowed_ips.items) |rule| {
+                    if (rule.matches(ip)) {
+                        const port_ok = if (port) |p| rule.portAllowed(p) else true;
+                        if (port_ok) {
+                            return rule.allow;
+                        }
+                    }
+                }
 
-        // Check resolved IPs from DNS (cache only applies in allowlist mode)
-        @constCast(self).cleanupExpiredEntries();
-        for (self.resolved_ips.items) |resolved| {
-          if (!std.mem.eql(u8, &resolved.address, &ip)) continue;
-          if (port) |p| {
-            if (self.isDomainAllowedOnPort(resolved.domain, p)) return true;
-          } else if (self.isDomainAllowed(resolved.domain)) {
-            return true;
-          }
-        }
+                // Check resolved IPs from DNS (cache only applies in allowlist mode)
+                @constCast(self).cleanupExpiredEntries();
+                for (self.resolved_ips.items) |resolved| {
+                    if (!std.mem.eql(u8, &resolved.address, &ip)) continue;
+                    if (port) |p| {
+                        if (self.isDomainAllowedOnPort(resolved.domain, p)) return true;
+                    } else if (self.isDomainAllowed(resolved.domain)) {
+                        return true;
+                    }
+                }
 
                 return false;
             },
@@ -362,21 +362,21 @@ pub const NetworkPolicy = struct {
 /// Matches a domain against a pattern (supports wildcards)
 /// *.example.com matches sub.example.com but NOT example.com
 pub fn matchDomainPattern(pattern: []const u8, domain: []const u8) bool {
-  // Exact match
-  if (std.mem.eql(u8, pattern, domain)) return true;
+    // Exact match
+    if (std.mem.eql(u8, pattern, domain)) return true;
 
     // Wildcard match
-  if (std.mem.startsWith(u8, pattern, "*.")) {
-    const suffix = pattern[1..]; // .example.com
-    if (std.mem.endsWith(u8, domain, suffix)) {
-      // Make sure there's something before the suffix
-      const prefix_len = domain.len - suffix.len;
-      if (prefix_len > 0) {
-        // Allow multi-level subdomains (e.g., deep.sub.example.com).
-        return true;
-      }
+    if (std.mem.startsWith(u8, pattern, "*.")) {
+        const suffix = pattern[1..]; // .example.com
+        if (std.mem.endsWith(u8, domain, suffix)) {
+            // Make sure there's something before the suffix
+            const prefix_len = domain.len - suffix.len;
+            if (prefix_len > 0) {
+                // Allow multi-level subdomains (e.g., deep.sub.example.com).
+                return true;
+            }
+        }
     }
-  }
 
     return false;
 }
@@ -403,6 +403,69 @@ pub fn parseIpAddress(ip_str: []const u8) ?[4]u8 {
 
     if (i != 4) return null;
     return result;
+}
+
+pub const DomainSpec = struct {
+    domain: []const u8,
+    port_min: ?u16 = null,
+    port_max: ?u16 = null,
+};
+
+fn isValidDomainLabel(label: []const u8) bool {
+    if (label.len == 0 or label.len > 63) return false;
+    if (label[0] == '-' or label[label.len - 1] == '-') return false;
+    for (label) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '-') return false;
+    }
+    return true;
+}
+
+pub fn isValidDomainPattern(pattern: []const u8) bool {
+    const trimmed = std.mem.trim(u8, pattern, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    const wildcard = std.mem.startsWith(u8, trimmed, "*.");
+    const domain = if (wildcard) trimmed[2..] else trimmed;
+    if (domain.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, domain, '*') != null) return false;
+    if (!wildcard and std.mem.indexOfScalar(u8, trimmed, '*') != null) return false;
+    if (domain[0] == '.' or domain[domain.len - 1] == '.') return false;
+
+    var labels = std.mem.splitScalar(u8, domain, '.');
+    while (labels.next()) |label| {
+        if (!isValidDomainLabel(label)) return false;
+    }
+    return true;
+}
+
+pub fn parseDomainSpec(spec: []const u8) ?DomainSpec {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    var colon_count: usize = 0;
+    for (trimmed) |ch| {
+        if (ch == ':') colon_count += 1;
+    }
+    if (colon_count > 1) return null;
+
+    if (colon_count == 1) {
+        const idx = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return null;
+        const domain = std.mem.trim(u8, trimmed[0..idx], " \t\r\n");
+        const port_raw = std.mem.trim(u8, trimmed[idx + 1 ..], " \t\r\n");
+        if (!isValidDomainPattern(domain)) return null;
+        const port = std.fmt.parseInt(u16, port_raw, 10) catch return null;
+        if (port == 0) return null;
+        return .{
+            .domain = domain,
+            .port_min = port,
+            .port_max = port,
+        };
+    }
+
+    if (!isValidDomainPattern(trimmed)) return null;
+    return .{
+        .domain = trimmed,
+    };
 }
 
 /// Parses a CIDR notation string (e.g., "10.0.0.0/8")
@@ -495,6 +558,32 @@ test "policy: parseCidr" {
 
     try std.testing.expect(parseCidr("invalid") == null);
     try std.testing.expect(parseCidr("10.0.0.0/33") == null);
+}
+
+test "policy: parseDomainSpec supports plain and domain-port entries" {
+    const plain = parseDomainSpec("example.com").?;
+    try std.testing.expectEqualStrings("example.com", plain.domain);
+    try std.testing.expect(plain.port_min == null);
+
+    const wildcard = parseDomainSpec("*.example.com").?;
+    try std.testing.expectEqualStrings("*.example.com", wildcard.domain);
+    try std.testing.expect(wildcard.port_min == null);
+
+    const with_port = parseDomainSpec("example.com:443").?;
+    try std.testing.expectEqualStrings("example.com", with_port.domain);
+    try std.testing.expectEqual(@as(?u16, 443), with_port.port_min);
+    try std.testing.expectEqual(@as(?u16, 443), with_port.port_max);
+}
+
+test "policy: parseDomainSpec rejects malformed values" {
+    try std.testing.expect(parseDomainSpec("") == null);
+    try std.testing.expect(parseDomainSpec("example.com:") == null);
+    try std.testing.expect(parseDomainSpec("example.com:abc") == null);
+    try std.testing.expect(parseDomainSpec("example.com:0") == null);
+    try std.testing.expect(parseDomainSpec(".example.com") == null);
+    try std.testing.expect(parseDomainSpec("example..com") == null);
+    try std.testing.expect(parseDomainSpec("bad*pattern.com") == null);
+    try std.testing.expect(parseDomainSpec("example.com:443:10") == null);
 }
 
 test "policy: NetworkPolicy basic operations" {

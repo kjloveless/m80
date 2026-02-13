@@ -4,24 +4,25 @@ Cross-platform microVM runtime (Zig) with a minimal CLI scaffold.
 
 ## Status
 
-Phase 0: repository layout, core stubs, and CLI scaffolding.
-Phase 1: WHP backend brings up vCPU loop + guest memory loading (Windows), with shared IO/serial scaffolding across backends.
-Phase 2–6: jailer, mounts, and networking are present as scaffolds/stubs and still evolving (see `PHASES.md` for detail).
+Phase 0: complete (repo/contracts/CLI baseline).
+Phase 1: backend bring-up is implemented across WHP/HVF/KVM paths, with integration determinism and parity still in progress.
+Phase 2/5/6: jailer, mounts, and network-policy building blocks are implemented; end-to-end enforcement hardening is still in progress (see `docs/PHASES.md`).
 
-## QA Snapshot (2026-01-19)
+## QA Snapshot
 
-- `zig build test`: **200 passed, 8 skipped, 0 failed** (re-verified)
-- Skips are OS-gated/integration-gated (HVF/POSIX/WHP integration paths).
+- Historical snapshot (2026-01-19): `zig build test` reported **200 passed, 8 skipped, 0 failed**.
+- Current status should be validated with a fresh local run (`zig build test`) because platform-gated tests vary by host.
 
 ## In Progress / Next
 
-- **Security hardening:** Windows ACL hardening implementation.
-- **VM backend validation:** cross-backend start/stop parity checks.
+- **2-week execution plan (2026-02-13 to 2026-02-27):** `docs/NEXT-2-WEEKS.md`
+- **Immediate priorities:** Linux KVM lifecycle determinism, WHP/HVF parity validation, snapshot round-trip baseline.
+- **Hardening priorities:** virtio-net policy enforcement path and jailer enforcement verification.
 
 ## Supported Platforms
 
 - Windows (primary target)
-- POSIX hosts (macOS/Linux) for scaffolding and CLI development
+- POSIX hosts (macOS/Linux) for active backend development and validation
 
 ## VM Name Rules
 
@@ -118,6 +119,8 @@ m80 console deb
 
 Note: `start` runs the VM in the background. `console` attaches to the running VM.
 If the VM isn't running, start it first.
+`stop` now requests graceful shutdown first via a VM-local `stop.request` control
+file, then falls back to `SIGTERM`/`SIGKILL` if the detached runner does not exit.
 
 Shared directory example (strict roots required):
 
@@ -181,8 +184,16 @@ continues with networking disabled for that VM.
 
 Config keys:
 - `network_mode`: `locked_down` (default) | `allowlist` | `open`
-- `allowed_domains`: comma-separated domain allowlist (used by DNS enforcement)
+- `allowed_domains`: comma-separated domain allowlist entries. Each entry can be:
+  - `example.com` or `*.example.com`
+  - `example.com:443` (domain rule scoped to one destination port)
 - `allowed_ips`: comma-separated IPv4/CIDR allowlist (e.g., `1.2.3.4,10.0.0.0/8`)
+
+Invalid `allowed_domains` / `allowed_ips` entries now fail `m80 start` during
+config validation.
+
+When allowlist mode blocks a DNS query, virtio-net now returns a synthetic DNS
+`REFUSED` response to the guest and drops the outbound query.
 
 Example (allow Debian repos):
 
@@ -200,6 +211,16 @@ network_mode=open
 ```
 export M80_ALLOW_OPEN_NETWORK=1
 ```
+
+## Jailer Enforcement Mode
+
+Jailer runtime hardening is controlled by `M80_JAILER_ENFORCEMENT`:
+
+- `observe` (default): attempt seccomp/sandbox setup; log and continue on failure.
+- `strict`: fail VM start when seccomp/sandbox setup fails.
+- `off`: skip runtime seccomp/sandbox setup.
+
+This is an internal hardening control; no new CLI flags or VM config keys were added.
 
 ## HVF arm64 Boot Smoke Test
 
@@ -297,6 +318,35 @@ M80_TEST_SERIAL_EXPECT="Linux version" \
 zig build test -- --test-filter "smoke: hvf arm64 repeated start-stop reliability"
 ```
 
+One-command helper (captures `artifacts/hvf-reliability.log`):
+
+```
+make hvf-reliability KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz EXPECT="m80 initramfs: boot ok"
+```
+
+Nightly-depth helper (200 cycles):
+
+```
+make hvf-reliability-nightly KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz EXPECT="m80 initramfs: boot ok"
+```
+
+Log summary commands:
+
+```bash
+grep -c "VcpuStopTimeout" artifacts/hvf-reliability.log
+grep -c "unknown sysreg trap" artifacts/hvf-reliability.log
+awk '/VcpuStopTimeout|unknown sysreg trap/' artifacts/hvf-reliability.log
+```
+
+Deterministic timeout-path test (integration-gated):
+
+```bash
+M80_TEST_HVF_FORCE_STOP_TIMEOUT=1 \
+M80_TEST_KERNEL=images/linux \
+M80_TEST_INITRD=images/m80-initramfs.cpio.gz \
+zig build test -- --test-filter "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled"
+```
+
 Known-good small raw ARM64 kernels (bring your own kernel):
 
 - Debian bullseye netboot `linux` (~26MB): raw `Image` and works with the current loader.
@@ -314,7 +364,7 @@ curl -L -o images/alpine-vmlinuz-virt https://nl.alpinelinux.org/v3.20/releases/
 file images/alpine-vmlinuz-virt
 ```
 
-If `file` reports a PE/COFF executable (EFI stub), the current loader will not boot it. Use a raw `Image` instead. citeturn3search0turn2view0
+If `file` reports a PE/COFF executable (EFI stub), the current loader will not boot it. Use a raw `Image` instead.
 
 ## HVF Setup & Troubleshooting (macOS arm64)
 
@@ -355,3 +405,16 @@ If you see `hv_vm_create` failing with `HV_DENIED` (`0xfae94007`), it typically 
 If `stop` fails with `VcpuStopTimeout`, the backend did not observe vCPU thread
 exit within the bounded stop window. Inspect the VM `run.log` for arm64 exit/trap
 details and resolve the underlying guest/hypervisor stall before retrying.
+
+Unknown arm64 sysreg traps are strict-fail by policy. Do not add permissive
+"ignore unknown trap" logic. Triage with:
+
+```bash
+awk '/unknown sysreg trap/ {print}' /path/to/run.log
+```
+
+For each new trap signature:
+1. Capture full decoded fields (`syndrome`, `ec`, `op0/op1/crn/crm/op2`, `pc`).
+2. Reproduce with the same kernel/initrd (or disk) and cmdline.
+3. Open a follow-up ticket with signature + repro command + log excerpt.
+4. Add only targeted handling plus a regression test.

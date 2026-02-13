@@ -34,6 +34,8 @@ const log = @import("../util/log.zig");
 const config = @import("../core/config.zig");
 const serial = @import("serial.zig");
 const boot = @import("boot.zig");
+const virtio = @import("virtio.zig");
+const virtio_fs = @import("../fs/virtio_fs.zig");
 
 // Linux-only KVM bindings; compiled out on non-Linux hosts.
 // Uses @cImport to access linux/kvm.h ioctl definitions.
@@ -63,10 +65,13 @@ const default_cmdline: []const u8 = "console=ttyS0";
 // Single active VM at a time (m80 limitation)
 
 var active_memory_size: usize = 0;
+var active_guest_memory: ?[]align(std.heap.page_size_min) u8 = null;
+var active_memory_is_mmap = false;
 var active_vcpu_thread: ?std.Thread = null;
 var vcpu_running = std.atomic.Value(bool).init(false);
 var simulate_io = std.atomic.Value(bool).init(false);
 var serial_io = SerialIo{};
+var active_kvm: ?KvmState = null;
 
 // =============================================================================
 // KVM DATA STRUCTURES
@@ -173,6 +178,13 @@ const KvmRun = extern struct {
 };
 
 const KvmHandle = usize;
+const KvmState = if (builtin.os.tag == .linux) struct {
+    kvm_fd: std.posix.fd_t,
+    vm_fd: std.posix.fd_t,
+    vcpu_fd: std.posix.fd_t,
+    run: *linux_kvm.kvm_run,
+    run_size: usize,
+} else struct {};
 
 fn kvmSetRegs(handle: KvmHandle, regs: KvmRegs) !void {
     if (builtin.os.tag != .linux) return error.NotSupported;
@@ -411,6 +423,209 @@ fn loadGuestInitrd(memory_size_bytes: u64, initrd_path: ?[]const u8) !void {
     try readGuestImageFile(initrd_path.?, "initrd");
 }
 
+fn setActiveGuestMemory(buffer: []align(std.heap.page_size_min) u8) void {
+    active_guest_memory = buffer;
+}
+
+fn clearActiveGuestMemory() void {
+    active_guest_memory = null;
+}
+
+fn allocateGuestMemory(size_bytes: usize) ![]align(std.heap.page_size_min) u8 {
+    if (builtin.os.tag == .linux) {
+        const prot: u32 = @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE);
+        const flags = std.posix.MAP{
+            .TYPE = .PRIVATE,
+            .ANONYMOUS = true,
+        };
+        const mapped = try std.posix.mmap(null, size_bytes, prot, flags, -1, 0);
+        return mapped;
+    }
+    const buf = try std.heap.page_allocator.alloc(u8, size_bytes);
+    @memset(buf, 0);
+    return @alignCast(buf);
+}
+
+fn freeGuestMemory(buffer: []align(std.heap.page_size_min) u8) void {
+    if (builtin.os.tag == .linux and active_memory_is_mmap) {
+        std.posix.munmap(buffer);
+        return;
+    }
+    std.heap.page_allocator.free(buffer);
+}
+
+fn writeGuestBytes(guest_addr: u64, data: []const u8) !void {
+    const memory = active_guest_memory orelse return error.NoGuestMemory;
+    const end_addr = guest_addr + data.len;
+    if (end_addr > memory.len) return error.InvalidGuestLayout;
+    const start_offset: usize = @intCast(guest_addr);
+    const end_offset: usize = @intCast(end_addr);
+    std.mem.copyForwards(u8, memory[start_offset..end_offset], data);
+}
+
+fn readGuestBytes(guest_addr: u64, out: []u8) !void {
+    const memory = active_guest_memory orelse return error.NoGuestMemory;
+    const end_addr = guest_addr + out.len;
+    if (end_addr > memory.len) return error.InvalidGuestLayout;
+    const start_offset: usize = @intCast(guest_addr);
+    const end_offset: usize = @intCast(end_addr);
+    std.mem.copyForwards(u8, out, memory[start_offset..end_offset]);
+}
+
+fn mapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64, fd: std.posix.fd_t, file_offset: u64, writable: bool) !void {
+    if (builtin.os.tag != .linux) return error.NotSupported;
+    if (len == 0) return;
+    const memory = active_guest_memory orelse return error.NoGuestMemory;
+    const end_addr = guest_addr + len;
+    if (end_addr > memory.len) return error.InvalidGuestLayout;
+    if (len > std.math.maxInt(usize)) return error.InvalidGuestLayout;
+
+    const host_addr = @intFromPtr(memory.ptr) + @as(usize, @intCast(guest_addr));
+    const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
+    const prot: u32 = @intCast(if (writable) (std.posix.PROT.READ | std.posix.PROT.WRITE) else std.posix.PROT.READ);
+    const flags = std.posix.MAP{
+        .TYPE = .SHARED,
+        .FIXED = true,
+    };
+    _ = try std.posix.mmap(host_ptr, @intCast(len), prot, flags, fd, @intCast(file_offset));
+}
+
+fn unmapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64) !void {
+    if (builtin.os.tag != .linux) return error.NotSupported;
+    if (len == 0) return;
+    const memory = active_guest_memory orelse return error.NoGuestMemory;
+    const end_addr = guest_addr + len;
+    if (end_addr > memory.len) return error.InvalidGuestLayout;
+    if (len > std.math.maxInt(usize)) return error.InvalidGuestLayout;
+
+    const host_addr = @intFromPtr(memory.ptr) + @as(usize, @intCast(guest_addr));
+    const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
+    const prot: u32 = @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE);
+    const flags = std.posix.MAP{
+        .TYPE = .PRIVATE,
+        .FIXED = true,
+        .ANONYMOUS = true,
+    };
+    _ = try std.posix.mmap(host_ptr, @intCast(len), prot, flags, -1, 0);
+}
+
+fn buildDaxMapper(memory_size_bytes: u64) virtio_fs.DaxMapper {
+    return .{
+        .ctx = null,
+        .window_base = 0,
+        .window_size = memory_size_bytes,
+        .page_size = std.heap.page_size_min,
+        .map = mapDaxRegion,
+        .unmap = unmapDaxRegion,
+    };
+}
+
+fn loadFileToGuest(path: []const u8, guest_addr: u64, label: []const u8) !void {
+    var file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    var buf: [4096]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const n = try file.read(&buf);
+        if (n == 0) break;
+        try writeGuestBytes(guest_addr + offset, buf[0..n]);
+        offset += @as(u64, n);
+    }
+    log.info("posix loaded {s} ({d} bytes) at 0x{x}", .{ label, offset, guest_addr });
+}
+
+fn handleMmioExit(state: *KvmState) void {
+    if (builtin.os.tag != .linux) return;
+    const exit = state.run;
+    const addr = exit.mmio.phys_addr;
+    const len: usize = @intCast(exit.mmio.len);
+    const is_write = exit.mmio.is_write != 0;
+    var value: u64 = 0;
+    if (is_write) {
+        var i: usize = 0;
+        while (i < len and i < exit.mmio.data.len) : (i += 1) {
+            value |= @as(u64, exit.mmio.data[i]) << @as(u6, @intCast(i * 8));
+        }
+    }
+
+    if (virtio.virtioBlkIndexForAddr(addr)) |blk_index| {
+        _ = virtio.handleVirtioBlkMmio(blk_index, addr - virtio.virtioBlkMmioBase(blk_index), is_write, len, value);
+        return;
+    }
+    if (addr >= virtio.virtio_console_mmio_base and addr < virtio.virtio_console_mmio_base + virtio.virtio_console_mmio_size) {
+        const result = virtio.handleVirtioConsoleMmio(addr - virtio.virtio_console_mmio_base, is_write, len, value);
+        if (!is_write) {
+            std.mem.writeInt(u64, exit.mmio.data[0..8], result, .little);
+        }
+        return;
+    }
+    if (addr >= virtio.virtio_rng_mmio_base and addr < virtio.virtio_rng_mmio_base + virtio.virtio_rng_mmio_size) {
+        const result = virtio.handleVirtioRngMmio(addr - virtio.virtio_rng_mmio_base, is_write, len, value);
+        if (!is_write) {
+            std.mem.writeInt(u64, exit.mmio.data[0..8], result, .little);
+        }
+        return;
+    }
+    if (addr >= virtio.virtio_fs_mmio_base and addr < virtio.virtio_fs_mmio_base + virtio.virtio_fs_mmio_size) {
+        const result = virtio.handleVirtioFsMmio(addr - virtio.virtio_fs_mmio_base, is_write, len, value);
+        if (!is_write) {
+            std.mem.writeInt(u64, exit.mmio.data[0..8], result, .little);
+        }
+        return;
+    }
+    if (addr >= virtio.virtio_net_mmio_base and addr < virtio.virtio_net_mmio_base + virtio.virtio_net_mmio_size) {
+        const result = virtio.handleVirtioNetMmio(addr - virtio.virtio_net_mmio_base, is_write, len, value);
+        if (!is_write) {
+            std.mem.writeInt(u64, exit.mmio.data[0..8], result, .little);
+        }
+        return;
+    }
+}
+
+fn runVcpuKvm(state: *KvmState) void {
+    if (builtin.os.tag != .linux) return;
+    log.info("posix vcpu 0 kvm run loop entered", .{});
+    while (vcpu_running.load(.seq_cst)) {
+        const rc = std.os.linux.ioctl(state.vcpu_fd, linux_kvm.KVM_RUN, 0);
+        if (std.os.linux.E.init(rc) != .SUCCESS) {
+            log.err("posix KVM_RUN failed", .{});
+            break;
+        }
+
+        switch (state.run.exit_reason) {
+            linux_kvm.KVM_EXIT_IO => {
+                const offset: usize = @intCast(state.run.io.data_offset);
+                const base: [*]u8 = @ptrCast(state.run);
+                const size: usize = @intCast(state.run.io.size);
+                const data = base[offset..][0..size];
+                const exit = kvmIoExitToIoExit(state.run.io, data);
+                if (exit.is_write) {
+                    _ = handleIoExit(exit);
+                } else {
+                    const value = handleIoExit(exit);
+                    var i: usize = 0;
+                    while (i < size) : (i += 1) {
+                        data[i] = @intCast((value >> @intCast(i * 8)) & 0xFF);
+                    }
+                }
+            },
+            linux_kvm.KVM_EXIT_MMIO => handleMmioExit(state),
+            linux_kvm.KVM_EXIT_HLT, linux_kvm.KVM_EXIT_SHUTDOWN => {
+                log.info("posix KVM exit {d}, halting vcpu", .{state.run.exit_reason});
+                vcpu_running.store(false, .seq_cst);
+            },
+            linux_kvm.KVM_EXIT_FAIL_ENTRY, linux_kvm.KVM_EXIT_INTERNAL_ERROR => {
+                log.err("posix KVM exit error {d}", .{state.run.exit_reason});
+                vcpu_running.store(false, .seq_cst);
+            },
+            else => {
+                log.warn("posix KVM exit reason={d}", .{state.run.exit_reason});
+            },
+        }
+    }
+    log.info("posix vcpu 0 kvm run loop exited", .{});
+}
+
 /// Starts a VM with the KVM backend.
 ///
 /// This function:
@@ -433,6 +648,7 @@ pub fn start(cfg: config.VmConfig) !void {
     log.info("posix backend stub start (no-op)", .{});
     const size_bytes_u64 = try std.math.mul(u64, cfg.memory_mb, mb_to_bytes);
     if (size_bytes_u64 > std.math.maxInt(usize)) return error.MemoryTooLarge;
+    const size_bytes: usize = @intCast(size_bytes_u64);
     try prepareGuestImage(size_bytes_u64);
     try loadGuestKernel(size_bytes_u64, cfg.kernel_path);
     try loadGuestInitrd(size_bytes_u64, cfg.initrd_path);
@@ -461,7 +677,97 @@ pub fn start(cfg: config.VmConfig) !void {
         kvm_regset.regs.rflags,
         kvm_regset.regs.rsi,
     });
-    active_memory_size = @intCast(size_bytes_u64);
+    const guest_memory = try allocateGuestMemory(size_bytes);
+    active_memory_is_mmap = builtin.os.tag == .linux;
+    setActiveGuestMemory(guest_memory);
+    active_memory_size = size_bytes;
+
+    virtio.initGuestIo(.{
+        .read_bytes = readGuestBytes,
+        .write_bytes = writeGuestBytes,
+    });
+    if (builtin.os.tag == .linux) {
+        const dax_mapper = buildDaxMapper(size_bytes_u64);
+        virtio.setupVirtioFs(std.heap.page_allocator, cfg, dax_mapper) catch |e| {
+            log.err("posix virtio-fs setup failed: {s}", .{@errorName(e)});
+            return e;
+        };
+    } else {
+        virtio.setupVirtioFs(std.heap.page_allocator, cfg, null) catch |e| {
+            log.err("posix virtio-fs setup failed: {s}", .{@errorName(e)});
+            return e;
+        };
+    }
+
+    if (builtin.os.tag == .linux) {
+        const kvm_fd = try std.posix.open("/dev/kvm", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+        errdefer std.posix.close(kvm_fd);
+
+        const api_version = std.os.linux.ioctl(kvm_fd, linux_kvm.KVM_GET_API_VERSION, 0);
+        if (api_version != linux_kvm.KVM_API_VERSION) return error.NotSupported;
+
+        const vm_fd = std.os.linux.ioctl(kvm_fd, linux_kvm.KVM_CREATE_VM, 0);
+        if (vm_fd < 0) return error.SystemError;
+        errdefer std.posix.close(@intCast(vm_fd));
+
+        if (@hasDecl(linux_kvm, "KVM_SET_TSS_ADDR")) {
+            _ = std.os.linux.ioctl(@intCast(vm_fd), linux_kvm.KVM_SET_TSS_ADDR, 0xfffbd000);
+        }
+
+        var region = linux_kvm.kvm_userspace_memory_region{
+            .slot = 0,
+            .flags = 0,
+            .guest_phys_addr = 0,
+            .memory_size = size_bytes,
+            .userspace_addr = @intFromPtr(guest_memory.ptr),
+        };
+        const rc_mem = std.os.linux.ioctl(@intCast(vm_fd), linux_kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region));
+        if (std.os.linux.E.init(rc_mem) != .SUCCESS) return error.SystemError;
+
+        const vcpu_fd = std.os.linux.ioctl(@intCast(vm_fd), linux_kvm.KVM_CREATE_VCPU, 0);
+        if (vcpu_fd < 0) return error.SystemError;
+        errdefer std.posix.close(@intCast(vcpu_fd));
+
+        const run_size = std.os.linux.ioctl(kvm_fd, linux_kvm.KVM_GET_VCPU_MMAP_SIZE, 0);
+        if (run_size <= 0) return error.SystemError;
+        const run = try std.posix.mmap(
+            null,
+            @intCast(run_size),
+            @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE),
+            std.posix.MAP{ .TYPE = .SHARED },
+            @intCast(vcpu_fd),
+            0,
+        );
+
+        const cmdline_with_null = try std.fmt.allocPrint(std.heap.page_allocator, "{s}\x00", .{cmdline});
+        defer std.heap.page_allocator.free(cmdline_with_null);
+        try writeGuestBytes(guest_cmdline_base, cmdline_with_null);
+
+        if (cfg.kernel_path) |kernel_path| {
+            try loadFileToGuest(kernel_path, guest_kernel_base, "kernel");
+        }
+        if (cfg.initrd_path) |initrd_path| {
+            try loadFileToGuest(initrd_path, guest_initrd_base, "initrd");
+        }
+
+        const sregs = buildKvmSregs();
+        try kvmSetSregs(@intCast(vcpu_fd), sregs);
+        try kvmSetRegs(@intCast(vcpu_fd), kvm_regset.regs);
+
+        active_kvm = .{
+            .kvm_fd = kvm_fd,
+            .vm_fd = @intCast(vm_fd),
+            .vcpu_fd = @intCast(vcpu_fd),
+            .run = @ptrCast(@alignCast(run.ptr)),
+            .run_size = @intCast(run_size),
+        };
+
+        vcpu_running.store(true, .seq_cst);
+        serial_io.setFromEnv(std.heap.page_allocator);
+        active_vcpu_thread = try std.Thread.spawn(.{}, runVcpuKvm, .{&active_kvm.?});
+        log.info("vm running (kvm)", .{});
+        return;
+    }
 
     vcpu_running.store(true, .seq_cst);
     if (envFlagPresent(std.heap.page_allocator, "M80_IO_SIM")) {
@@ -486,6 +792,20 @@ pub fn stop() !void {
         active_vcpu_thread = null;
     }
     serial_io.clear(std.heap.page_allocator);
+    if (builtin.os.tag == .linux) {
+        if (active_kvm) |state| {
+            std.posix.munmap(state.run[0..state.run_size]);
+            std.posix.close(state.vcpu_fd);
+            std.posix.close(state.vm_fd);
+            std.posix.close(state.kvm_fd);
+            active_kvm = null;
+        }
+    }
+    if (active_guest_memory) |memory| {
+        freeGuestMemory(memory);
+    }
+    clearActiveGuestMemory();
+    active_memory_is_mmap = false;
     active_memory_size = 0;
 }
 

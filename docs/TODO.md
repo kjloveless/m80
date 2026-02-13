@@ -1,6 +1,7 @@
 # TODO: Documentation, Refactors, and Tests
 
 Goal: improve clarity (docs/comments), refactor complex areas into smaller units, and raise test quality/coverage (target >=70% measured separately).
+Status (2026-02-13): This checklist is complete as a historical work log. Active work is tracked in `docs/NEXT-2-WEEKS.md`.
 
 ## Plan (detailed steps)
 
@@ -9,13 +10,13 @@ Goal: improve clarity (docs/comments), refactor complex areas into smaller units
   - [x] Identify long/complex functions and correctness-sensitive paths
   - [x] List specific refactor targets (function splits, naming, error-handling clarity)
 
-- [ ] **Refactor for clarity (behavior-preserving)**
+- [x] **Refactor for clarity (behavior-preserving)**
   - [x] `src/core/config.zig`: isolate config-line parsing and list replacement logic
   - [x] `src/core/state.zig`: extract helpers for filesystem setup and status file handling
   - [x] Add short, targeted comments only where intent isn’t obvious
-  - [ ] Keep diffs small; no behavior change without tests
+  - [x] Keep diffs small; no behavior change without tests
 
-- [ ] **Add meaningful tests (core correctness)**
+- [x] **Add meaningful tests (core correctness)**
   - [x] `src/core/config.zig`:
     - [x] parse `allowed_domains`/`allowed_ips` with trimming
     - [x] unknown key behavior (ignored)
@@ -26,20 +27,20 @@ Goal: improve clarity (docs/comments), refactor complex areas into smaller units
   - [x] `src/core/paths.zig`:
     - [x] boundary conditions on name length
 
-- [ ] **Update TODO as work completes**
+- [x] **Update TODO as work completes**
   - [x] Check off items and add brief notes per change
 
-- [ ] **VM backend focus (posix/serial first)**
+- [x] **VM backend focus (posix/serial first)**
   - [x] Review `src/vm/posix.zig`, `src/vm/serial.zig`, `src/vm/vm.zig`
   - [x] Refactor stub startup/IO helpers for clarity and safety
   - [x] Add tests for byte/IO helpers and edge cases
 
-- [ ] **Security hardening coverage**
+- [x] **Security hardening coverage**
   - [x] Path safety (symlink escape + safe delete)
   - [x] ACL hardening (skip symlinks + configurable modes)
   - [x] Windows ACL hardening implementation
 
-- [ ] **VM backend config validation**
+- [x] **VM backend config validation**
   - [x] POSIX/HVF missing kernel/initrd loader errors + unset no-op tests
   - [x] Windows image load oversized/null memory cases
   - [x] Cross-backend start/stop validation parity

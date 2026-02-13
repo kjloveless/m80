@@ -239,6 +239,10 @@ pub const StartConfigError = error{
     DataDiskUnreadable,
     /// network_mode=open requires explicit env opt-in
     OpenNetworkNotAllowed,
+    /// allowed_domains contains malformed domain or domain:port rule
+    InvalidAllowedDomainSpec,
+    /// allowed_ips contains malformed IP/CIDR rule
+    InvalidAllowedIpSpec,
     /// virtio_fs_queues outside supported range
     VirtioFsQueuesInvalid,
     /// mounts configured without mount_roots
@@ -543,6 +547,14 @@ pub fn validateStartConfig(cfg: *const VmConfig) StartConfigError!void {
         if (mount_cfg.mount_type != .virtio_fs) return error.MountTypeUnsupported;
     }
     if (cfg.virtio_fs_queues == 0 or cfg.virtio_fs_queues > 8) return error.VirtioFsQueuesInvalid;
+    for (cfg.allowed_domains) |domain_spec| {
+        if (domain_spec.len == 0) continue;
+        if (net_policy.parseDomainSpec(domain_spec) == null) return error.InvalidAllowedDomainSpec;
+    }
+    for (cfg.allowed_ips) |ip_spec| {
+        if (ip_spec.len == 0) continue;
+        if (net_policy.parseCidr(ip_spec) == null) return error.InvalidAllowedIpSpec;
+    }
     if (cfg.network_mode == .open) {
         const env_var = std.process.getEnvVarOwned(std.heap.page_allocator, "M80_ALLOW_OPEN_NETWORK") catch {
             return error.OpenNetworkNotAllowed;
@@ -1327,6 +1339,30 @@ test "config: validateStartConfig requires open network opt-in" {
     _ = setenv("M80_ALLOW_OPEN_NETWORK", "1", 1);
     defer _ = setenv("M80_ALLOW_OPEN_NETWORK", "0", 1);
     try validateStartConfig(&cfg);
+}
+
+test "config: validateStartConfig rejects invalid allowed domain spec" {
+    var cfg = try defaultConfig(std.testing.allocator, "test");
+    defer freeConfig(std.testing.allocator, &cfg);
+    cfg.kernel_path = try std.testing.allocator.dupe(u8, "kernel");
+    cfg.disk_path = try std.testing.allocator.dupe(u8, "disk");
+    var allowed_domains = try std.testing.allocator.alloc([]const u8, 1);
+    allowed_domains[0] = try std.testing.allocator.dupe(u8, "example.com:notaport");
+    cfg.allowed_domains = allowed_domains;
+
+    try std.testing.expectError(error.InvalidAllowedDomainSpec, validateStartConfig(&cfg));
+}
+
+test "config: validateStartConfig rejects invalid allowed ip spec" {
+    var cfg = try defaultConfig(std.testing.allocator, "test");
+    defer freeConfig(std.testing.allocator, &cfg);
+    cfg.kernel_path = try std.testing.allocator.dupe(u8, "kernel");
+    cfg.disk_path = try std.testing.allocator.dupe(u8, "disk");
+    var allowed_ips = try std.testing.allocator.alloc([]const u8, 1);
+    allowed_ips[0] = try std.testing.allocator.dupe(u8, "10.0.0.0/99");
+    cfg.allowed_ips = allowed_ips;
+
+    try std.testing.expectError(error.InvalidAllowedIpSpec, validateStartConfig(&cfg));
 }
 
 test "config: unknown keys are ignored" {
