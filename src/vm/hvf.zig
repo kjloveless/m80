@@ -4127,6 +4127,113 @@ fn allocZ(allocator: std.mem.Allocator, value: []const u8) ![:0]u8 {
     return buf[0..value.len :0];
 }
 
+fn encodeDnsName(out: []u8, domain: []const u8) !usize {
+    if (domain.len == 0) return error.InvalidDnsName;
+    var out_idx: usize = 0;
+    var label_start: usize = 0;
+    while (label_start < domain.len) {
+        const dot = std.mem.indexOfScalarPos(u8, domain, label_start, '.') orelse domain.len;
+        const label_len = dot - label_start;
+        if (label_len == 0 or label_len > 63) return error.InvalidDnsName;
+        if (out_idx + 1 + label_len > out.len) return error.NoSpaceLeft;
+        out[out_idx] = @intCast(label_len);
+        out_idx += 1;
+        @memcpy(out[out_idx .. out_idx + label_len], domain[label_start..dot]);
+        out_idx += label_len;
+        label_start = if (dot < domain.len) dot + 1 else dot;
+    }
+    if (out_idx >= out.len) return error.NoSpaceLeft;
+    out[out_idx] = 0;
+    return out_idx + 1;
+}
+
+fn buildDnsQueryFrame(frame: []u8, domain: []const u8, dst_ip: [4]u8) ![]const u8 {
+    if (frame.len < 64) return error.NoSpaceLeft;
+    @memset(frame, 0);
+
+    // Ethernet header
+    frame[0..6].* = .{ 0x10, 0x22, 0x33, 0x44, 0x55, 0x66 };
+    frame[6..12].* = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+
+    const ip_offset: usize = 14;
+    const udp_offset: usize = ip_offset + 20;
+    const dns_offset: usize = udp_offset + 8;
+    const qname_len = try encodeDnsName(frame[dns_offset + 12 ..], domain);
+    const question_offset = dns_offset + 12 + qname_len;
+    if (question_offset + 4 > frame.len) return error.NoSpaceLeft;
+
+    // DNS header + question
+    frame[dns_offset + 0] = 0x12; // txid
+    frame[dns_offset + 1] = 0x34;
+    frame[dns_offset + 2] = 0x01; // standard query, recursion desired
+    frame[dns_offset + 3] = 0x00;
+    frame[dns_offset + 4] = 0x00; // qdcount=1
+    frame[dns_offset + 5] = 0x01;
+    frame[question_offset + 0] = 0x00; // qtype=A
+    frame[question_offset + 1] = 0x01;
+    frame[question_offset + 2] = 0x00; // qclass=IN
+    frame[question_offset + 3] = 0x01;
+
+    const dns_len: usize = 12 + qname_len + 4;
+    const udp_len: u16 = @intCast(8 + dns_len);
+    const ip_len: u16 = @intCast(20 + udp_len);
+    const frame_len = dns_offset + dns_len;
+
+    // IPv4 header
+    frame[ip_offset + 0] = 0x45;
+    frame[ip_offset + 8] = 64; // ttl
+    frame[ip_offset + 9] = 17; // udp
+    std.mem.writeInt(u16, frame[ip_offset + 2 ..][0..2], ip_len, .big);
+    frame[ip_offset + 12 .. ip_offset + 16].* = .{ 10, 0, 2, 15 };
+    @memcpy(frame[ip_offset + 16 .. ip_offset + 20], &dst_ip);
+
+    // UDP header
+    std.mem.writeInt(u16, frame[udp_offset..][0..2], 12345, .big);
+    std.mem.writeInt(u16, frame[udp_offset + 2 ..][0..2], 53, .big);
+    std.mem.writeInt(u16, frame[udp_offset + 4 ..][0..2], udp_len, .big);
+
+    return frame[0..frame_len];
+}
+
+fn runVirtioNetTxFrame(frame: []const u8, desc_addr: u64, avail_addr: u64, used_addr: u64, data_addr: u64) !void {
+    virtio.virtio_net_state.queues[1] = .{
+        .num = 8,
+        .ready = true,
+        .desc_addr = desc_addr,
+        .avail_addr = avail_addr,
+        .used_addr = used_addr,
+        .last_avail_idx = 0,
+        .used_idx = 0,
+    };
+
+    const payload_len = virtio.virtio_net_hdr_len + frame.len;
+    var payload = try std.testing.allocator.alloc(u8, payload_len);
+    defer std.testing.allocator.free(payload);
+    @memset(payload[0..virtio.virtio_net_hdr_len], 0);
+    @memcpy(payload[virtio.virtio_net_hdr_len..], frame);
+    try writeGuestBytes(data_addr, payload);
+
+    const desc = virtio.VirtqDesc{
+        .addr = data_addr,
+        .len = @intCast(payload_len),
+        .flags = 0,
+        .next = 0,
+    };
+    var desc_buf: [@sizeOf(virtio.VirtqDesc)]u8 = undefined;
+    std.mem.copyForwards(u8, &desc_buf, std.mem.asBytes(&desc));
+    try writeGuestBytes(desc_addr, desc_buf[0..]);
+
+    try writeGuestU16(avail_addr, 0);
+    try writeGuestU16(avail_addr + 2, 1);
+    try writeGuestU16(avail_addr + 4, 0);
+    try writeGuestU16(used_addr + 2, 0);
+
+    try virtio.processVirtioNetTxQueue();
+    try std.testing.expectEqual(@as(u16, 1), try readGuestU16(used_addr + 2));
+}
+
 fn expectLifecycleReset() !void {
     try std.testing.expect(active_vm == null);
     try std.testing.expect(active_guest_memory == null);
@@ -4141,6 +4248,7 @@ fn expectLifecycleReset() !void {
     try std.testing.expect(vmnet_rx_thread == null);
     try std.testing.expect(!vmnet_rx_running.load(.seq_cst));
     try std.testing.expect(active_memory_size == 0);
+    try std.testing.expect(virtio.net_policy_state == null);
 }
 
 test "smoke: hvf backend start/stop" {
@@ -4785,6 +4893,68 @@ test "smoke: hvf arm64 repeated start-stop reliability" {
         try stop();
         try expectLifecycleReset();
     }
+}
+
+test "hvf: integration allowlist blocks non-whitelisted dns egress via virtio-net tx path" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
+    const enabled = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_HVF_NET_POLICY_INTEGRATION") catch null;
+    defer if (enabled) |v| std.testing.allocator.free(v);
+    if (enabled == null or !std.mem.eql(u8, enabled.?, "1")) return error.SkipZigTest;
+
+    const cfg = try config.defaultConfig(std.testing.allocator, "test");
+    var cfg_mut = cfg;
+    defer config.freeConfig(std.testing.allocator, &cfg_mut);
+    cfg_mut.kernel_path = null;
+    cfg_mut.network_mode = .allowlist;
+    var allowed_domains = try std.testing.allocator.alloc([]const u8, 1);
+    allowed_domains[0] = try std.testing.allocator.dupe(u8, "allowed.test");
+    cfg_mut.allowed_domains = allowed_domains;
+
+    var started = false;
+    start(cfg_mut) catch |e| switch (e) {
+        error.NotImplemented => return error.SkipZigTest,
+        error.HvfFailure => return error.SkipZigTest,
+        else => return e,
+    };
+    started = true;
+    defer if (started) stop() catch {};
+
+    // vmnet entitlement/codesign may be absent on many hosts; only assert behavior
+    // when virtio-net was actually enabled by the platform path.
+    if (!virtio.virtio_net_state.enabled or active_vmnet_iface == null) return error.SkipZigTest;
+
+    const TxProbe = struct {
+        var sent = std.atomic.Value(usize).init(0);
+        fn callback(_: []const u8) void {
+            _ = sent.fetchAdd(1, .seq_cst);
+        }
+    };
+    TxProbe.sent.store(0, .seq_cst);
+    virtio.setNetTxCallback(TxProbe.callback);
+
+    if (active_memory_size < 0x8000) return error.SkipZigTest;
+    const scratch_base = guestMemoryBase() + @as(u64, active_memory_size) - 0x8000;
+    const desc_addr = scratch_base;
+    const avail_addr = scratch_base + 0x1000;
+    const used_addr = scratch_base + 0x2000;
+    const data_addr = scratch_base + 0x3000;
+
+    var blocked_buf: [256]u8 = undefined;
+    const blocked_frame = try buildDnsQueryFrame(blocked_buf[0..], "blocked.test", .{ 8, 8, 8, 8 });
+    try runVirtioNetTxFrame(blocked_frame, desc_addr, avail_addr, used_addr, data_addr);
+    try std.testing.expectEqual(@as(usize, 0), TxProbe.sent.load(.seq_cst));
+    try std.testing.expect(!virtio.outboundFrameAllowed(blocked_frame));
+
+    var allowed_buf: [256]u8 = undefined;
+    const allowed_frame = try buildDnsQueryFrame(allowed_buf[0..], "allowed.test", .{ 8, 8, 8, 8 });
+    try runVirtioNetTxFrame(allowed_frame, desc_addr, avail_addr, used_addr, data_addr);
+    try std.testing.expectEqual(@as(usize, 1), TxProbe.sent.load(.seq_cst));
+    try std.testing.expect(virtio.outboundFrameAllowed(allowed_frame));
+
+    try stop();
+    started = false;
+    try expectLifecycleReset();
 }
 
 test "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled" {

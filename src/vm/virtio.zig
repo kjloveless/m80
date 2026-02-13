@@ -249,6 +249,12 @@ const PendingRefusedQueue = struct {
 var pending_refused_queue = PendingRefusedQueue{};
 var pending_refused_mutex = std.Thread.Mutex{};
 
+fn resetPendingRefusedQueue() void {
+    pending_refused_mutex.lock();
+    defer pending_refused_mutex.unlock();
+    pending_refused_queue = .{};
+}
+
 fn queuePendingRefused(frame: []const u8) bool {
     if (pending_refused_queue.count >= PendingRefusedQueue.max_pending) return false;
     if (frame.len > PendingRefusedQueue.max_frame_len) return false;
@@ -297,6 +303,19 @@ pub fn setNetTxCallback(cb: ?NetTxCallback) void {
 
 pub var net_policy_state: ?net_policy.NetworkPolicy = null;
 pub var net_policy_mutex = std.Thread.Mutex{};
+
+fn deinitNetworkPolicyStateLocked() void {
+    if (net_policy_state) |*policy| {
+        policy.deinit();
+    }
+    net_policy_state = null;
+}
+
+pub fn resetNetworkPolicyState() void {
+    net_policy_mutex.lock();
+    defer net_policy_mutex.unlock();
+    deinitNetworkPolicyStateLocked();
+}
 
 pub const virtio_fs_tag_len: usize = 36;
 const virtio_fs_queue_limit: usize = 8;
@@ -540,6 +559,9 @@ pub fn resetVirtioNetState() void {
     gic_virtio_net_intid = null;
     virtio_net_irq_level = false;
     virtio_net_seen.store(false, .seq_cst);
+    net_tx_callback = null;
+    resetPendingRefusedQueue();
+    resetNetworkPolicyState();
 }
 
 pub fn resetVirtioFsState() void {
@@ -931,6 +953,9 @@ pub fn initNetworkPolicy(cfg: config.VmConfig) !void {
     if (policy.mode == .allowlist and policy.allowed_domains.items.len == 0 and policy.allowed_ips.items.len == 0) {
         log.warn("hvf network allowlist enabled with no rules; all outbound traffic will be blocked", .{});
     }
+    net_policy_mutex.lock();
+    defer net_policy_mutex.unlock();
+    deinitNetworkPolicyStateLocked();
     net_policy_state = policy;
 }
 

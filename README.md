@@ -347,6 +347,16 @@ M80_TEST_INITRD=images/m80-initramfs.cpio.gz \
 zig build test -- --test-filter "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled"
 ```
 
+Allowlist fail-hard integration test (platform-gated):
+
+```bash
+M80_TEST_HVF_NET_POLICY_INTEGRATION=1 \
+zig build test -- --test-filter "hvf: integration allowlist blocks non-whitelisted dns egress via virtio-net tx path"
+```
+
+This test requires vmnet-backed virtio-net to initialize on macOS. Hosts without
+vmnet entitlement/codesign support will skip this test.
+
 Known-good small raw ARM64 kernels (bring your own kernel):
 
 - Debian bullseye netboot `linux` (~26MB): raw `Image` and works with the current loader.

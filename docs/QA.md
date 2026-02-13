@@ -142,8 +142,11 @@ _None currently listed._
   - Commands:
     - `make hvf-reliability KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz`
     - `make hvf-reliability-nightly KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz`
+    - `M80_TEST_HVF_NET_POLICY_INTEGRATION=1 zig build test -- --test-filter "hvf: integration allowlist blocks non-whitelisted dns egress via virtio-net tx path"`
   - Deterministic timeout-path test:
     - `M80_TEST_HVF_FORCE_STOP_TIMEOUT=1 ... zig build test -- --test-filter "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled"`
+  - Network-policy integration note:
+    - The allowlist fail-hard test is platform-gated and expects vmnet-backed virtio-net to initialize; hosts without vmnet entitlement/codesign will report a skip.
   - CI workflow: `.github/workflows/hvf-reliability.yml` (self-hosted `macOS` + `ARM64` runner).
   - CI network profile: default locked-down/no vmnet entitlement required.
 - **Linux KVM integration tests**
