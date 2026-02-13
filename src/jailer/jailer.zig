@@ -35,8 +35,29 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const paths = @import("../core/paths.zig");
+const vm_config = @import("../core/config.zig");
 const log = @import("../util/log.zig");
 const acl = @import("acl.zig");
+const seccomp = @import("seccomp.zig");
+const sandbox_darwin = @import("sandbox_darwin.zig");
+const sandbox_windows = @import("sandbox_windows.zig");
+
+extern "c" fn getgid() std.posix.gid_t;
+extern "c" fn getegid() std.posix.gid_t;
+extern "c" fn setgroups(size: c_int, list: ?*const std.posix.gid_t) c_int;
+
+pub const EnforcementMode = enum {
+    off,
+    observe,
+    strict,
+
+    pub fn fromString(value: []const u8) ?EnforcementMode {
+        if (std.mem.eql(u8, value, "off")) return .off;
+        if (std.mem.eql(u8, value, "observe")) return .observe;
+        if (std.mem.eql(u8, value, "strict")) return .strict;
+        return null;
+    }
+};
 
 /// Configuration for the jailer
 pub const JailerConfig = struct {
@@ -52,6 +73,8 @@ pub const JailerConfig = struct {
     limits: ResourceLimits = .{},
     /// Whether to harden directory permissions
     harden_permissions: bool = true,
+    /// Runtime platform hardening behavior when seccomp/sandbox setup fails.
+    enforcement_mode: EnforcementMode = .observe,
 };
 
 /// Resource limits for the jailed process
@@ -73,6 +96,7 @@ pub const JailerError = error{
     PrivilegeVerifyFailed,
     ChrootFailed,
     ResourceLimitFailed,
+    SecurityPolicyFailed,
     PermissionDenied,
     InvalidConfig,
     OutOfMemory,
@@ -84,21 +108,27 @@ pub const Jailer = struct {
     config: JailerConfig,
 
     pub fn init(allocator: std.mem.Allocator) !Jailer {
-        return initWithConfig(allocator, .{});
+        var cfg = JailerConfig{};
+        cfg.enforcement_mode = readEnforcementModeFromEnv(allocator);
+        return initWithConfig(allocator, cfg);
     }
 
-    pub fn initWithConfig(allocator: std.mem.Allocator, config: JailerConfig) !Jailer {
+    pub fn initWithConfig(allocator: std.mem.Allocator, jailer_config: JailerConfig) !Jailer {
         const base = try paths.dataDir(allocator);
         defer allocator.free(base);
         const root = try std.fs.path.join(allocator, &[_][]const u8{ base, "instances", "default" });
         return Jailer{
             .allocator = allocator,
             .root = root,
-            .config = config,
+            .config = jailer_config,
         };
     }
 
     pub fn prepare(self: *Jailer) !void {
+        try self.prepareForVm(null, null);
+    }
+
+    pub fn prepareForVm(self: *Jailer, vm_dir: ?[]const u8, vm_cfg: ?*const vm_config.VmConfig) !void {
         // Prepare enforces filesystem + resource constraints before VM startup.
         log.info("preparing jail at {s}", .{self.root});
 
@@ -131,12 +161,147 @@ pub const Jailer = struct {
             try dropPrivileges(self.config.target_gid, self.config.target_uid);
             try verifyPrivilegesDropped();
         }
+
+        try applyPlatformHardening(self, vm_dir, vm_cfg);
     }
 
     pub fn deinit(self: *Jailer) void {
         self.allocator.free(self.root);
     }
 };
+
+fn readEnforcementModeFromEnv(allocator: std.mem.Allocator) EnforcementMode {
+    const raw = std.process.getEnvVarOwned(allocator, "M80_JAILER_ENFORCEMENT") catch return .observe;
+    defer allocator.free(raw);
+    return EnforcementMode.fromString(raw) orelse blk: {
+        log.warn("invalid M80_JAILER_ENFORCEMENT={s}; using observe", .{raw});
+        break :blk .observe;
+    };
+}
+
+fn effectiveVmDir(root: []const u8, vm_dir: ?[]const u8) ?[]const u8 {
+    return vm_dir orelse root;
+}
+
+fn allowSandboxNetwork(vm_cfg: ?*const vm_config.VmConfig) bool {
+    const cfg = vm_cfg orelse return false;
+    return cfg.network_mode != .locked_down;
+}
+
+fn maybePath(vm_cfg: ?*const vm_config.VmConfig, comptime field: []const u8) ?[]const u8 {
+    const cfg = vm_cfg orelse return null;
+    return @field(cfg, field);
+}
+
+fn handleHardeningFailure(mode: EnforcementMode, component: []const u8, err_name: []const u8) JailerError!void {
+    switch (mode) {
+        .off => return,
+        .observe => {
+            log.warn("jailer {s} hardening failed: {s} (mode=observe; continuing)", .{ component, err_name });
+            return;
+        },
+        .strict => {
+            log.err("jailer {s} hardening failed: {s} (mode=strict)", .{ component, err_name });
+            return JailerError.SecurityPolicyFailed;
+        },
+    }
+}
+
+fn applyLinuxSeccomp(self: *Jailer) JailerError!void {
+    seccomp.applyVmmSeccompFilter(self.allocator) catch |e| {
+        try handleHardeningFailure(self.config.enforcement_mode, "seccomp", @errorName(e));
+    };
+}
+
+fn applyDarwinSandbox(self: *Jailer, vm_dir: ?[]const u8, vm_cfg: ?*const vm_config.VmConfig) JailerError!void {
+    const options = sandbox_darwin.VmmSandboxOptions{
+        .vm_directory = effectiveVmDir(self.root, vm_dir),
+        .allow_write_vm_dir = true,
+        .kernel_path = maybePath(vm_cfg, "kernel_path"),
+        .initrd_path = maybePath(vm_cfg, "initrd_path"),
+        .disk_path = maybePath(vm_cfg, "disk_path"),
+        .seed_path = maybePath(vm_cfg, "seed_path"),
+        .data_disk_path = maybePath(vm_cfg, "data_disk_path"),
+        .allow_network = allowSandboxNetwork(vm_cfg),
+    };
+    sandbox_darwin.applyVmmSandbox(self.allocator, options) catch |e| {
+        try handleHardeningFailure(self.config.enforcement_mode, "darwin-sandbox", @errorName(e));
+    };
+}
+
+fn applyWindowsSandbox(self: *Jailer) JailerError!void {
+    const options = sandbox_windows.VmmSandboxOptions{
+        .memory_limit = self.config.limits.max_address_space,
+        .allow_clipboard = false,
+    };
+    sandbox_windows.applyVmmSandbox(self.allocator, options) catch |e| {
+        try handleHardeningFailure(self.config.enforcement_mode, "windows-job-object", @errorName(e));
+    };
+}
+
+fn applyPlatformHardening(self: *Jailer, vm_dir: ?[]const u8, vm_cfg: ?*const vm_config.VmConfig) JailerError!void {
+    if (builtin.is_test and vm_cfg == null and vm_dir == null) return;
+    if (self.config.enforcement_mode == .off) return;
+    switch (builtin.os.tag) {
+        .linux => try applyLinuxSeccomp(self),
+        .macos => try applyDarwinSandbox(self, vm_dir, vm_cfg),
+        .windows => try applyWindowsSandbox(self),
+        else => {},
+    }
+}
+
+fn integrationEnvEnabled(allocator: std.mem.Allocator, name: []const u8) bool {
+    const value = std.process.getEnvVarOwned(allocator, name) catch return false;
+    defer allocator.free(value);
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.mem.eql(u8, trimmed, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
+    return true;
+}
+
+fn requireIntegrationEnv(name: []const u8) !void {
+    if (!integrationEnvEnabled(std.testing.allocator, name)) {
+        return error.SkipZigTest;
+    }
+}
+
+fn integrationTestJailerConfig(mode: EnforcementMode) JailerConfig {
+    return .{
+        .harden_permissions = false,
+        .enforcement_mode = mode,
+        .limits = .{
+            .max_files = null,
+            .max_procs = null,
+            .max_address_space = null,
+            .max_core = null,
+            .max_cpu_time = null,
+        },
+    };
+}
+
+fn buildIntegrationVmConfig(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !vm_config.VmConfig {
+    var cfg = try vm_config.defaultConfig(allocator, "jailer-integration");
+    errdefer vm_config.freeConfig(allocator, &cfg);
+
+    {
+        var kernel = try tmp.dir.createFile("kernel", .{ .truncate = true });
+        defer kernel.close();
+        try kernel.writeAll("kernel");
+    }
+    {
+        var initrd = try tmp.dir.createFile("initrd", .{ .truncate = true });
+        defer initrd.close();
+        try initrd.writeAll("initrd");
+    }
+
+    const vm_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(vm_dir);
+    cfg.kernel_path = try std.fs.path.join(allocator, &[_][]const u8{ vm_dir, "kernel" });
+    cfg.initrd_path = try std.fs.path.join(allocator, &[_][]const u8{ vm_dir, "initrd" });
+    cfg.network_mode = .locked_down;
+    return cfg;
+}
 
 /// Drops privileges to the specified UID/GID
 /// Must be called in correct order: setgroups, setgid, setuid
@@ -193,8 +358,11 @@ fn dropSupplementaryGroups() !void {
         return;
     }
 
-    // On macOS/BSD, setgroups is available but we skip for safety
-    // This is a no-op on non-Linux for now
+    // POSIX path (macOS/BSD): clear supplemental groups explicitly.
+    if (setgroups(0, null) != 0) {
+        log.err("setgroups failed", .{});
+        return error.SystemError;
+    }
 }
 
 /// Sets the effective and real GID
@@ -303,11 +471,9 @@ pub fn getCurrentUid() u32 {
 pub fn getCurrentGid() u32 {
     if (builtin.os.tag == .windows) return 0;
     if (builtin.os.tag == .linux) {
-        return @intCast(std.os.linux.syscall(.getgid, .{}));
+        return @intCast(std.os.linux.getgid());
     }
-    // macOS uses the same syscall number as getuid but we return 0 for now
-    // as there's no direct Zig binding for getgid on macOS
-    return 0;
+    return @intCast(getgid());
 }
 
 /// Checks if running as root
@@ -326,10 +492,9 @@ pub fn getEffectiveUid() u32 {
 pub fn getEffectiveGid() u32 {
     if (builtin.os.tag == .windows) return 0;
     if (builtin.os.tag == .linux) {
-        return @intCast(std.os.linux.syscall(.getegid, .{}));
+        return @intCast(std.os.linux.getegid());
     }
-    // macOS - return 0 for now as there's no direct Zig binding
-    return 0;
+    return @intCast(getegid());
 }
 
 // =============================================================================
@@ -353,6 +518,7 @@ test "jailer: config defaults" {
     try std.testing.expect(config.target_gid == null);
     try std.testing.expect(!config.chroot_enabled);
     try std.testing.expect(config.harden_permissions);
+    try std.testing.expectEqual(EnforcementMode.observe, config.enforcement_mode);
 }
 
 test "jailer: resource limits defaults" {
@@ -463,11 +629,12 @@ test "jailer: JailerError variants exist" {
         JailerError.PrivilegeVerifyFailed,
         JailerError.ChrootFailed,
         JailerError.ResourceLimitFailed,
+        JailerError.SecurityPolicyFailed,
         JailerError.PermissionDenied,
         JailerError.InvalidConfig,
         JailerError.OutOfMemory,
     };
-    try std.testing.expectEqual(@as(usize, 7), errors.len);
+    try std.testing.expectEqual(@as(usize, 8), errors.len);
 }
 
 test "jailer: isRoot matches getCurrentUid" {
@@ -494,6 +661,54 @@ test "jailer: initWithConfig preserves config" {
     try std.testing.expect(!jailer.config.chroot_enabled);
     try std.testing.expect(!jailer.config.harden_permissions);
     try std.testing.expectEqual(@as(?u64, 512), jailer.config.limits.max_files);
+}
+
+test "jailer: EnforcementMode fromString" {
+    try std.testing.expectEqual(EnforcementMode.off, EnforcementMode.fromString("off").?);
+    try std.testing.expectEqual(EnforcementMode.observe, EnforcementMode.fromString("observe").?);
+    try std.testing.expectEqual(EnforcementMode.strict, EnforcementMode.fromString("strict").?);
+    try std.testing.expect(EnforcementMode.fromString("invalid") == null);
+}
+
+test "jailer: integration observe mode exercises platform hardening path" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    try requireIntegrationEnv("M80_TEST_JAILER_INTEGRATION");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try buildIntegrationVmConfig(std.testing.allocator, &tmp);
+    defer vm_config.freeConfig(std.testing.allocator, &cfg);
+    const vm_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(vm_dir);
+
+    var jailer = try Jailer.initWithConfig(
+        std.testing.allocator,
+        integrationTestJailerConfig(.observe),
+    );
+    defer jailer.deinit();
+    try jailer.prepareForVm(vm_dir, &cfg);
+}
+
+test "jailer: integration strict mode fails when hardening cannot be applied" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    try requireIntegrationEnv("M80_TEST_JAILER_INTEGRATION");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try buildIntegrationVmConfig(std.testing.allocator, &tmp);
+    defer vm_config.freeConfig(std.testing.allocator, &cfg);
+    const vm_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(vm_dir);
+
+    var jailer = try Jailer.initWithConfig(
+        std.testing.allocator,
+        integrationTestJailerConfig(.strict),
+    );
+    defer jailer.deinit();
+    try std.testing.expectError(
+        JailerError.SecurityPolicyFailed,
+        jailer.prepareForVm(vm_dir, &cfg),
+    );
 }
 
 test "jailer: dropPrivileges is no-op on windows" {

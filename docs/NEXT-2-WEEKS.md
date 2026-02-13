@@ -25,14 +25,14 @@ Goal: close the highest-risk gaps between current backend/device scaffolding and
 ## Week 2 (2026-02-20 to 2026-02-27)
 
 - [ ] Network policy enforcement through virtio-net path
-  - [ ] Enforce `locked_down` as default deny in device/backend data path.
-  - [ ] Enforce allowlist mode for DNS + IP policy with explicit test cases.
+  - [x] Enforce `locked_down` as default deny in device/backend data path.
+  - [x] Enforce allowlist mode for DNS + IP policy with explicit test cases.
   - [ ] Exit criteria: integration tests prove non-whitelisted destinations fail hard.
 
 - [ ] Jailer enforcement hardening pass
-  - [ ] Ensure Linux seccomp policy is applied in runtime prepare path (not only generated).
-  - [ ] Ensure macOS sandbox profile is applied in runtime path (not only generated).
-  - [ ] Add verification checks for resource limit application.
+  - [x] Ensure Linux seccomp policy is applied in runtime prepare path (not only generated).
+  - [x] Ensure macOS sandbox profile is applied in runtime path (not only generated).
+  - [x] Add verification checks for resource limit application.
   - [ ] Exit criteria: jailer enforcement paths are exercised in platform-gated tests.
 
 - [ ] Docs + QA sync with live state

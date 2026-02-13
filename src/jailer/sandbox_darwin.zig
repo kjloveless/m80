@@ -133,9 +133,9 @@ pub const SandboxProfile = struct {
             [*:0]const u8,
             u64,
             *?[*:0]u8,
-        ) callconv(.C) c_int, .{ .name = "sandbox_init" });
+        ) callconv(.c) c_int, .{ .name = "sandbox_init" });
 
-        const sandbox_free_error_fn = @extern(?*const fn (?[*:0]u8) callconv(.C) void, .{
+        const sandbox_free_error_fn = @extern(?*const fn (?[*:0]u8) callconv(.c) void, .{
             .name = "sandbox_free_error",
         });
 

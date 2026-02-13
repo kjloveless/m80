@@ -7,7 +7,7 @@ const net_policy = @import("../net/policy.zig");
 const virtio_fs = @import("../fs/virtio_fs.zig");
 const mounts = @import("../fs/mounts.zig");
 const log = @import("../util/log.zig");
-const SerialIo = @import("serial.zig").SerialIo;
+const serial = @import("serial.zig");
 
 pub const GuestIo = struct {
     read_bytes: *const fn (u64, []u8) anyerror!void,
@@ -128,6 +128,7 @@ pub var gic_virtio_rng_intid: ?u32 = null;
 pub var virtio_blk_irq_level: [virtio_blk_device_count]bool = .{ false, false, false };
 pub var virtio_console_irq_level = false;
 pub var virtio_rng_irq_level = false;
+pub var virtio_console_rx_logged = std.atomic.Value(bool).init(false);
 
 pub const VirtioBlkQueue = struct {
     num: u16 = 0,
@@ -522,6 +523,7 @@ pub fn resetVirtioConsoleState() void {
     virtio_console_state = .{};
     gic_virtio_console_intid = null;
     virtio_console_irq_level = false;
+    virtio_console_rx_logged.store(false, .seq_cst);
     virtio_console_input.mutex.lock();
     virtio_console_input.buf.clearRetainingCapacity();
     virtio_console_input.mutex.unlock();
@@ -744,15 +746,15 @@ pub fn restoreVirtioFsState(snap: snapshot.VirtioFsSnapshotState) void {
 
 /// Collects all enabled device states for snapshot
 pub fn collectDeviceStates(allocator: std.mem.Allocator) ![]snapshot.DeviceStateEntry {
-    var entries = std.ArrayList(snapshot.DeviceStateEntry).init(allocator);
-    errdefer entries.deinit();
+    var entries = std.ArrayList(snapshot.DeviceStateEntry).empty;
+    errdefer entries.deinit(allocator);
 
     // VirtIO-blk devices
     for (0..virtio_blk_device_count) |i| {
         if (captureVirtioBlkState(i)) |state| {
             const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioBlkSnapshotState));
             @memcpy(data, std.mem.asBytes(&state));
-            try entries.append(.{
+            try entries.append(allocator, .{
                 .header = .{
                     .device_type = .virtio_blk,
                     .device_index = @intCast(i),
@@ -767,7 +769,7 @@ pub fn collectDeviceStates(allocator: std.mem.Allocator) ![]snapshot.DeviceState
     if (captureVirtioConsoleState()) |state| {
         const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioConsoleSnapshotState));
         @memcpy(data, std.mem.asBytes(&state));
-        try entries.append(.{
+        try entries.append(allocator, .{
             .header = .{
                 .device_type = .virtio_console,
                 .device_index = 0,
@@ -781,7 +783,7 @@ pub fn collectDeviceStates(allocator: std.mem.Allocator) ![]snapshot.DeviceState
     if (captureVirtioRngState()) |state| {
         const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioRngSnapshotState));
         @memcpy(data, std.mem.asBytes(&state));
-        try entries.append(.{
+        try entries.append(allocator, .{
             .header = .{
                 .device_type = .virtio_rng,
                 .device_index = 0,
@@ -795,7 +797,7 @@ pub fn collectDeviceStates(allocator: std.mem.Allocator) ![]snapshot.DeviceState
     if (captureVirtioNetState()) |state| {
         const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioNetSnapshotState));
         @memcpy(data, std.mem.asBytes(&state));
-        try entries.append(.{
+        try entries.append(allocator, .{
             .header = .{
                 .device_type = .virtio_net,
                 .device_index = 0,
@@ -809,7 +811,7 @@ pub fn collectDeviceStates(allocator: std.mem.Allocator) ![]snapshot.DeviceState
     if (captureVirtioFsState()) |state| {
         const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioFsSnapshotState));
         @memcpy(data, std.mem.asBytes(&state));
-        try entries.append(.{
+        try entries.append(allocator, .{
             .header = .{
                 .device_type = .virtio_fs,
                 .device_index = 0,
@@ -819,7 +821,7 @@ pub fn collectDeviceStates(allocator: std.mem.Allocator) ![]snapshot.DeviceState
         });
     }
 
-    return entries.toOwnedSlice();
+    return entries.toOwnedSlice(allocator);
 }
 
 /// Frees device state entries allocated by collectDeviceStates
@@ -855,7 +857,7 @@ pub fn setupVirtioNet(enabled: bool, mac: [6]u8) void {
     );
 }
 
-pub fn setupVirtioFs(allocator: std.mem.Allocator, cfg: config.VmConfig) !void {
+pub fn setupVirtioFs(allocator: std.mem.Allocator, cfg: config.VmConfig, dax: ?virtio_fs.DaxMapper) !void {
     resetVirtioFsState();
     if (cfg.mounts.len == 0) return;
     if (cfg.mounts.len > 1) return error.MountsUnsupported;
@@ -879,7 +881,7 @@ pub fn setupVirtioFs(allocator: std.mem.Allocator, cfg: config.VmConfig) !void {
     virtio_fs_mount_manager = manager;
 
     const mount_tag = manager.mounts.items[0].tag;
-    const device = virtio_fs.VirtioFsDevice.init(
+    var device = virtio_fs.VirtioFsDevice.init(
         allocator,
         &virtio_fs_mount_manager.?,
         mount_tag,
@@ -889,6 +891,9 @@ pub fn setupVirtioFs(allocator: std.mem.Allocator, cfg: config.VmConfig) !void {
             .always => .always,
         },
     );
+    if (dax) |mapper| {
+        device.configureDax(mapper);
+    }
     virtio_fs_device = device;
     virtio_fs_state.enabled = true;
     @memset(&virtio_fs_state.tag, 0);
@@ -905,18 +910,14 @@ pub fn initNetworkPolicy(cfg: config.VmConfig) !void {
 
     for (cfg.allowed_domains) |domain_spec| {
         if (domain_spec.len == 0) continue;
-        // Parse "domain:port" format - strip port suffix for domain matching
-        if (std.mem.lastIndexOfScalar(u8, domain_spec, ':')) |colon_idx| {
-            const domain = domain_spec[0..colon_idx];
-            const port_str = domain_spec[colon_idx + 1 ..];
-            if (std.fmt.parseInt(u16, port_str, 10)) |port| {
-                try policy.addDomainRuleWithPorts(domain, port, port);
-            } else |_| {
-                // Not a valid port number, treat whole string as domain
-                try policy.addDomainRule(domain_spec);
-            }
+        const parsed = net_policy.parseDomainSpec(domain_spec) orelse {
+            log.err("hvf network allowlist invalid domain spec: {s}", .{domain_spec});
+            return error.InvalidNetworkConfig;
+        };
+        if (parsed.port_min == null and parsed.port_max == null) {
+            try policy.addDomainRule(parsed.domain);
         } else {
-            try policy.addDomainRule(domain_spec);
+            try policy.addDomainRuleWithPorts(parsed.domain, parsed.port_min, parsed.port_max);
         }
     }
     for (cfg.allowed_ips) |ip_str| {
@@ -1002,8 +1003,16 @@ pub fn outboundFrameAllowed(frame: []const u8) bool {
             const payload = frame[payload_offset..];
             var name_buf: [256]u8 = undefined;
             const domain = dns.parseQueryDomain(payload, &name_buf) catch return false;
-            return policy.isDomainAllowed(domain);
+            return policy.isDomainAllowedOnPort(domain, dst_port);
         }
+        return policy.isIpAllowedOnPort(dst_ip, dst_port);
+    }
+
+    if (protocol == 6) { // TCP
+        const tcp_offset = ip_offset + ihl;
+        if (frame.len < tcp_offset + 4) return false;
+        const dst_port = std.mem.readInt(u16, frame[tcp_offset + 2 ..][0..2], .big);
+        return policy.isIpAllowedOnPort(dst_ip, dst_port);
     }
 
     return policy.isIpAllowed(dst_ip);
@@ -1041,7 +1050,7 @@ pub fn maybeSendDnsRefused(frame: []const u8) bool {
     // Check if domain is blocked
     var name_buf: [256]u8 = undefined;
     const domain = dns.parseQueryDomain(payload, &name_buf) catch return false;
-    if (policy.isDomainAllowed(domain)) return false;
+    if (policy.isDomainAllowedOnPort(domain, dst_port)) return false;
 
     // Domain is blocked - send REFUSED response
     const dst_ip: [4]u8 = frame[ip_offset + 16 ..][0..4].*;
@@ -1091,13 +1100,12 @@ fn sendDnsRefusedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offs
     // Modify DNS header: set QR=1 (response) and RCODE=5 (REFUSED)
     // DNS flags are at payload_offset + 2..4
     // Original flags format: QR(1) OPCODE(4) AA(1) TC(1) RD(1) | RA(1) Z(3) RCODE(4)
-    // We want: QR=1, keep OPCODE, set AA=1, clear TC, keep RD, set RA=1, RCODE=3 (NXDOMAIN)
-    // Using NXDOMAIN instead of REFUSED so clients don't retry thinking another server might work
+    // We want: QR=1, keep OPCODE, set AA=1, clear TC, keep RD, set RA=1, RCODE=5 (REFUSED)
     const orig_flags = std.mem.readInt(u16, response[payload_offset + 2 ..][0..2], .big);
     const opcode = (orig_flags >> 11) & 0xF;
     const rd = (orig_flags >> 8) & 1;
-    // QR=1, OPCODE kept, AA=1, TC=0, RD kept, RA=1, Z=0, RCODE=3 (NXDOMAIN)
-    const new_flags: u16 = (1 << 15) | (opcode << 11) | (1 << 10) | (rd << 8) | (1 << 7) | 3;
+    // QR=1, OPCODE kept, AA=1, TC=0, RD kept, RA=1, Z=0, RCODE=5 (REFUSED)
+    const new_flags: u16 = (1 << 15) | (opcode << 11) | (1 << 10) | (rd << 8) | (1 << 7) | 5;
     std.mem.writeInt(u16, response[payload_offset + 2 ..][0..2], new_flags, .big);
 
     // Send response back to guest
@@ -1107,16 +1115,16 @@ fn sendDnsRefusedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offs
             pending_refused_mutex.lock();
             defer pending_refused_mutex.unlock();
             if (queuePendingRefused(response[0..frame_len])) {
-                log.info("virtio-net dns nxdomain queued (no buffers)", .{});
+                log.info("virtio-net dns refused queued (no buffers)", .{});
             } else {
-                log.warn("virtio-net dns nxdomain dropped (queue full)", .{});
+                log.warn("virtio-net dns refused dropped (queue full)", .{});
             }
             return;
         }
-        log.warn("virtio-net dns nxdomain send failed: {s}", .{@errorName(e)});
+        log.warn("virtio-net dns refused send failed: {s}", .{@errorName(e)});
         return;
     };
-    log.info("virtio-net dns nxdomain sent", .{});
+    log.info("virtio-net dns refused sent", .{});
 }
 
 pub fn virtioConsoleInputLen() usize {
@@ -1539,9 +1547,7 @@ pub fn processVirtioConsoleQueue(queue_index: u16) !void {
                 while (remaining > 0) {
                     const chunk: usize = @intCast(@min(remaining, buf.len));
                     try readGuestBytes(desc.addr + offset, buf[0..chunk]);
-                    for (buf[0..chunk]) |b| {
-                        SerialIo.writeToStdout(1, b);
-                    }
+                    serial.writeConsoleBytes(buf[0..chunk]);
                     remaining -= @as(u64, chunk);
                     offset += @as(u64, chunk);
                 }
@@ -1906,6 +1912,9 @@ pub fn processVirtioConsoleRxQueue() !void {
     }
 
     if (wrote_any) {
+        if (!virtio_console_rx_logged.swap(true, .seq_cst)) {
+            log.info("hvf virtio-console rx wrote bytes", .{});
+        }
         virtio_console_state.interrupt_status |= virtio_mmio_int_vring;
         updateVirtioConsoleInterrupt();
     }
@@ -2980,6 +2989,96 @@ test "virtio: maybeSendDnsRefused returns false for allowed domain" {
     frame[66] = 0;
     // maybeSendDnsRefused should return false for allowed domain
     try std.testing.expect(!maybeSendDnsRefused(&frame));
+}
+
+test "virtio: dns allowlist respects port rules" {
+    net_policy_mutex.lock();
+    const saved = net_policy_state;
+    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
+    policy.mode = .allowlist;
+    try policy.addDomainRuleWithPorts("example.com", 443, 443);
+    net_policy_state = policy;
+    net_policy_mutex.unlock();
+    defer {
+        net_policy_mutex.lock();
+        if (net_policy_state) |*p| p.deinit();
+        net_policy_state = saved;
+        net_policy_mutex.unlock();
+    }
+
+    // Build a DNS query for example.com
+    var frame: [100]u8 = undefined;
+    @memset(&frame, 0);
+    // Ethernet header
+    frame[12] = 0x08; // ethertype IPv4
+    frame[13] = 0x00;
+    // IP header at offset 14
+    frame[14] = 0x45; // version 4, IHL 5
+    frame[23] = 17; // protocol UDP
+    // UDP header at offset 34
+    frame[36] = 0x00; // dst port 53
+    frame[37] = 0x35;
+    // DNS query at offset 42
+    frame[42] = 0x12;
+    frame[43] = 0x34;
+    frame[44] = 0x01;
+    frame[45] = 0x00;
+    frame[46] = 0x00;
+    frame[47] = 0x01;
+    frame[54] = 7;
+    frame[55] = 'e';
+    frame[56] = 'x';
+    frame[57] = 'a';
+    frame[58] = 'm';
+    frame[59] = 'p';
+    frame[60] = 'l';
+    frame[61] = 'e';
+    frame[62] = 3;
+    frame[63] = 'c';
+    frame[64] = 'o';
+    frame[65] = 'm';
+    frame[66] = 0;
+
+    try std.testing.expect(!outboundFrameAllowed(&frame));
+    try std.testing.expect(maybeSendDnsRefused(&frame));
+}
+
+test "virtio: outboundFrameAllowed enforces port rules for resolved IPs" {
+    net_policy_mutex.lock();
+    const saved = net_policy_state;
+    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
+    policy.mode = .allowlist;
+    try policy.addDomainRuleWithPorts("example.com", 443, 443);
+    try policy.addResolvedIp("example.com", [4]u8{ 1, 2, 3, 4 }, 60);
+    net_policy_state = policy;
+    net_policy_mutex.unlock();
+    defer {
+        net_policy_mutex.lock();
+        if (net_policy_state) |*p| p.deinit();
+        net_policy_state = saved;
+        net_policy_mutex.unlock();
+    }
+
+    var frame: [54]u8 = undefined;
+    @memset(&frame, 0);
+    frame[12] = 0x08; // ethertype IPv4
+    frame[13] = 0x00;
+    frame[14] = 0x45; // version 4, IHL 5
+    frame[23] = 6; // protocol TCP
+    // dst ip 1.2.3.4
+    frame[30] = 1;
+    frame[31] = 2;
+    frame[32] = 3;
+    frame[33] = 4;
+    // TCP header at offset 34; set dst port to 80
+    frame[36] = 0x00;
+    frame[37] = 0x50;
+    try std.testing.expect(!outboundFrameAllowed(&frame));
+
+    // Set dst port to 443
+    frame[36] = 0x01;
+    frame[37] = 0xbb;
+    try std.testing.expect(outboundFrameAllowed(&frame));
 }
 
 test "virtio: resetVirtioBlkDevice handles out of bounds" {

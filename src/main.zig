@@ -46,6 +46,7 @@ else
 const Vm = @import("vm/vm.zig").Vm;
 const Jailer = @import("jailer/jailer.zig").Jailer;
 const snapshot = @import("vm/snapshot.zig");
+const hvf = @import("vm/hvf.zig");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -203,6 +204,15 @@ fn clearVmPid(vm_dir: std.fs.Dir) void {
     vm_dir.deleteFile("pid") catch {};
 }
 
+fn waitForPidExit(pid: i32, sleep_ms: u64, max_attempts: usize) bool {
+    var attempts: usize = 0;
+    while (attempts < max_attempts) : (attempts += 1) {
+        if (!isPidAlive(pid)) return true;
+        std.Thread.sleep(sleep_ms * std.time.ns_per_ms);
+    }
+    return !isPidAlive(pid);
+}
+
 fn isPidAlive(pid: i32) bool {
     if (builtin.os.tag == .windows) return false;
     if (pid <= 0) return false;
@@ -337,6 +347,14 @@ fn dieStartConfigError(err: core.config.StartConfigError, cfg: *const core.confi
         ),
         error.OpenNetworkNotAllowed => errors.die(
             "network_mode=open requires explicit opt-in. Run `export M80_ALLOW_OPEN_NETWORK=1` and retry.",
+            .{},
+        ),
+        error.InvalidAllowedDomainSpec => errors.die(
+            "allowed_domains contains an invalid entry. Use domain patterns like `example.com`, `*.example.com`, or `example.com:443`.",
+            .{},
+        ),
+        error.InvalidAllowedIpSpec => errors.die(
+            "allowed_ips contains an invalid entry. Use IPv4 or CIDR values like `1.2.3.4` or `10.0.0.0/8`.",
             .{},
         ),
         error.MountRootsRequired => errors.die(
@@ -476,10 +494,13 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     if (ensure_deb) {
         try ensureDebVmConfig(allocator);
     }
+    const restore_path = std.process.getEnvVarOwned(allocator, "M80_RESTORE_PATH") catch null;
+    defer if (restore_path) |path| allocator.free(path);
+    if (restore_path != null) {
+        setEnvFlag(allocator, "M80_START_PAUSED", "1") catch {};
+    }
     var jailer = try Jailer.init(allocator);
     defer jailer.deinit();
-
-    try jailer.prepare();
 
     var vm = try Vm.init(allocator, &jailer);
     defer vm.deinit();
@@ -515,6 +536,9 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     core.config.validateStartFiles(&cfg_mut) catch |e| {
         dieStartConfigError(e, &cfg_mut);
     };
+    jailer.prepareForVm(dir_path, &cfg_mut) catch |e| {
+        errors.die("jailer prepare failed: {s}", .{@errorName(e)});
+    };
 
     vm.start(cfg_mut) catch |e| switch (e) {
         error.MountsInvalid => errors.die(
@@ -528,6 +552,25 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
         else => errors.die("start failed: {s}", .{@errorName(e)}),
     };
 
+    if (restore_path) |path| {
+        log.info("restoring snapshot: {s}", .{path});
+        hvf.pauseVcpu() catch |e| {
+            log.err("restore pause failed: {s}", .{@errorName(e)});
+            vm.stop() catch {};
+            writeRestoreResult(vm_dir, @errorName(e));
+            return e;
+        };
+        defer hvf.resumeVcpu();
+        vm.restore(path, false) catch |e| {
+            log.err("restore failed: {s}", .{@errorName(e)});
+            vm.stop() catch {};
+            writeRestoreResult(vm_dir, @errorName(e));
+            return e;
+        };
+        log.info("snapshot restore complete", .{});
+        writeRestoreResult(vm_dir, "ok");
+    }
+
     state.setStatus(allocator, name, .running) catch |e| switch (e) {
         error.InvalidArgs => errors.die("invalid vm name: {s}\n", .{name}),
         error.NotFound => errors.die("vm not found: {s}\n", .{name}),
@@ -538,11 +581,12 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
         return;
     }
 
+    stop_requested.store(false, .seq_cst);
     installSignalHandlers() catch |e| {
         errors.die("start failed: {s}", .{@errorName(e)});
     };
     std.debug.print("vm running (Ctrl+C to stop)\n", .{});
-    waitForStopSignal();
+    try waitForStopOrSnapshot(allocator, &vm, vm_dir);
 
     vm.stop() catch |e| {
         errors.die("stop failed: {s}", .{@errorName(e)});
@@ -580,6 +624,142 @@ fn waitForStopSignal() void {
         }
     }
     while (!stop_requested.load(.seq_cst)) {
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+    }
+}
+
+const snapshot_request_file = "snapshot.request";
+const snapshot_result_file = "snapshot.result";
+const restore_request_file = "restore.request";
+const restore_result_file = "restore.result";
+const stop_request_file = "stop.request";
+
+fn writeStopRequest(vm_dir: std.fs.Dir) !void {
+    var req = try vm_dir.createFile(stop_request_file, .{ .truncate = true });
+    defer req.close();
+    try req.writeAll("1\n");
+}
+
+fn hasStopRequest(vm_dir: std.fs.Dir) !bool {
+    var file = vm_dir.openFile(stop_request_file, .{}) catch |e| switch (e) {
+        error.FileNotFound => return false,
+        else => return e,
+    };
+    file.close();
+    return true;
+}
+
+fn readSnapshotRequest(allocator: std.mem.Allocator, vm_dir: std.fs.Dir) !?[]u8 {
+    var file = vm_dir.openFile(snapshot_request_file, .{}) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 4096);
+    errdefer allocator.free(data);
+
+    const trimmed = std.mem.trim(u8, data, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(data);
+        return null;
+    }
+
+    const path = try allocator.dupe(u8, trimmed);
+    allocator.free(data);
+    return path;
+}
+
+fn readRestoreRequest(allocator: std.mem.Allocator, vm_dir: std.fs.Dir) !?[]u8 {
+    var file = vm_dir.openFile(restore_request_file, .{}) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 4096);
+    errdefer allocator.free(data);
+
+    const trimmed = std.mem.trim(u8, data, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(data);
+        return null;
+    }
+
+    const path = try allocator.dupe(u8, trimmed);
+    allocator.free(data);
+    return path;
+}
+
+fn writeSnapshotResult(vm_dir: std.fs.Dir, msg: []const u8) void {
+    var file = vm_dir.createFile(snapshot_result_file, .{ .truncate = true }) catch return;
+    defer file.close();
+    _ = file.writeAll(msg) catch {};
+}
+
+fn writeRestoreResult(vm_dir: std.fs.Dir, msg: []const u8) void {
+    var file = vm_dir.createFile(restore_result_file, .{ .truncate = true }) catch return;
+    defer file.close();
+    _ = file.writeAll(msg) catch {};
+}
+
+fn waitForStopOrSnapshot(
+    allocator: std.mem.Allocator,
+    vm: *Vm,
+    vm_dir: std.fs.Dir,
+) !void {
+    if (builtin.os.tag == .windows) {
+        waitForStopSignal();
+        return;
+    }
+
+    while (!stop_requested.load(.seq_cst)) {
+        if (try hasStopRequest(vm_dir)) {
+            log.info("stop request received", .{});
+            stop_requested.store(true, .seq_cst);
+            vm_dir.deleteFile(stop_request_file) catch {};
+            break;
+        }
+        if (try readSnapshotRequest(allocator, vm_dir)) |path| {
+            defer allocator.free(path);
+            log.info("snapshot request path={s}", .{path});
+            vm.snapshot(path) catch |e| {
+                log.warn("snapshot failed: {s}", .{@errorName(e)});
+                var buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "{s} (vcpu_running={} vcpu_active={})", .{
+                    @errorName(e),
+                    hvf.isVcpuRunning(),
+                    hvf.hasActiveVcpu(),
+                }) catch @errorName(e);
+                writeSnapshotResult(vm_dir, msg);
+                vm_dir.deleteFile(snapshot_request_file) catch {};
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+                continue;
+            };
+            writeSnapshotResult(vm_dir, "ok");
+            vm_dir.deleteFile(snapshot_request_file) catch {};
+        }
+        if (try readRestoreRequest(allocator, vm_dir)) |path| {
+            defer allocator.free(path);
+            log.info("restore request path={s}", .{path});
+            hvf.pauseVcpu() catch |e| {
+                log.warn("restore pause failed: {s}", .{@errorName(e)});
+                writeRestoreResult(vm_dir, @errorName(e));
+                vm_dir.deleteFile(restore_request_file) catch {};
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+                continue;
+            };
+            defer hvf.resumeVcpu();
+            vm.restore(path, false) catch |e| {
+                log.warn("restore failed: {s}", .{@errorName(e)});
+                writeRestoreResult(vm_dir, @errorName(e));
+                vm_dir.deleteFile(restore_request_file) catch {};
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+                continue;
+            };
+            writeRestoreResult(vm_dir, "ok");
+            vm_dir.deleteFile(restore_request_file) catch {};
+        }
         std.Thread.sleep(200 * std.time.ns_per_ms);
     }
 }
@@ -714,6 +894,7 @@ pub fn main() !void {
         defer vm_dir.close();
 
         if (readVmPid(vm_dir)) |pid| {
+            vm_dir.deleteFile(stop_request_file) catch {};
             if (isPidAlive(pid)) {
                 errors.die("vm already running: {s}", .{name});
             }
@@ -724,6 +905,7 @@ pub fn main() !void {
         const socket_path = try vmConsoleSocketPath(allocator, name);
         defer allocator.free(socket_path);
         std.fs.cwd().deleteFile(socket_path) catch {};
+        vm_dir.deleteFile(stop_request_file) catch {};
 
         const exe_path = try std.fs.selfExePathAlloc(allocator);
         defer allocator.free(exe_path);
@@ -741,6 +923,9 @@ pub fn main() !void {
         defer env_map.deinit();
         try env_map.put("M80_CONSOLE_SOCKET", socket_path);
         try env_map.put("M80_VIRTIO_CONSOLE", "1");
+        const log_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, "run.log" });
+        defer allocator.free(log_path);
+        try env_map.put("M80_LOG_FILE", log_path);
         child.env_map = &env_map;
 
         try child.spawn();
@@ -858,22 +1043,26 @@ pub fn main() !void {
         defer vm_dir.close();
 
         if (readVmPid(vm_dir)) |pid| {
+            vm_dir.deleteFile(stop_request_file) catch {};
             if (builtin.os.tag != .windows) {
-                std.posix.kill(pid, std.posix.SIG.TERM) catch |e| switch (e) {
-                    error.ProcessNotFound => {},
-                    else => errors.die("stop failed: {s}", .{@errorName(e)}),
+                writeStopRequest(vm_dir) catch |e| {
+                    log.warn("stop request write failed: {s}", .{@errorName(e)});
                 };
-
-                var i: usize = 0;
-                while (i < 50) : (i += 1) {
-                    if (!isPidAlive(pid)) break;
-                    std.Thread.sleep(100 * std.time.ns_per_ms);
+                var exited = waitForPidExit(pid, 100, 50);
+                if (!exited) {
+                    std.posix.kill(pid, std.posix.SIG.TERM) catch |e| switch (e) {
+                        error.ProcessNotFound => {},
+                        else => errors.die("stop failed: {s}", .{@errorName(e)}),
+                    };
+                    exited = waitForPidExit(pid, 100, 50);
                 }
-                if (isPidAlive(pid)) {
+                if (!exited) {
                     std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                    _ = waitForPidExit(pid, 100, 10);
                 }
             }
             clearVmPid(vm_dir);
+            vm_dir.deleteFile(stop_request_file) catch {};
         } else {
             // Fallback to in-process stop (legacy behavior).
             var jailer = try Jailer.init(allocator);
@@ -936,25 +1125,55 @@ pub fn main() !void {
         const dir_path = try core.paths.vmDir(allocator, name);
         defer allocator.free(dir_path);
         var cwd = std.fs.cwd();
-        _ = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+        var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+        defer vm_dir.close();
 
-        // Validate snapshot path
-        const header = snapshot.validateSnapshot(snap_path) catch |e| switch (e) {
-            error.FileNotFound => {
-                // This is expected for a new snapshot
-                std.debug.print("creating new snapshot: {s}\n", .{snap_path});
-                std.debug.print("snapshot: feature requires running VM (not yet implemented)\n", .{});
-                return;
-            },
-            error.InvalidMagic => errors.die("invalid snapshot file: {s}", .{snap_path}),
-            error.UnsupportedVersion => errors.die("unsupported snapshot version: {s}", .{snap_path}),
-            else => errors.die("snapshot validation failed: {s}", .{@errorName(e)}),
+        if (readVmPid(vm_dir)) |pid| {
+            if (!isPidAlive(pid)) {
+                clearVmPid(vm_dir);
+                state.setStatus(allocator, name, .stopped) catch {};
+                errors.die("vm not running: {s}\nrun `m80 start {s}` first", .{ name, name });
+            }
+            state.setStatus(allocator, name, .running) catch {};
+        } else {
+            errors.die("vm not running: {s}\nrun `m80 start {s}` first", .{ name, name });
+        }
+
+        vm_dir.deleteFile(snapshot_result_file) catch {};
+        vm_dir.deleteFile(snapshot_request_file) catch {};
+
+        // Write snapshot request
+        var req = vm_dir.createFile(snapshot_request_file, .{ .truncate = true }) catch |e| {
+            errors.die("snapshot request failed: {s}", .{@errorName(e)});
         };
-        _ = header;
+        defer req.close();
+        try req.writeAll(snap_path);
 
-        // TODO: Connect to running VM and save state
-        std.debug.print("snapshot: feature requires running VM (not yet implemented)\n", .{});
-        return;
+        // Wait for result
+        var attempts: usize = 0;
+        while (attempts < 600) : (attempts += 1) {
+            var res = vm_dir.openFile(snapshot_result_file, .{}) catch |e| switch (e) {
+                error.FileNotFound => {
+                    std.Thread.sleep(200 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => errors.die("snapshot result open failed: {s}", .{@errorName(e)}),
+            };
+            defer res.close();
+
+            const result = try res.readToEndAlloc(allocator, 1024);
+            defer allocator.free(result);
+            const trimmed = std.mem.trim(u8, result, " \t\r\n");
+            if (std.mem.eql(u8, trimmed, "ok")) {
+                vm_dir.deleteFile(snapshot_result_file) catch {};
+                std.debug.print("snapshot saved: {s}\n", .{snap_path});
+                return;
+            }
+            vm_dir.deleteFile(snapshot_result_file) catch {};
+            errors.die("snapshot failed: {s}", .{trimmed});
+        }
+
+        errors.die("snapshot timed out: {s}", .{snap_path});
     }
 
     // ===== RESTORE COMMAND =====
@@ -970,7 +1189,9 @@ pub fn main() !void {
         const dir_path = try core.paths.vmDir(allocator, name);
         defer allocator.free(dir_path);
         var cwd = std.fs.cwd();
-        _ = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+        var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
+        defer vm_dir.close();
+        vm_dir.deleteFile(stop_request_file) catch {};
 
         // Validate snapshot
         const header = snapshot.validateSnapshot(snap_path) catch |e| switch (e) {
@@ -986,9 +1207,106 @@ pub fn main() !void {
             header.non_zero_page_count,
         });
 
-        // TODO: Start VM and restore state from snapshot
-        std.debug.print("restore: feature requires VM start integration (not yet implemented)\n", .{});
-        return;
+        if (readVmPid(vm_dir)) |pid| {
+            if (isPidAlive(pid)) {
+                vm_dir.deleteFile(restore_result_file) catch {};
+                vm_dir.deleteFile(restore_request_file) catch {};
+                var req = vm_dir.createFile(restore_request_file, .{ .truncate = true }) catch |e| {
+                    errors.die("restore request failed: {s}", .{@errorName(e)});
+                };
+                defer req.close();
+                _ = req.writeAll(snap_path) catch |e| {
+                    errors.die("restore request failed: {s}", .{@errorName(e)});
+                };
+
+                std.debug.print("restore started: {s}\n", .{name});
+                var attempts: usize = 0;
+                while (attempts < 600) : (attempts += 1) {
+                    var res = vm_dir.openFile(restore_result_file, .{}) catch |e| switch (e) {
+                        error.FileNotFound => {
+                            std.Thread.sleep(200 * std.time.ns_per_ms);
+                            continue;
+                        },
+                        else => errors.die("restore result open failed: {s}", .{@errorName(e)}),
+                    };
+                    defer res.close();
+
+                    const result = try res.readToEndAlloc(allocator, 1024);
+                    defer allocator.free(result);
+                    const trimmed = std.mem.trim(u8, result, " \t\r\n");
+                    if (std.mem.eql(u8, trimmed, "ok")) {
+                        vm_dir.deleteFile(restore_result_file) catch {};
+                        std.debug.print("restore complete: {s}\n", .{name});
+                        return;
+                    }
+                    vm_dir.deleteFile(restore_result_file) catch {};
+                    errors.die("restore failed: {s}", .{trimmed});
+                }
+
+                errors.die("restore timed out: {s}", .{name});
+            }
+            clearVmPid(vm_dir);
+            state.setStatus(allocator, name, .stopped) catch {};
+        }
+
+        const socket_path = try vmConsoleSocketPath(allocator, name);
+        defer allocator.free(socket_path);
+        std.fs.cwd().deleteFile(socket_path) catch {};
+        vm_dir.deleteFile(restore_result_file) catch {};
+
+        const exe_path = try std.fs.selfExePathAlloc(allocator);
+        defer allocator.free(exe_path);
+
+        var argv = [_][]const u8{ exe_path, "run", name };
+        var child = std.process.Child.init(&argv, allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        if (builtin.os.tag != .windows) {
+            child.pgid = 0;
+        }
+
+        var env_map = try std.process.getEnvMap(allocator);
+        defer env_map.deinit();
+        try env_map.put("M80_CONSOLE_SOCKET", socket_path);
+        try env_map.put("M80_VIRTIO_CONSOLE", "1");
+        try env_map.put("M80_RESTORE_PATH", snap_path);
+        const log_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, "run.log" });
+        defer allocator.free(log_path);
+        try env_map.put("M80_LOG_FILE", log_path);
+        child.env_map = &env_map;
+
+        try child.spawn();
+        if (builtin.os.tag != .windows) {
+            try writeVmPid(vm_dir, @intCast(child.id));
+        }
+
+        std.debug.print("restore started: {s}\n", .{name});
+
+        var attempts: usize = 0;
+        while (attempts < 600) : (attempts += 1) {
+            var res = vm_dir.openFile(restore_result_file, .{}) catch |e| switch (e) {
+                error.FileNotFound => {
+                    std.Thread.sleep(200 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => errors.die("restore result open failed: {s}", .{@errorName(e)}),
+            };
+            defer res.close();
+
+            const result = try res.readToEndAlloc(allocator, 1024);
+            defer allocator.free(result);
+            const trimmed = std.mem.trim(u8, result, " \t\r\n");
+            if (std.mem.eql(u8, trimmed, "ok")) {
+                vm_dir.deleteFile(restore_result_file) catch {};
+                std.debug.print("restore complete: {s}\n", .{name});
+                return;
+            }
+            vm_dir.deleteFile(restore_result_file) catch {};
+            errors.die("restore failed: {s}", .{trimmed});
+        }
+
+        errors.die("restore timed out: {s}", .{name});
     }
 
     // ===== CLONE COMMAND =====
@@ -1090,4 +1408,15 @@ test "main: fileSizeIfExists returns size for existing file" {
     // Should return the file size (3 bytes)
     const size = fileSizeIfExists(abs) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 3), size);
+}
+
+test "main: stop request helpers round-trip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expect(!(try hasStopRequest(tmp.dir)));
+    try writeStopRequest(tmp.dir);
+    try std.testing.expect(try hasStopRequest(tmp.dir));
+    tmp.dir.deleteFile(stop_request_file) catch {};
+    try std.testing.expect(!(try hasStopRequest(tmp.dir)));
 }
