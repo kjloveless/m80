@@ -123,7 +123,8 @@ _None currently listed._
 - **Windows WHP integration tests**
   - Run with `M80_WHP_INTEGRATION=1` + `M80_TEST_KERNEL`/`M80_TEST_INITRD`.
 - **Mac HVF integration tests**
-  - Implement HVF backend; remove skip.
+  - Run boot/login/reliability loops on entitled arm64 hosts.
+  - Use `M80_TEST_HVF_RELIABILITY=1` and `M80_TEST_HVF_RELIABILITY_CYCLES=20` for lifecycle stress.
 - **Linux KVM integration tests**
   - Wire real KVM exit parsing, run smoke tests on Linux CI.
 
