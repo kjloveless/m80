@@ -176,6 +176,9 @@ opt in at build time:
 M80_VMNET_ENTITLEMENTS=1 zig build
 ```
 
+If vmnet cannot start, m80 now logs an explicit entitlement/codesign warning and
+continues with networking disabled for that VM.
+
 Config keys:
 - `network_mode`: `locked_down` (default) | `allowlist` | `open`
 - `allowed_domains`: comma-separated domain allowlist (used by DNS enforcement)
@@ -269,6 +272,31 @@ Makefile target:
 make boot-hvf-login
 ```
 
+## HVF arm64 Reliability Loop Test
+
+This gated integration test repeatedly starts/stops HVF on macOS arm64 to catch
+lifecycle races and cleanup regressions.
+
+Required env vars:
+- `M80_TEST_HVF_RELIABILITY=1`
+- `M80_TEST_KERNEL`
+- `M80_TEST_INITRD` or `M80_TEST_DISK`
+- `M80_TEST_SERIAL_EXPECT` (optional but recommended)
+
+Optional:
+- `M80_TEST_HVF_RELIABILITY_CYCLES` (default: `20`)
+
+Example:
+
+```
+M80_TEST_HVF_RELIABILITY=1 \
+M80_TEST_HVF_RELIABILITY_CYCLES=20 \
+M80_TEST_KERNEL=images/linux \
+M80_TEST_INITRD=images/m80-initramfs.cpio.gz \
+M80_TEST_SERIAL_EXPECT="Linux version" \
+zig build test -- --test-filter "smoke: hvf arm64 repeated start-stop reliability"
+```
+
 Known-good small raw ARM64 kernels (bring your own kernel):
 
 - Debian bullseye netboot `linux` (~26MB): raw `Image` and works with the current loader.
@@ -323,3 +351,7 @@ zig build test
 These automatically codesign the emitted binaries using `entitlements/hvf-entitlements.xml`.
 
 If you see `hv_vm_create` failing with `HV_DENIED` (`0xfae94007`), it typically means the entitlement is missing or the binary isn’t properly signed.
+
+If `stop` fails with `VcpuStopTimeout`, the backend did not observe vCPU thread
+exit within the bounded stop window. Inspect the VM `run.log` for arm64 exit/trap
+details and resolve the underlying guest/hypervisor stall before retrying.
