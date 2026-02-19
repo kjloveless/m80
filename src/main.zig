@@ -45,8 +45,6 @@ else
 
 const Vm = @import("vm/vm.zig").Vm;
 const Jailer = @import("jailer/jailer.zig").Jailer;
-const snapshot = @import("vm/snapshot.zig");
-const hvf = @import("vm/hvf.zig");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -120,8 +118,8 @@ pub fn writeHelp(writer: anytype) !void {
         \\  m80 delete <name>            remove a VM and its files
         \\  m80 ps                       list all VMs and their status
         \\  m80 inspect <name>           show VM details
-        \\  m80 snapshot <name> <path>   save VM memory to snapshot file
-        \\  m80 restore <name> <path>    restore VM memory from snapshot
+        \\  m80 snapshot <name> <path>   save running VM disk snapshot to directory
+        \\  m80 restore <name> <path>    restore VM disks from snapshot directory
         \\  m80 clone <name> <new-name>  clone a VM (copy config)
         \\  m80 help                     show this help message
         \\
@@ -142,8 +140,8 @@ fn printHelp() void {
         \\  m80 delete <name>            remove a VM and its files
         \\  m80 ps                       list all VMs and their status
         \\  m80 inspect <name>           show VM details
-        \\  m80 snapshot <name> <path>   save VM memory to snapshot file
-        \\  m80 restore <name> <path>    restore VM memory from snapshot
+        \\  m80 snapshot <name> <path>   save running VM disk snapshot to directory
+        \\  m80 restore <name> <path>    restore VM disks from snapshot directory
         \\  m80 clone <name> <new-name>  clone a VM (copy config)
         \\  m80 help                     show this help message
         \\
@@ -496,9 +494,6 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     }
     const restore_path = std.process.getEnvVarOwned(allocator, "M80_RESTORE_PATH") catch null;
     defer if (restore_path) |path| allocator.free(path);
-    if (restore_path != null) {
-        setEnvFlag(allocator, "M80_START_PAUSED", "1") catch {};
-    }
     var jailer = try Jailer.init(allocator);
     defer jailer.deinit();
 
@@ -553,21 +548,14 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     };
 
     if (restore_path) |path| {
-        log.info("restoring snapshot: {s}", .{path});
-        hvf.pauseVcpu() catch |e| {
-            log.err("restore pause failed: {s}", .{@errorName(e)});
+        log.info("restoring filesystem snapshot: {s}", .{path});
+        vm.restoreFilesystem(cfg_mut, path) catch |e| {
+            log.err("filesystem restore failed: {s}", .{@errorName(e)});
             vm.stop() catch {};
             writeRestoreResult(vm_dir, @errorName(e));
             return e;
         };
-        defer hvf.resumeVcpu();
-        vm.restore(path, false) catch |e| {
-            log.err("restore failed: {s}", .{@errorName(e)});
-            vm.stop() catch {};
-            writeRestoreResult(vm_dir, @errorName(e));
-            return e;
-        };
-        log.info("snapshot restore complete", .{});
+        log.info("filesystem restore complete", .{});
         writeRestoreResult(vm_dir, "ok");
     }
 
@@ -586,7 +574,7 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
         errors.die("start failed: {s}", .{@errorName(e)});
     };
     std.debug.print("vm running (Ctrl+C to stop)\n", .{});
-    try waitForStopOrSnapshot(allocator, &vm, vm_dir);
+    try waitForStopOrSnapshot(allocator, &vm, vm_dir, &cfg_mut);
 
     vm.stop() catch |e| {
         errors.die("stop failed: {s}", .{@errorName(e)});
@@ -707,6 +695,7 @@ fn waitForStopOrSnapshot(
     allocator: std.mem.Allocator,
     vm: *Vm,
     vm_dir: std.fs.Dir,
+    cfg: *const core.config.VmConfig,
 ) !void {
     if (builtin.os.tag == .windows) {
         waitForStopSignal();
@@ -723,15 +712,9 @@ fn waitForStopOrSnapshot(
         if (try readSnapshotRequest(allocator, vm_dir)) |path| {
             defer allocator.free(path);
             log.info("snapshot request path={s}", .{path});
-            vm.snapshot(path) catch |e| {
+            vm.snapshotFilesystem(cfg.*, path) catch |e| {
                 log.warn("snapshot failed: {s}", .{@errorName(e)});
-                var buf: [128]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "{s} (vcpu_running={} vcpu_active={})", .{
-                    @errorName(e),
-                    hvf.isVcpuRunning(),
-                    hvf.hasActiveVcpu(),
-                }) catch @errorName(e);
-                writeSnapshotResult(vm_dir, msg);
+                writeSnapshotResult(vm_dir, @errorName(e));
                 vm_dir.deleteFile(snapshot_request_file) catch {};
                 std.Thread.sleep(50 * std.time.ns_per_ms);
                 continue;
@@ -742,15 +725,7 @@ fn waitForStopOrSnapshot(
         if (try readRestoreRequest(allocator, vm_dir)) |path| {
             defer allocator.free(path);
             log.info("restore request path={s}", .{path});
-            hvf.pauseVcpu() catch |e| {
-                log.warn("restore pause failed: {s}", .{@errorName(e)});
-                writeRestoreResult(vm_dir, @errorName(e));
-                vm_dir.deleteFile(restore_request_file) catch {};
-                std.Thread.sleep(50 * std.time.ns_per_ms);
-                continue;
-            };
-            defer hvf.resumeVcpu();
-            vm.restore(path, false) catch |e| {
+            vm.restoreFilesystem(cfg.*, path) catch |e| {
                 log.warn("restore failed: {s}", .{@errorName(e)});
                 writeRestoreResult(vm_dir, @errorName(e));
                 vm_dir.deleteFile(restore_request_file) catch {};
@@ -1113,7 +1088,7 @@ pub fn main() !void {
     }
 
     // ===== SNAPSHOT COMMAND =====
-    // Saves VM memory state to a snapshot file for later restoration.
+    // Saves running VM filesystem state (configured block images) to a directory.
     // Usage: m80 snapshot <name> <path>
     if (std.mem.eql(u8, cmd, "snapshot")) {
         if (args.len < 4) {
@@ -1177,7 +1152,7 @@ pub fn main() !void {
     }
 
     // ===== RESTORE COMMAND =====
-    // Restores VM memory state from a previously saved snapshot.
+    // Restores VM filesystem state from a snapshot directory.
     // Usage: m80 restore <name> <path>
     if (std.mem.eql(u8, cmd, "restore")) {
         if (args.len < 4) {
@@ -1191,21 +1166,14 @@ pub fn main() !void {
         var cwd = std.fs.cwd();
         var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
         defer vm_dir.close();
-        vm_dir.deleteFile(stop_request_file) catch {};
-
-        // Validate snapshot
-        const header = snapshot.validateSnapshot(snap_path) catch |e| switch (e) {
-            error.FileNotFound => errors.die("snapshot not found: {s}", .{snap_path}),
-            error.InvalidMagic => errors.die("invalid snapshot file: {s}", .{snap_path}),
-            error.UnsupportedVersion => errors.die("unsupported snapshot version: {s}", .{snap_path}),
-            else => errors.die("snapshot validation failed: {s}", .{@errorName(e)}),
+        const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| {
+            errors.die("invalid config: {s}", .{@errorName(e)});
         };
+        var cfg_mut = cfg;
+        defer core.config.freeConfig(allocator, &cfg_mut);
+        try core.config.resolveRelativePaths(allocator, dir_path, &cfg_mut);
 
-        std.debug.print("snapshot: memory_size={d} pages={d} non_zero={d}\n", .{
-            header.memory_size,
-            header.total_page_count,
-            header.non_zero_page_count,
-        });
+        vm_dir.deleteFile(stop_request_file) catch {};
 
         if (readVmPid(vm_dir)) |pid| {
             if (isPidAlive(pid)) {
@@ -1219,7 +1187,7 @@ pub fn main() !void {
                     errors.die("restore request failed: {s}", .{@errorName(e)});
                 };
 
-                std.debug.print("restore started: {s}\n", .{name});
+                std.debug.print("filesystem restore started: {s}\n", .{name});
                 var attempts: usize = 0;
                 while (attempts < 600) : (attempts += 1) {
                     var res = vm_dir.openFile(restore_result_file, .{}) catch |e| switch (e) {
@@ -1236,77 +1204,29 @@ pub fn main() !void {
                     const trimmed = std.mem.trim(u8, result, " \t\r\n");
                     if (std.mem.eql(u8, trimmed, "ok")) {
                         vm_dir.deleteFile(restore_result_file) catch {};
-                        std.debug.print("restore complete: {s}\n", .{name});
+                        std.debug.print("filesystem restore complete: {s}\n", .{name});
                         return;
                     }
                     vm_dir.deleteFile(restore_result_file) catch {};
-                    errors.die("restore failed: {s}", .{trimmed});
+                    errors.die("filesystem restore failed: {s}", .{trimmed});
                 }
 
-                errors.die("restore timed out: {s}", .{name});
+                errors.die("filesystem restore timed out: {s}", .{name});
             }
             clearVmPid(vm_dir);
             state.setStatus(allocator, name, .stopped) catch {};
         }
 
-        const socket_path = try vmConsoleSocketPath(allocator, name);
-        defer allocator.free(socket_path);
-        std.fs.cwd().deleteFile(socket_path) catch {};
-        vm_dir.deleteFile(restore_result_file) catch {};
+        var jailer = try Jailer.init(allocator);
+        defer jailer.deinit();
 
-        const exe_path = try std.fs.selfExePathAlloc(allocator);
-        defer allocator.free(exe_path);
-
-        var argv = [_][]const u8{ exe_path, "run", name };
-        var child = std.process.Child.init(&argv, allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        if (builtin.os.tag != .windows) {
-            child.pgid = 0;
-        }
-
-        var env_map = try std.process.getEnvMap(allocator);
-        defer env_map.deinit();
-        try env_map.put("M80_CONSOLE_SOCKET", socket_path);
-        try env_map.put("M80_VIRTIO_CONSOLE", "1");
-        try env_map.put("M80_RESTORE_PATH", snap_path);
-        const log_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, "run.log" });
-        defer allocator.free(log_path);
-        try env_map.put("M80_LOG_FILE", log_path);
-        child.env_map = &env_map;
-
-        try child.spawn();
-        if (builtin.os.tag != .windows) {
-            try writeVmPid(vm_dir, @intCast(child.id));
-        }
-
-        std.debug.print("restore started: {s}\n", .{name});
-
-        var attempts: usize = 0;
-        while (attempts < 600) : (attempts += 1) {
-            var res = vm_dir.openFile(restore_result_file, .{}) catch |e| switch (e) {
-                error.FileNotFound => {
-                    std.Thread.sleep(200 * std.time.ns_per_ms);
-                    continue;
-                },
-                else => errors.die("restore result open failed: {s}", .{@errorName(e)}),
-            };
-            defer res.close();
-
-            const result = try res.readToEndAlloc(allocator, 1024);
-            defer allocator.free(result);
-            const trimmed = std.mem.trim(u8, result, " \t\r\n");
-            if (std.mem.eql(u8, trimmed, "ok")) {
-                vm_dir.deleteFile(restore_result_file) catch {};
-                std.debug.print("restore complete: {s}\n", .{name});
-                return;
-            }
-            vm_dir.deleteFile(restore_result_file) catch {};
-            errors.die("restore failed: {s}", .{trimmed});
-        }
-
-        errors.die("restore timed out: {s}", .{name});
+        var vm = try Vm.init(allocator, &jailer);
+        defer vm.deinit();
+        vm.restoreFilesystem(cfg_mut, snap_path) catch |e| {
+            errors.die("filesystem restore failed: {s}", .{@errorName(e)});
+        };
+        std.debug.print("filesystem restore complete: {s}\n", .{name});
+        return;
     }
 
     // ===== CLONE COMMAND =====

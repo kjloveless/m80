@@ -538,6 +538,21 @@ pub fn resetVirtioBlkState() void {
     }
 }
 
+/// Flushes all active virtio-blk backing files to stable storage.
+pub fn syncVirtioBlkDevices() !void {
+    var first_err: ?anyerror = null;
+    for (&virtio_blk_devices) |*device| {
+        if (!device.enabled) continue;
+        if (device.file) |*file| {
+            file.sync() catch |e| {
+                log.warn("hvf virtio-blk sync failed: {s}", .{@errorName(e)});
+                if (first_err == null) first_err = e;
+            };
+        }
+    }
+    if (first_err) |err| return err;
+}
+
 pub fn resetVirtioConsoleState() void {
     virtio_console_state = .{};
     gic_virtio_console_intid = null;

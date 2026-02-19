@@ -24,10 +24,201 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("../util/log.zig");
+const config = @import("../core/config.zig");
 const Jailer = @import("../jailer/jailer.zig").Jailer;
 const windows = @import("windows.zig");
 const hvf = @import("hvf.zig");
 const posix = @import("posix.zig");
+
+const FsSnapshotEntry = struct {
+    slot: []const u8,
+    source_path: []const u8,
+    snapshot_name: []const u8,
+    bytes: u64,
+};
+
+const FsSnapshotManifest = struct {
+    vda: ?[]u8 = null,
+    vdb: ?[]u8 = null,
+    vdc: ?[]u8 = null,
+
+    fn deinit(self: *FsSnapshotManifest, allocator: std.mem.Allocator) void {
+        if (self.vda) |value| allocator.free(value);
+        if (self.vdb) |value| allocator.free(value);
+        if (self.vdc) |value| allocator.free(value);
+        self.* = .{};
+    }
+};
+
+fn openPathForRead(path: []const u8) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.openFileAbsolute(path, .{});
+    }
+    return std.fs.cwd().openFile(path, .{});
+}
+
+fn copyFileToDir(
+    allocator: std.mem.Allocator,
+    src_path: []const u8,
+    out_dir: std.fs.Dir,
+    out_name: []const u8,
+) !u64 {
+    var src = try openPathForRead(src_path);
+    defer src.close();
+    var dst = try out_dir.createFile(out_name, .{ .truncate = true });
+    defer dst.close();
+
+    var buf = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(buf);
+
+    var total: u64 = 0;
+    while (true) {
+        const n = try src.read(buf);
+        if (n == 0) break;
+        try dst.writeAll(buf[0..n]);
+        total += @intCast(n);
+    }
+    try dst.sync();
+    return total;
+}
+
+fn snapshotFileNameForSlot(allocator: std.mem.Allocator, slot: []const u8, src_path: []const u8) ![]u8 {
+    const base = std.fs.path.basename(src_path);
+    const name = if (base.len == 0) "disk.img" else base;
+    return std.fmt.allocPrint(allocator, "{s}-{s}", .{ slot, name });
+}
+
+fn appendSnapshotEntry(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayList(FsSnapshotEntry),
+    out_dir: std.fs.Dir,
+    slot: []const u8,
+    src_path: ?[]const u8,
+) !void {
+    if (src_path == null) return;
+    const path = src_path.?;
+
+    const snapshot_name = try snapshotFileNameForSlot(allocator, slot, path);
+    errdefer allocator.free(snapshot_name);
+
+    const copied_bytes = try copyFileToDir(allocator, path, out_dir, snapshot_name);
+    try entries.append(allocator, .{
+        .slot = slot,
+        .source_path = path,
+        .snapshot_name = snapshot_name,
+        .bytes = copied_bytes,
+    });
+}
+
+fn writeFilesystemSnapshotManifest(out_dir: std.fs.Dir, entries: []const FsSnapshotEntry) !void {
+    var manifest = try out_dir.createFile("manifest.txt", .{ .truncate = true });
+    defer manifest.close();
+    var writer_buf: [1024]u8 = undefined;
+    var file_writer = manifest.writer(&writer_buf);
+    const w = &file_writer.interface;
+    try w.writeAll("format=m80-fs-snapshot-v1\n");
+    try w.print("created_unix={d}\n", .{std.time.timestamp()});
+    for (entries) |entry| {
+        try w.print("{s}={s}\n", .{ entry.slot, entry.snapshot_name });
+        try w.print("{s}_source={s}\n", .{ entry.slot, entry.source_path });
+        try w.print("{s}_bytes={d}\n", .{ entry.slot, entry.bytes });
+    }
+    try w.flush();
+}
+
+fn parseFilesystemSnapshotManifest(allocator: std.mem.Allocator, snapshot_dir: std.fs.Dir) !FsSnapshotManifest {
+    var file = try snapshot_dir.openFile("manifest.txt", .{});
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(data);
+
+    var manifest = FsSnapshotManifest{};
+    errdefer manifest.deinit(allocator);
+
+    var saw_format = false;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidFilesystemSnapshot;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+
+        if (std.mem.eql(u8, key, "format")) {
+            saw_format = true;
+            if (!std.mem.eql(u8, value, "m80-fs-snapshot-v1")) {
+                return error.UnsupportedFilesystemSnapshotFormat;
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "vda")) {
+            if (manifest.vda) |existing| allocator.free(existing);
+            manifest.vda = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, key, "vdb")) {
+            if (manifest.vdb) |existing| allocator.free(existing);
+            manifest.vdb = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, key, "vdc")) {
+            if (manifest.vdc) |existing| allocator.free(existing);
+            manifest.vdc = try allocator.dupe(u8, value);
+        }
+    }
+
+    if (!saw_format) return error.InvalidFilesystemSnapshot;
+    return manifest;
+}
+
+fn openPathForWriteTruncate(path: []const u8) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.createFileAbsolute(path, .{ .truncate = true });
+    }
+    return std.fs.cwd().createFile(path, .{ .truncate = true });
+}
+
+fn copySnapshotEntryToPath(
+    allocator: std.mem.Allocator,
+    snapshot_dir: std.fs.Dir,
+    snapshot_name: []const u8,
+    target_path: []const u8,
+) !u64 {
+    var src = try snapshot_dir.openFile(snapshot_name, .{});
+    defer src.close();
+    var dst = try openPathForWriteTruncate(target_path);
+    defer dst.close();
+
+    var buf = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(buf);
+
+    var total: u64 = 0;
+    while (true) {
+        const n = try src.read(buf);
+        if (n == 0) break;
+        try dst.writeAll(buf[0..n]);
+        total += @intCast(n);
+    }
+    try dst.sync();
+    return total;
+}
+
+fn restoreSlotFromManifest(
+    allocator: std.mem.Allocator,
+    snapshot_dir: std.fs.Dir,
+    slot: []const u8,
+    snapshot_name: ?[]const u8,
+    target_path: ?[]const u8,
+) !bool {
+    const name = snapshot_name orelse return false;
+    const target = target_path orelse return error.MissingSnapshotTargetDisk;
+    const bytes = try copySnapshotEntryToPath(allocator, snapshot_dir, name, target);
+    log.info("filesystem restore slot={s} source={s} target={s} bytes={d}", .{
+        slot,
+        name,
+        target,
+        bytes,
+    });
+    return true;
+}
 
 /// Virtual Machine handle.
 ///
@@ -99,6 +290,80 @@ pub const Vm = struct {
             .macos => try hvf.stop(),
             .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .haiku => try posix.stop(),
             else => return error.UnsupportedPlatform,
+        }
+    }
+
+    /// Creates a filesystem snapshot of the VM block images while the VM is running.
+    ///
+    /// This copies configured block-image files (`disk_path`, `seed_path`,
+    /// `data_disk_path`) into the target directory and writes a `manifest.txt`.
+    /// Unlike full VM snapshots, this does not capture guest memory or vCPU state.
+    pub fn snapshotFilesystem(self: *Vm, cfg: config.VmConfig, out_dir_path: []const u8) !void {
+        const virtio = @import("virtio.zig");
+        var cwd = std.fs.cwd();
+
+        if (cfg.disk_path == null and cfg.seed_path == null and cfg.data_disk_path == null) {
+            return error.NoDiskConfigured;
+        }
+
+        switch (@import("builtin").os.tag) {
+            .macos => {
+                try hvf.pauseVcpu();
+                defer hvf.resumeVcpu();
+                try virtio.syncVirtioBlkDevices();
+            },
+            .windows => return error.NotSupported,
+            .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .haiku => return error.NotSupported,
+            else => return error.UnsupportedPlatform,
+        }
+
+        try cwd.makePath(out_dir_path);
+        var out_dir = try cwd.openDir(out_dir_path, .{});
+        defer out_dir.close();
+
+        var entries = std.ArrayList(FsSnapshotEntry).empty;
+        defer {
+            for (entries.items) |entry| {
+                self.allocator.free(entry.snapshot_name);
+            }
+            entries.deinit(self.allocator);
+        }
+
+        try appendSnapshotEntry(self.allocator, &entries, out_dir, "vda", cfg.disk_path);
+        try appendSnapshotEntry(self.allocator, &entries, out_dir, "vdb", cfg.seed_path);
+        try appendSnapshotEntry(self.allocator, &entries, out_dir, "vdc", cfg.data_disk_path);
+        try writeFilesystemSnapshotManifest(out_dir, entries.items);
+    }
+
+    /// Restores VM block-image files from a filesystem snapshot directory.
+    ///
+    /// Expects a snapshot directory created by `snapshotFilesystem`, including
+    /// `manifest.txt` and per-slot image files.
+    pub fn restoreFilesystem(self: *Vm, cfg: config.VmConfig, snapshot_dir_path: []const u8) !void {
+        const virtio = @import("virtio.zig");
+        var cwd = std.fs.cwd();
+        var snapshot_dir = try cwd.openDir(snapshot_dir_path, .{});
+        defer snapshot_dir.close();
+
+        var manifest = try parseFilesystemSnapshotManifest(self.allocator, snapshot_dir);
+        defer manifest.deinit(self.allocator);
+
+        const should_pause = builtin.os.tag == .macos and hvf.isVcpuRunning();
+        if (should_pause) {
+            try hvf.pauseVcpu();
+            defer hvf.resumeVcpu();
+            try virtio.syncVirtioBlkDevices();
+        }
+
+        var restored_any = false;
+        if (try restoreSlotFromManifest(self.allocator, snapshot_dir, "vda", manifest.vda, cfg.disk_path)) restored_any = true;
+        if (try restoreSlotFromManifest(self.allocator, snapshot_dir, "vdb", manifest.vdb, cfg.seed_path)) restored_any = true;
+        if (try restoreSlotFromManifest(self.allocator, snapshot_dir, "vdc", manifest.vdc, cfg.data_disk_path)) restored_any = true;
+
+        if (!restored_any) return error.EmptyFilesystemSnapshot;
+
+        if (should_pause) {
+            try virtio.syncVirtioBlkDevices();
         }
     }
 
@@ -334,7 +599,6 @@ pub const Vm = struct {
                     }
                     try hvf.applyPausedVcpuState(snapshot_data.vcpu_states[0]);
                 }
-
             },
             .windows => return error.NotSupported,
             .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .haiku => return error.NotSupported,
@@ -374,4 +638,52 @@ test "smoke: backend start/stop" {
         else => return e,
     };
     try vm.stop();
+}
+
+test "vm: snapshot file name prefixes slot" {
+    const name = try snapshotFileNameForSlot(std.testing.allocator, "vda", "/images/rootfs.ext4");
+    defer std.testing.allocator.free(name);
+    try std.testing.expectEqualStrings("vda-rootfs.ext4", name);
+}
+
+test "vm: copyFileToDir copies source bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var src = try tmp.dir.createFile("src.img", .{ .truncate = true });
+    defer src.close();
+    try src.writeAll("snapshot-bytes");
+
+    var out_dir = try tmp.dir.openDir(".", .{});
+    defer out_dir.close();
+
+    const src_path = try tmp.dir.realpathAlloc(std.testing.allocator, "src.img");
+    defer std.testing.allocator.free(src_path);
+
+    const copied = try copyFileToDir(std.testing.allocator, src_path, out_dir, "copy.img");
+    try std.testing.expectEqual(@as(u64, 14), copied);
+
+    const copied_data = try out_dir.readFileAlloc(std.testing.allocator, "copy.img", 64);
+    defer std.testing.allocator.free(copied_data);
+    try std.testing.expectEqualStrings("snapshot-bytes", copied_data);
+}
+
+test "vm: parseFilesystemSnapshotManifest reads slot mappings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var manifest = try tmp.dir.createFile("manifest.txt", .{ .truncate = true });
+    defer manifest.close();
+    try manifest.writeAll(
+        "format=m80-fs-snapshot-v1\n" ++
+            "created_unix=123\n" ++
+            "vda=vda-rootfs.ext4\n" ++
+            "vdb=vdb-seed.iso\n",
+    );
+
+    var parsed = try parseFilesystemSnapshotManifest(std.testing.allocator, tmp.dir);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("vda-rootfs.ext4", parsed.vda.?);
+    try std.testing.expectEqualStrings("vdb-seed.iso", parsed.vdb.?);
+    try std.testing.expect(parsed.vdc == null);
 }

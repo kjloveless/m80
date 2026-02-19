@@ -147,8 +147,7 @@ _None currently listed._
     - `M80_TEST_HVF_FORCE_STOP_TIMEOUT=1 ... zig build test -- --test-filter "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled"`
   - Network-policy integration note:
     - The allowlist fail-hard test is platform-gated and expects vmnet-backed virtio-net to initialize; hosts without vmnet entitlement/codesign will report a skip.
-  - CI workflow: `.github/workflows/hvf-reliability.yml` (self-hosted `macOS` + `ARM64` runner).
-  - CI network profile: default locked-down/no vmnet entitlement required.
+  - CI workflow is currently disabled; run these commands on an entitled macOS arm64 host.
 - **Linux KVM integration tests**
   - Wire real KVM exit parsing, run smoke tests on Linux CI.
 
