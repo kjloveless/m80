@@ -3382,27 +3382,6 @@ fn isGzipImage(header: []const u8) bool {
     return header.len >= 2 and header[0] == 0x1f and header[1] == 0x8b;
 }
 
-fn copyFileRangeToGuest(
-    file: std.fs.File,
-    file_offset: u64,
-    guest_addr: u64,
-    size: u64,
-    label: []const u8,
-) !void {
-    var buf: [4096]u8 = undefined;
-    var remaining = size;
-    var offset: u64 = 0;
-    while (remaining > 0) {
-        const chunk: usize = @intCast(@min(remaining, buf.len));
-        const n = try file.preadAll(buf[0..chunk], file_offset + offset);
-        if (n == 0) return error.UnexpectedEof;
-        try writeGuestBytes(guest_addr + offset, buf[0..n]);
-        remaining -= @as(u64, n);
-        offset += @as(u64, n);
-    }
-    log.info("hvf loaded {s} ({d} bytes) at 0x{x}", .{ label, size, guest_addr });
-}
-
 fn loadGuestKernel(memory_size_bytes: u64, kernel_path: ?[]const u8) !KernelLoadResult {
     if (kernel_path == null) {
         log.warn("hvf kernel path not set; skipping kernel load", .{});

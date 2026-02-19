@@ -299,27 +299,33 @@ fn skipName(response: []const u8, start: usize) !usize {
         }
         if ((len & 0xC0) == 0xC0) {
             // Compression pointer: two-byte jump.
+            if (pos + 1 >= response.len) return error.InvalidResponse;
             return pos + 2;
         }
-        pos += 1 + len;
+        const step: usize = 1 + @as(usize, len);
+        if (pos + step > response.len) return error.InvalidResponse;
+        pos += step;
     }
     return error.InvalidResponse;
 }
 
-pub fn parseQueryDomain(buf: []const u8, out: []u8) ![]const u8 {
+fn parseMessageDomain(buf: []const u8, out: []u8, require_question: bool) ![]const u8 {
     if (buf.len < @sizeOf(DnsHeader)) return error.InvalidResponse;
-    const qd_count = std.mem.readInt(u16, buf[4..][0..2], .big);
-    if (qd_count == 0) return error.InvalidResponse;
+    if (require_question) {
+        const qd_count = std.mem.readInt(u16, buf[4..][0..2], .big);
+        if (qd_count == 0) return error.InvalidResponse;
+    }
     const name = try decodeName(buf, @sizeOf(DnsHeader), out);
     _ = std.ascii.lowerString(name, name);
     return name;
 }
 
+pub fn parseQueryDomain(buf: []const u8, out: []u8) ![]const u8 {
+    return parseMessageDomain(buf, out, true);
+}
+
 pub fn parseResponseDomain(buf: []const u8, out: []u8) ![]const u8 {
-    if (buf.len < @sizeOf(DnsHeader)) return error.InvalidResponse;
-    const name = try decodeName(buf, @sizeOf(DnsHeader), out);
-    _ = std.ascii.lowerString(name, name);
-    return name;
+    return parseMessageDomain(buf, out, false);
 }
 
 fn decodeName(buf: []const u8, start: usize, out: []u8) ![]u8 {
@@ -639,7 +645,7 @@ test "dns: skipName rejects truncated label" {
 
 test "dns: skipQuestion rejects truncated" {
     // QNAME ok, but missing QTYPE/QCLASS (needs 4 bytes).
-    const data = [_]u8{ 0 };
+    const data = [_]u8{0};
     try std.testing.expectError(error.InvalidResponse, skipQuestion(&data, 0));
 }
 
@@ -669,7 +675,7 @@ test "dns: resolve uses udp responder" {
     var bound_storage: std.posix.sockaddr.storage = undefined;
     var bound_len: std.posix.socklen_t = @sizeOf(@TypeOf(bound_storage));
     try std.posix.getsockname(sock, @ptrCast(&bound_storage), &bound_len);
-    const bound_addr = std.net.Address.initPosix(@alignCast(@ptrCast(&bound_storage)));
+    const bound_addr = std.net.Address.initPosix(@ptrCast(@alignCast(&bound_storage)));
     const port = bound_addr.getPort();
 
     const ResponderCtx = struct {
@@ -729,7 +735,7 @@ test "dns: resolve uses udp responder" {
     };
 
     var ctx = ResponderCtx{ .sock = sock };
-    const thread = try std.Thread.spawn(.{}, responder.run, .{ &ctx });
+    const thread = try std.Thread.spawn(.{}, responder.run, .{&ctx});
     defer thread.join();
 
     var resolver = DnsResolver.init(allocator);
@@ -756,7 +762,7 @@ test "dns: resolveWithPolicy caches resolved ip" {
     var bound_storage: std.posix.sockaddr.storage = undefined;
     var bound_len: std.posix.socklen_t = @sizeOf(@TypeOf(bound_storage));
     try std.posix.getsockname(sock, @ptrCast(&bound_storage), &bound_len);
-    const bound_addr = std.net.Address.initPosix(@alignCast(@ptrCast(&bound_storage)));
+    const bound_addr = std.net.Address.initPosix(@ptrCast(@alignCast(&bound_storage)));
     const port = bound_addr.getPort();
 
     const ResponderCtx = struct {
@@ -816,7 +822,7 @@ test "dns: resolveWithPolicy caches resolved ip" {
     };
 
     var ctx = ResponderCtx{ .sock = sock };
-    const thread = try std.Thread.spawn(.{}, responder.run, .{ &ctx });
+    const thread = try std.Thread.spawn(.{}, responder.run, .{&ctx});
     defer thread.join();
 
     var net_policy = policy.NetworkPolicy.init(allocator);

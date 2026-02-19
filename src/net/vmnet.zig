@@ -60,6 +60,15 @@ fn vmnetStatusToError(status: c.vmnet_return_t) VmnetError!void {
     }
 }
 
+fn vmnetPacketIoStatusToError(status: c.vmnet_return_t) VmnetError!void {
+    switch (status) {
+        c.VMNET_SUCCESS => return,
+        c.VMNET_PACKET_TOO_BIG => return VmnetError.InvalidParams,
+        c.VMNET_FAILURE => return VmnetError.StartFailed,
+        else => return VmnetError.StartFailed,
+    }
+}
+
 pub fn startShared() VmnetError!VmnetInterface {
     const desc = c.xpc_dictionary_create(null, null, 0);
     if (desc == null) return VmnetError.StartFailed;
@@ -131,10 +140,7 @@ pub fn readPackets(
     pktcnt: *c_int,
 ) VmnetError!void {
     const status = c.vmnet_read(iface.handle, packets, pktcnt);
-    if (status == c.VMNET_SUCCESS) return;
-    if (status == c.VMNET_FAILURE) return VmnetError.StartFailed;
-    if (status == c.VMNET_PACKET_TOO_BIG) return VmnetError.InvalidParams;
-    return VmnetError.StartFailed;
+    try vmnetPacketIoStatusToError(status);
 }
 
 pub fn writePackets(
@@ -143,9 +149,7 @@ pub fn writePackets(
     pktcnt: *c_int,
 ) VmnetError!void {
     const status = c.vmnet_write(iface.handle, packets, pktcnt);
-    if (status == c.VMNET_SUCCESS) return;
-    if (status == c.VMNET_PACKET_TOO_BIG) return VmnetError.InvalidParams;
-    return VmnetError.StartFailed;
+    try vmnetPacketIoStatusToError(status);
 }
 
 pub const c_types = c;

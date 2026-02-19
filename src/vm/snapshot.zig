@@ -749,6 +749,272 @@ pub fn isLazyCompatible(header: *const SnapshotHeader) bool {
     return (header._reserved[0] & SNAPSHOT_FLAG_LAZY_COMPATIBLE) != 0;
 }
 
+fn isLegacyVcpuStateVersion(version: u32) bool {
+    return version == snapshot_version_1 or
+        version == snapshot_version_2 or
+        version == snapshot_version_3 or
+        version == snapshot_version_4 or
+        version == snapshot_version_5;
+}
+
+fn loadVcpuStatesFromFile(
+    allocator: std.mem.Allocator,
+    file: *std.fs.File,
+    header: *const SnapshotHeader,
+    vcpu_states: []VcpuState,
+) !void {
+    if (header.vcpu_count == 0) return;
+
+    log.info(
+        "snapshot vcpu version check v1={} v2={} v3={} v4={} v5={} arch={d}",
+        .{
+            header.version == snapshot_version_1,
+            header.version == snapshot_version_2,
+            header.version == snapshot_version_3,
+            header.version == snapshot_version_4,
+            header.version == snapshot_version_5,
+            header.arch,
+        },
+    );
+
+    try file.seekTo(header.vcpu_state_offset);
+
+    if (isLegacyVcpuStateVersion(header.version)) {
+        if (header.arch == 1) {
+            if (header.version == snapshot_version_5) {
+                const legacy_states = try allocator.alloc(VcpuStateArm64V5, header.vcpu_count);
+                defer allocator.free(legacy_states);
+                const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
+                if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V5)) return error.CorruptedSnapshot;
+                if (legacy_states.len > 0) {
+                    log.info(
+                        "snapshot legacy v5 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
+                        .{
+                            legacy_states[0].pc,
+                            legacy_states[0].sp_el1,
+                            legacy_states[0].elr_el1,
+                        },
+                    );
+                }
+                for (legacy_states, 0..) |legacy, idx| {
+                    vcpu_states[idx] = .{
+                        .arm64 = .{
+                            .x = legacy.x,
+                            .pc = legacy.pc,
+                            .sp = legacy.sp,
+                            .cpsr = legacy.cpsr,
+                            .fpcr = legacy.fpcr,
+                            .fpsr = legacy.fpsr,
+                            .sp_el0 = legacy.sp_el0,
+                            .sp_el1 = legacy.sp_el1,
+                            .elr_el1 = legacy.elr_el1,
+                            .spsr_el1 = legacy.spsr_el1,
+                            .sctlr_el1 = legacy.sctlr_el1,
+                            .tcr_el1 = legacy.tcr_el1,
+                            .ttbr0_el1 = legacy.ttbr0_el1,
+                            .ttbr1_el1 = legacy.ttbr1_el1,
+                            .mair_el1 = legacy.mair_el1,
+                            .vbar_el1 = legacy.vbar_el1,
+                            .mpidr_el1 = legacy.mpidr_el1,
+                            .tpidr_el0 = legacy.tpidr_el0,
+                            .tpidr_el1 = legacy.tpidr_el1,
+                            .tpidrro_el0 = legacy.tpidrro_el0,
+                            .cntkctl_el1 = legacy.cntkctl_el1,
+                            .cntv_ctl_el0 = legacy.cntv_ctl_el0,
+                            .cntv_cval_el0 = legacy.cntv_cval_el0,
+                            .cntp_ctl_el0 = legacy.cntp_ctl_el0,
+                            .cntp_cval_el0 = legacy.cntp_cval_el0,
+                            .cntp_tval_el0 = legacy.cntp_tval_el0,
+                            .apia_key_lo = legacy.apia_key_lo,
+                            .apia_key_hi = legacy.apia_key_hi,
+                            .apib_key_lo = legacy.apib_key_lo,
+                            .apib_key_hi = legacy.apib_key_hi,
+                            .apda_key_lo = legacy.apda_key_lo,
+                            .apda_key_hi = legacy.apda_key_hi,
+                            .apdb_key_lo = legacy.apdb_key_lo,
+                            .apdb_key_hi = legacy.apdb_key_hi,
+                            .apga_key_lo = legacy.apga_key_lo,
+                            .apga_key_hi = legacy.apga_key_hi,
+                            .vtimer_offset = legacy.vtimer_offset,
+                            .vtimer_masked = legacy.vtimer_masked,
+                            .vtimer_valid = legacy.vtimer_valid,
+                        },
+                    };
+                }
+            } else if (header.version == snapshot_version_4) {
+                const legacy_states = try allocator.alloc(VcpuStateArm64V4, header.vcpu_count);
+                defer allocator.free(legacy_states);
+                const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
+                if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V4)) return error.CorruptedSnapshot;
+                if (legacy_states.len > 0) {
+                    log.info(
+                        "snapshot legacy v4 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
+                        .{
+                            legacy_states[0].pc,
+                            legacy_states[0].sp_el1,
+                            legacy_states[0].elr_el1,
+                        },
+                    );
+                }
+                for (legacy_states, 0..) |legacy, idx| {
+                    vcpu_states[idx] = .{
+                        .arm64 = .{
+                            .x = legacy.x,
+                            .pc = legacy.pc,
+                            .sp = legacy.sp,
+                            .cpsr = legacy.cpsr,
+                            .fpcr = legacy.fpcr,
+                            .fpsr = legacy.fpsr,
+                            .sp_el0 = legacy.sp_el0,
+                            .sp_el1 = legacy.sp_el1,
+                            .elr_el1 = legacy.elr_el1,
+                            .spsr_el1 = legacy.spsr_el1,
+                            .sctlr_el1 = legacy.sctlr_el1,
+                            .tcr_el1 = legacy.tcr_el1,
+                            .ttbr0_el1 = legacy.ttbr0_el1,
+                            .ttbr1_el1 = legacy.ttbr1_el1,
+                            .mair_el1 = legacy.mair_el1,
+                            .vbar_el1 = legacy.vbar_el1,
+                            .mpidr_el1 = legacy.mpidr_el1,
+                            .tpidr_el0 = legacy.tpidr_el0,
+                            .tpidr_el1 = legacy.tpidr_el1,
+                            .tpidrro_el0 = legacy.tpidrro_el0,
+                            .cntkctl_el1 = legacy.cntkctl_el1,
+                            .cntv_ctl_el0 = legacy.cntv_ctl_el0,
+                            .cntv_cval_el0 = legacy.cntv_cval_el0,
+                            .cntp_ctl_el0 = legacy.cntp_ctl_el0,
+                            .cntp_cval_el0 = legacy.cntp_cval_el0,
+                            .cntp_tval_el0 = legacy.cntp_tval_el0,
+                            .apia_key_lo = legacy.apia_key_lo,
+                            .apia_key_hi = legacy.apia_key_hi,
+                            .apib_key_lo = legacy.apib_key_lo,
+                            .apib_key_hi = legacy.apib_key_hi,
+                            .apda_key_lo = legacy.apda_key_lo,
+                            .apda_key_hi = legacy.apda_key_hi,
+                            .apdb_key_lo = legacy.apdb_key_lo,
+                            .apdb_key_hi = legacy.apdb_key_hi,
+                            .apga_key_lo = legacy.apga_key_lo,
+                            .apga_key_hi = legacy.apga_key_hi,
+                        },
+                    };
+                }
+            } else if (header.version == snapshot_version_3) {
+                const legacy_states = try allocator.alloc(VcpuStateArm64V3, header.vcpu_count);
+                defer allocator.free(legacy_states);
+                const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
+                if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V3)) return error.CorruptedSnapshot;
+                if (legacy_states.len > 0) {
+                    log.info(
+                        "snapshot legacy v3 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
+                        .{
+                            legacy_states[0].pc,
+                            legacy_states[0].sp_el1,
+                            legacy_states[0].elr_el1,
+                        },
+                    );
+                }
+                for (legacy_states, 0..) |legacy, idx| {
+                    vcpu_states[idx] = .{
+                        .arm64 = .{
+                            .x = legacy.x,
+                            .pc = legacy.pc,
+                            .sp = legacy.sp,
+                            .cpsr = legacy.cpsr,
+                            .fpcr = legacy.fpcr,
+                            .fpsr = legacy.fpsr,
+                            .sp_el0 = legacy.sp_el0,
+                            .sp_el1 = legacy.sp_el1,
+                            .elr_el1 = legacy.elr_el1,
+                            .spsr_el1 = legacy.spsr_el1,
+                            .sctlr_el1 = legacy.sctlr_el1,
+                            .tcr_el1 = legacy.tcr_el1,
+                            .ttbr0_el1 = legacy.ttbr0_el1,
+                            .ttbr1_el1 = legacy.ttbr1_el1,
+                            .mair_el1 = legacy.mair_el1,
+                            .vbar_el1 = legacy.vbar_el1,
+                            .mpidr_el1 = legacy.mpidr_el1,
+                            .tpidr_el0 = legacy.tpidr_el0,
+                            .tpidr_el1 = legacy.tpidr_el1,
+                            .tpidrro_el0 = legacy.tpidrro_el0,
+                            .cntkctl_el1 = legacy.cntkctl_el1,
+                            .cntv_ctl_el0 = legacy.cntv_ctl_el0,
+                            .cntv_cval_el0 = legacy.cntv_cval_el0,
+                            .cntp_ctl_el0 = legacy.cntp_ctl_el0,
+                            .cntp_cval_el0 = legacy.cntp_cval_el0,
+                            .cntp_tval_el0 = legacy.cntp_tval_el0,
+                        },
+                    };
+                }
+            } else {
+                const legacy_states = try allocator.alloc(VcpuStateArm64V2, header.vcpu_count);
+                defer allocator.free(legacy_states);
+                const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
+                if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V2)) return error.CorruptedSnapshot;
+                if (legacy_states.len > 0) {
+                    log.info(
+                        "snapshot legacy v2 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
+                        .{
+                            legacy_states[0].pc,
+                            legacy_states[0].sp_el1,
+                            legacy_states[0].elr_el1,
+                        },
+                    );
+                }
+                for (legacy_states, 0..) |legacy, idx| {
+                    vcpu_states[idx] = .{
+                        .arm64 = .{
+                            .x = legacy.x,
+                            .pc = legacy.pc,
+                            .sp = legacy.sp,
+                            .cpsr = legacy.cpsr,
+                            .fpcr = legacy.fpcr,
+                            .fpsr = legacy.fpsr,
+                            .sp_el1 = legacy.sp_el1,
+                            .elr_el1 = legacy.elr_el1,
+                            .spsr_el1 = legacy.spsr_el1,
+                            .sctlr_el1 = legacy.sctlr_el1,
+                            .tcr_el1 = legacy.tcr_el1,
+                            .ttbr0_el1 = legacy.ttbr0_el1,
+                            .ttbr1_el1 = legacy.ttbr1_el1,
+                            .mair_el1 = legacy.mair_el1,
+                            .vbar_el1 = legacy.vbar_el1,
+                            .mpidr_el1 = legacy.mpidr_el1,
+                        },
+                    };
+                }
+            }
+        } else {
+            const legacy_states = try allocator.alloc(VcpuStateX86, header.vcpu_count);
+            defer allocator.free(legacy_states);
+            const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
+            if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateX86)) return error.CorruptedSnapshot;
+            for (legacy_states, 0..) |legacy, idx| {
+                vcpu_states[idx] = .{ .x86 = legacy };
+            }
+        }
+    } else {
+        const vcpu_read = try file.readAll(std.mem.sliceAsBytes(vcpu_states));
+        if (vcpu_read != header.vcpu_count * @sizeOf(VcpuState)) return error.CorruptedSnapshot;
+    }
+}
+
+fn loadDeviceStateHeadersFromFile(
+    file: *std.fs.File,
+    header: *const SnapshotHeader,
+    device_states: []DeviceState,
+) !void {
+    if (header.device_count == 0) return;
+    try file.seekTo(header.device_state_offset);
+    for (device_states) |*device_state| {
+        const device_bytes = std.mem.asBytes(device_state);
+        const device_read = try file.readAll(device_bytes);
+        if (device_read != device_bytes.len) return error.CorruptedSnapshot;
+        if (device_state.state_size > 0) {
+            try file.seekBy(@as(i64, @intCast(device_state.state_size)));
+        }
+    }
+}
+
 /// Creates a full VM snapshot including vCPU state, device state, and memory.
 pub const Snapshot = struct {
     header: SnapshotHeader,
@@ -880,251 +1146,9 @@ pub const Snapshot = struct {
         };
         errdefer snapshot.deinit();
 
-        // Read vCPU states
-        if (header.vcpu_count > 0) {
-            log.info(
-                "snapshot vcpu version check v1={} v2={} v3={} v4={} v5={} arch={d}",
-                .{
-                    header.version == snapshot_version_1,
-                    header.version == snapshot_version_2,
-                    header.version == snapshot_version_3,
-                    header.version == snapshot_version_4,
-                    header.version == snapshot_version_5,
-                    header.arch,
-                },
-            );
-            try file.seekTo(header.vcpu_state_offset);
-            if (header.version == snapshot_version_1 or header.version == snapshot_version_2 or header.version == snapshot_version_3 or header.version == snapshot_version_4 or header.version == snapshot_version_5) {
-                if (header.arch == 1) {
-                    if (header.version == snapshot_version_5) {
-                        const legacy_states = try allocator.alloc(VcpuStateArm64V5, header.vcpu_count);
-                        defer allocator.free(legacy_states);
-                        const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                        if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V5)) return error.CorruptedSnapshot;
-                        if (legacy_states.len > 0) {
-                            log.info(
-                                "snapshot legacy v5 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
-                                .{
-                                    legacy_states[0].pc,
-                                    legacy_states[0].sp_el1,
-                                    legacy_states[0].elr_el1,
-                                },
-                            );
-                        }
-                        for (legacy_states, 0..) |legacy, idx| {
-                            snapshot.vcpu_states[idx] = .{
-                                .arm64 = .{
-                                    .x = legacy.x,
-                                    .pc = legacy.pc,
-                                    .sp = legacy.sp,
-                                    .cpsr = legacy.cpsr,
-                                    .fpcr = legacy.fpcr,
-                                    .fpsr = legacy.fpsr,
-                                    .sp_el0 = legacy.sp_el0,
-                                    .sp_el1 = legacy.sp_el1,
-                                    .elr_el1 = legacy.elr_el1,
-                                    .spsr_el1 = legacy.spsr_el1,
-                                    .sctlr_el1 = legacy.sctlr_el1,
-                                    .tcr_el1 = legacy.tcr_el1,
-                                    .ttbr0_el1 = legacy.ttbr0_el1,
-                                    .ttbr1_el1 = legacy.ttbr1_el1,
-                                    .mair_el1 = legacy.mair_el1,
-                                    .vbar_el1 = legacy.vbar_el1,
-                                    .mpidr_el1 = legacy.mpidr_el1,
-                                    .tpidr_el0 = legacy.tpidr_el0,
-                                    .tpidr_el1 = legacy.tpidr_el1,
-                                    .tpidrro_el0 = legacy.tpidrro_el0,
-                                    .cntkctl_el1 = legacy.cntkctl_el1,
-                                    .cntv_ctl_el0 = legacy.cntv_ctl_el0,
-                                    .cntv_cval_el0 = legacy.cntv_cval_el0,
-                                    .cntp_ctl_el0 = legacy.cntp_ctl_el0,
-                                    .cntp_cval_el0 = legacy.cntp_cval_el0,
-                                    .cntp_tval_el0 = legacy.cntp_tval_el0,
-                                    .apia_key_lo = legacy.apia_key_lo,
-                                    .apia_key_hi = legacy.apia_key_hi,
-                                    .apib_key_lo = legacy.apib_key_lo,
-                                    .apib_key_hi = legacy.apib_key_hi,
-                                    .apda_key_lo = legacy.apda_key_lo,
-                                    .apda_key_hi = legacy.apda_key_hi,
-                                    .apdb_key_lo = legacy.apdb_key_lo,
-                                    .apdb_key_hi = legacy.apdb_key_hi,
-                                    .apga_key_lo = legacy.apga_key_lo,
-                                    .apga_key_hi = legacy.apga_key_hi,
-                                    .vtimer_offset = legacy.vtimer_offset,
-                                    .vtimer_masked = legacy.vtimer_masked,
-                                    .vtimer_valid = legacy.vtimer_valid,
-                                },
-                            };
-                        }
-                    } else if (header.version == snapshot_version_4) {
-                        const legacy_states = try allocator.alloc(VcpuStateArm64V4, header.vcpu_count);
-                        defer allocator.free(legacy_states);
-                        const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                        if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V4)) return error.CorruptedSnapshot;
-                        if (legacy_states.len > 0) {
-                            log.info(
-                                "snapshot legacy v4 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
-                                .{
-                                    legacy_states[0].pc,
-                                    legacy_states[0].sp_el1,
-                                    legacy_states[0].elr_el1,
-                                },
-                            );
-                        }
-                        for (legacy_states, 0..) |legacy, idx| {
-                            snapshot.vcpu_states[idx] = .{
-                                .arm64 = .{
-                                    .x = legacy.x,
-                                    .pc = legacy.pc,
-                                    .sp = legacy.sp,
-                                    .cpsr = legacy.cpsr,
-                                    .fpcr = legacy.fpcr,
-                                    .fpsr = legacy.fpsr,
-                                    .sp_el0 = legacy.sp_el0,
-                                    .sp_el1 = legacy.sp_el1,
-                                    .elr_el1 = legacy.elr_el1,
-                                    .spsr_el1 = legacy.spsr_el1,
-                                    .sctlr_el1 = legacy.sctlr_el1,
-                                    .tcr_el1 = legacy.tcr_el1,
-                                    .ttbr0_el1 = legacy.ttbr0_el1,
-                                    .ttbr1_el1 = legacy.ttbr1_el1,
-                                    .mair_el1 = legacy.mair_el1,
-                                    .vbar_el1 = legacy.vbar_el1,
-                                    .mpidr_el1 = legacy.mpidr_el1,
-                                    .tpidr_el0 = legacy.tpidr_el0,
-                                    .tpidr_el1 = legacy.tpidr_el1,
-                                    .tpidrro_el0 = legacy.tpidrro_el0,
-                                    .cntkctl_el1 = legacy.cntkctl_el1,
-                                    .cntv_ctl_el0 = legacy.cntv_ctl_el0,
-                                    .cntv_cval_el0 = legacy.cntv_cval_el0,
-                                    .cntp_ctl_el0 = legacy.cntp_ctl_el0,
-                                    .cntp_cval_el0 = legacy.cntp_cval_el0,
-                                    .cntp_tval_el0 = legacy.cntp_tval_el0,
-                                    .apia_key_lo = legacy.apia_key_lo,
-                                    .apia_key_hi = legacy.apia_key_hi,
-                                    .apib_key_lo = legacy.apib_key_lo,
-                                    .apib_key_hi = legacy.apib_key_hi,
-                                    .apda_key_lo = legacy.apda_key_lo,
-                                    .apda_key_hi = legacy.apda_key_hi,
-                                    .apdb_key_lo = legacy.apdb_key_lo,
-                                    .apdb_key_hi = legacy.apdb_key_hi,
-                                    .apga_key_lo = legacy.apga_key_lo,
-                                    .apga_key_hi = legacy.apga_key_hi,
-                                },
-                            };
-                        }
-                    } else if (header.version == snapshot_version_3) {
-                        const legacy_states = try allocator.alloc(VcpuStateArm64V3, header.vcpu_count);
-                        defer allocator.free(legacy_states);
-                        const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                        if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V3)) return error.CorruptedSnapshot;
-                        if (legacy_states.len > 0) {
-                            log.info(
-                                "snapshot legacy v3 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
-                                .{
-                                    legacy_states[0].pc,
-                                    legacy_states[0].sp_el1,
-                                    legacy_states[0].elr_el1,
-                                },
-                            );
-                        }
-                        for (legacy_states, 0..) |legacy, idx| {
-                            snapshot.vcpu_states[idx] = .{
-                                .arm64 = .{
-                                    .x = legacy.x,
-                                    .pc = legacy.pc,
-                                    .sp = legacy.sp,
-                                    .cpsr = legacy.cpsr,
-                                    .fpcr = legacy.fpcr,
-                                    .fpsr = legacy.fpsr,
-                                    .sp_el0 = legacy.sp_el0,
-                                    .sp_el1 = legacy.sp_el1,
-                                    .elr_el1 = legacy.elr_el1,
-                                    .spsr_el1 = legacy.spsr_el1,
-                                    .sctlr_el1 = legacy.sctlr_el1,
-                                    .tcr_el1 = legacy.tcr_el1,
-                                    .ttbr0_el1 = legacy.ttbr0_el1,
-                                    .ttbr1_el1 = legacy.ttbr1_el1,
-                                    .mair_el1 = legacy.mair_el1,
-                                    .vbar_el1 = legacy.vbar_el1,
-                                    .mpidr_el1 = legacy.mpidr_el1,
-                                    .tpidr_el0 = legacy.tpidr_el0,
-                                    .tpidr_el1 = legacy.tpidr_el1,
-                                    .tpidrro_el0 = legacy.tpidrro_el0,
-                                    .cntkctl_el1 = legacy.cntkctl_el1,
-                                    .cntv_ctl_el0 = legacy.cntv_ctl_el0,
-                                    .cntv_cval_el0 = legacy.cntv_cval_el0,
-                                    .cntp_ctl_el0 = legacy.cntp_ctl_el0,
-                                    .cntp_cval_el0 = legacy.cntp_cval_el0,
-                                    .cntp_tval_el0 = legacy.cntp_tval_el0,
-                                },
-                            };
-                        }
-                    } else {
-                        const legacy_states = try allocator.alloc(VcpuStateArm64V2, header.vcpu_count);
-                        defer allocator.free(legacy_states);
-                        const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                        if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V2)) return error.CorruptedSnapshot;
-                        if (legacy_states.len > 0) {
-                            log.info(
-                                "snapshot legacy v2 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
-                                .{
-                                    legacy_states[0].pc,
-                                    legacy_states[0].sp_el1,
-                                    legacy_states[0].elr_el1,
-                                },
-                            );
-                        }
-                        for (legacy_states, 0..) |legacy, idx| {
-                            snapshot.vcpu_states[idx] = .{
-                                .arm64 = .{
-                                    .x = legacy.x,
-                                    .pc = legacy.pc,
-                                    .sp = legacy.sp,
-                                    .cpsr = legacy.cpsr,
-                                    .fpcr = legacy.fpcr,
-                                    .fpsr = legacy.fpsr,
-                                    .sp_el1 = legacy.sp_el1,
-                                    .elr_el1 = legacy.elr_el1,
-                                    .spsr_el1 = legacy.spsr_el1,
-                                    .sctlr_el1 = legacy.sctlr_el1,
-                                    .tcr_el1 = legacy.tcr_el1,
-                                    .ttbr0_el1 = legacy.ttbr0_el1,
-                                    .ttbr1_el1 = legacy.ttbr1_el1,
-                                    .mair_el1 = legacy.mair_el1,
-                                    .vbar_el1 = legacy.vbar_el1,
-                                    .mpidr_el1 = legacy.mpidr_el1,
-                                },
-                            };
-                        }
-                    }
-                } else {
-                    const legacy_states = try allocator.alloc(VcpuStateX86, header.vcpu_count);
-                    defer allocator.free(legacy_states);
-                    const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                    if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateX86)) return error.CorruptedSnapshot;
-                    for (legacy_states, 0..) |legacy, idx| {
-                        snapshot.vcpu_states[idx] = .{ .x86 = legacy };
-                    }
-                }
-            } else {
-                const vcpu_read = try file.readAll(std.mem.sliceAsBytes(snapshot.vcpu_states));
-                if (vcpu_read != header.vcpu_count * @sizeOf(VcpuState)) return error.CorruptedSnapshot;
-            }
-        }
-
-        // Read device states (header only, skip variable data)
-        if (header.device_count > 0) {
-            try file.seekTo(header.device_state_offset);
-            for (snapshot.device_states) |*device_state| {
-                const device_bytes = std.mem.asBytes(device_state);
-                const device_read = try file.readAll(device_bytes);
-                if (device_read != device_bytes.len) return error.CorruptedSnapshot;
-                if (device_state.state_size > 0) {
-                    try file.seekBy(@as(i64, @intCast(device_state.state_size)));
-                }
-            }
-        }
+        // Read vCPU and device state headers.
+        try loadVcpuStatesFromFile(allocator, &file, &header, snapshot.vcpu_states);
+        try loadDeviceStateHeadersFromFile(&file, &header, snapshot.device_states);
 
         // Restore memory
         @memset(memory, 0);
@@ -1173,249 +1197,8 @@ pub const Snapshot = struct {
         };
         errdefer snapshot.deinit();
 
-        if (header.vcpu_count > 0) {
-            log.info(
-                "snapshot vcpu version check v1={} v2={} v3={} v4={} v5={} arch={d}",
-                .{
-                    header.version == snapshot_version_1,
-                    header.version == snapshot_version_2,
-                    header.version == snapshot_version_3,
-                    header.version == snapshot_version_4,
-                    header.version == snapshot_version_5,
-                    header.arch,
-                },
-            );
-            try file.seekTo(header.vcpu_state_offset);
-            if (header.version == snapshot_version_1 or header.version == snapshot_version_2 or header.version == snapshot_version_3 or header.version == snapshot_version_4 or header.version == snapshot_version_5) {
-                if (header.arch == 1) {
-                    if (header.version == snapshot_version_5) {
-                        const legacy_states = try allocator.alloc(VcpuStateArm64V5, header.vcpu_count);
-                        defer allocator.free(legacy_states);
-                        const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                        if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V5)) return error.CorruptedSnapshot;
-                        if (legacy_states.len > 0) {
-                            log.info(
-                                "snapshot legacy v5 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
-                                .{
-                                    legacy_states[0].pc,
-                                    legacy_states[0].sp_el1,
-                                    legacy_states[0].elr_el1,
-                                },
-                            );
-                        }
-                        for (legacy_states, 0..) |legacy, idx| {
-                            snapshot.vcpu_states[idx] = .{
-                                .arm64 = .{
-                                    .x = legacy.x,
-                                    .pc = legacy.pc,
-                                    .sp = legacy.sp,
-                                    .cpsr = legacy.cpsr,
-                                    .fpcr = legacy.fpcr,
-                                    .fpsr = legacy.fpsr,
-                                    .sp_el0 = legacy.sp_el0,
-                                    .sp_el1 = legacy.sp_el1,
-                                    .elr_el1 = legacy.elr_el1,
-                                    .spsr_el1 = legacy.spsr_el1,
-                                    .sctlr_el1 = legacy.sctlr_el1,
-                                    .tcr_el1 = legacy.tcr_el1,
-                                    .ttbr0_el1 = legacy.ttbr0_el1,
-                                    .ttbr1_el1 = legacy.ttbr1_el1,
-                                    .mair_el1 = legacy.mair_el1,
-                                    .vbar_el1 = legacy.vbar_el1,
-                                    .mpidr_el1 = legacy.mpidr_el1,
-                                    .tpidr_el0 = legacy.tpidr_el0,
-                                    .tpidr_el1 = legacy.tpidr_el1,
-                                    .tpidrro_el0 = legacy.tpidrro_el0,
-                                    .cntkctl_el1 = legacy.cntkctl_el1,
-                                    .cntv_ctl_el0 = legacy.cntv_ctl_el0,
-                                    .cntv_cval_el0 = legacy.cntv_cval_el0,
-                                    .cntp_ctl_el0 = legacy.cntp_ctl_el0,
-                                    .cntp_cval_el0 = legacy.cntp_cval_el0,
-                                    .cntp_tval_el0 = legacy.cntp_tval_el0,
-                                    .apia_key_lo = legacy.apia_key_lo,
-                                    .apia_key_hi = legacy.apia_key_hi,
-                                    .apib_key_lo = legacy.apib_key_lo,
-                                    .apib_key_hi = legacy.apib_key_hi,
-                                    .apda_key_lo = legacy.apda_key_lo,
-                                    .apda_key_hi = legacy.apda_key_hi,
-                                    .apdb_key_lo = legacy.apdb_key_lo,
-                                    .apdb_key_hi = legacy.apdb_key_hi,
-                                    .apga_key_lo = legacy.apga_key_lo,
-                                    .apga_key_hi = legacy.apga_key_hi,
-                                    .vtimer_offset = legacy.vtimer_offset,
-                                    .vtimer_masked = legacy.vtimer_masked,
-                                    .vtimer_valid = legacy.vtimer_valid,
-                                },
-                            };
-                        }
-                    } else if (header.version == snapshot_version_4) {
-                        const legacy_states = try allocator.alloc(VcpuStateArm64V4, header.vcpu_count);
-                        defer allocator.free(legacy_states);
-                        const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                        if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V4)) return error.CorruptedSnapshot;
-                        if (legacy_states.len > 0) {
-                            log.info(
-                                "snapshot legacy v4 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
-                                .{
-                                    legacy_states[0].pc,
-                                    legacy_states[0].sp_el1,
-                                    legacy_states[0].elr_el1,
-                                },
-                            );
-                        }
-                        for (legacy_states, 0..) |legacy, idx| {
-                            snapshot.vcpu_states[idx] = .{
-                                .arm64 = .{
-                                    .x = legacy.x,
-                                    .pc = legacy.pc,
-                                    .sp = legacy.sp,
-                                    .cpsr = legacy.cpsr,
-                                    .fpcr = legacy.fpcr,
-                                    .fpsr = legacy.fpsr,
-                                    .sp_el0 = legacy.sp_el0,
-                                    .sp_el1 = legacy.sp_el1,
-                                    .elr_el1 = legacy.elr_el1,
-                                    .spsr_el1 = legacy.spsr_el1,
-                                    .sctlr_el1 = legacy.sctlr_el1,
-                                    .tcr_el1 = legacy.tcr_el1,
-                                    .ttbr0_el1 = legacy.ttbr0_el1,
-                                    .ttbr1_el1 = legacy.ttbr1_el1,
-                                    .mair_el1 = legacy.mair_el1,
-                                    .vbar_el1 = legacy.vbar_el1,
-                                    .mpidr_el1 = legacy.mpidr_el1,
-                                    .tpidr_el0 = legacy.tpidr_el0,
-                                    .tpidr_el1 = legacy.tpidr_el1,
-                                    .tpidrro_el0 = legacy.tpidrro_el0,
-                                    .cntkctl_el1 = legacy.cntkctl_el1,
-                                    .cntv_ctl_el0 = legacy.cntv_ctl_el0,
-                                    .cntv_cval_el0 = legacy.cntv_cval_el0,
-                                    .cntp_ctl_el0 = legacy.cntp_ctl_el0,
-                                    .cntp_cval_el0 = legacy.cntp_cval_el0,
-                                    .cntp_tval_el0 = legacy.cntp_tval_el0,
-                                    .apia_key_lo = legacy.apia_key_lo,
-                                    .apia_key_hi = legacy.apia_key_hi,
-                                    .apib_key_lo = legacy.apib_key_lo,
-                                    .apib_key_hi = legacy.apib_key_hi,
-                                    .apda_key_lo = legacy.apda_key_lo,
-                                    .apda_key_hi = legacy.apda_key_hi,
-                                    .apdb_key_lo = legacy.apdb_key_lo,
-                                    .apdb_key_hi = legacy.apdb_key_hi,
-                                    .apga_key_lo = legacy.apga_key_lo,
-                                    .apga_key_hi = legacy.apga_key_hi,
-                                },
-                            };
-                        }
-                    } else if (header.version == snapshot_version_3) {
-                        const legacy_states = try allocator.alloc(VcpuStateArm64V3, header.vcpu_count);
-                        defer allocator.free(legacy_states);
-                        const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                        if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V3)) return error.CorruptedSnapshot;
-                        if (legacy_states.len > 0) {
-                            log.info(
-                                "snapshot legacy v3 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
-                                .{
-                                    legacy_states[0].pc,
-                                    legacy_states[0].sp_el1,
-                                    legacy_states[0].elr_el1,
-                                },
-                            );
-                        }
-                        for (legacy_states, 0..) |legacy, idx| {
-                            snapshot.vcpu_states[idx] = .{
-                                .arm64 = .{
-                                    .x = legacy.x,
-                                    .pc = legacy.pc,
-                                    .sp = legacy.sp,
-                                    .cpsr = legacy.cpsr,
-                                    .fpcr = legacy.fpcr,
-                                    .fpsr = legacy.fpsr,
-                                    .sp_el0 = legacy.sp_el0,
-                                    .sp_el1 = legacy.sp_el1,
-                                    .elr_el1 = legacy.elr_el1,
-                                    .spsr_el1 = legacy.spsr_el1,
-                                    .sctlr_el1 = legacy.sctlr_el1,
-                                    .tcr_el1 = legacy.tcr_el1,
-                                    .ttbr0_el1 = legacy.ttbr0_el1,
-                                    .ttbr1_el1 = legacy.ttbr1_el1,
-                                    .mair_el1 = legacy.mair_el1,
-                                    .vbar_el1 = legacy.vbar_el1,
-                                    .mpidr_el1 = legacy.mpidr_el1,
-                                    .tpidr_el0 = legacy.tpidr_el0,
-                                    .tpidr_el1 = legacy.tpidr_el1,
-                                    .tpidrro_el0 = legacy.tpidrro_el0,
-                                    .cntkctl_el1 = legacy.cntkctl_el1,
-                                    .cntv_ctl_el0 = legacy.cntv_ctl_el0,
-                                    .cntv_cval_el0 = legacy.cntv_cval_el0,
-                                    .cntp_ctl_el0 = legacy.cntp_ctl_el0,
-                                    .cntp_cval_el0 = legacy.cntp_cval_el0,
-                                    .cntp_tval_el0 = legacy.cntp_tval_el0,
-                                },
-                            };
-                        }
-                    } else {
-                        const legacy_states = try allocator.alloc(VcpuStateArm64V2, header.vcpu_count);
-                        defer allocator.free(legacy_states);
-                        const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                        if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateArm64V2)) return error.CorruptedSnapshot;
-                        if (legacy_states.len > 0) {
-                            log.info(
-                                "snapshot legacy v2 arm64 pc=0x{x} sp_el1=0x{x} elr_el1=0x{x}",
-                                .{
-                                    legacy_states[0].pc,
-                                    legacy_states[0].sp_el1,
-                                    legacy_states[0].elr_el1,
-                                },
-                            );
-                        }
-                        for (legacy_states, 0..) |legacy, idx| {
-                            snapshot.vcpu_states[idx] = .{
-                                .arm64 = .{
-                                    .x = legacy.x,
-                                    .pc = legacy.pc,
-                                    .sp = legacy.sp,
-                                    .cpsr = legacy.cpsr,
-                                    .fpcr = legacy.fpcr,
-                                    .fpsr = legacy.fpsr,
-                                    .sp_el1 = legacy.sp_el1,
-                                    .elr_el1 = legacy.elr_el1,
-                                    .spsr_el1 = legacy.spsr_el1,
-                                    .sctlr_el1 = legacy.sctlr_el1,
-                                    .tcr_el1 = legacy.tcr_el1,
-                                    .ttbr0_el1 = legacy.ttbr0_el1,
-                                    .ttbr1_el1 = legacy.ttbr1_el1,
-                                    .mair_el1 = legacy.mair_el1,
-                                    .vbar_el1 = legacy.vbar_el1,
-                                    .mpidr_el1 = legacy.mpidr_el1,
-                                },
-                            };
-                        }
-                    }
-                } else {
-                    const legacy_states = try allocator.alloc(VcpuStateX86, header.vcpu_count);
-                    defer allocator.free(legacy_states);
-                    const vcpu_read = try file.readAll(std.mem.sliceAsBytes(legacy_states));
-                    if (vcpu_read != header.vcpu_count * @sizeOf(VcpuStateX86)) return error.CorruptedSnapshot;
-                    for (legacy_states, 0..) |legacy, idx| {
-                        snapshot.vcpu_states[idx] = .{ .x86 = legacy };
-                    }
-                }
-            } else {
-                const vcpu_read = try file.readAll(std.mem.sliceAsBytes(snapshot.vcpu_states));
-                if (vcpu_read != header.vcpu_count * @sizeOf(VcpuState)) return error.CorruptedSnapshot;
-            }
-        }
-
-        if (header.device_count > 0) {
-            try file.seekTo(header.device_state_offset);
-            for (snapshot.device_states) |*device_state| {
-                const device_bytes = std.mem.asBytes(device_state);
-                const device_read = try file.readAll(device_bytes);
-                if (device_read != device_bytes.len) return error.CorruptedSnapshot;
-                if (device_state.state_size > 0) {
-                    try file.seekBy(@as(i64, @intCast(device_state.state_size)));
-                }
-            }
-        }
+        try loadVcpuStatesFromFile(allocator, &file, &header, snapshot.vcpu_states);
+        try loadDeviceStateHeadersFromFile(&file, &header, snapshot.device_states);
 
         return snapshot;
     }

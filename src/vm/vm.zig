@@ -57,17 +57,11 @@ fn openPathForRead(path: []const u8) !std.fs.File {
     return std.fs.cwd().openFile(path, .{});
 }
 
-fn copyFileToDir(
+fn copyFileContents(
     allocator: std.mem.Allocator,
-    src_path: []const u8,
-    out_dir: std.fs.Dir,
-    out_name: []const u8,
+    src: *std.fs.File,
+    dst: *std.fs.File,
 ) !u64 {
-    var src = try openPathForRead(src_path);
-    defer src.close();
-    var dst = try out_dir.createFile(out_name, .{ .truncate = true });
-    defer dst.close();
-
     var buf = try allocator.alloc(u8, 64 * 1024);
     defer allocator.free(buf);
 
@@ -80,6 +74,19 @@ fn copyFileToDir(
     }
     try dst.sync();
     return total;
+}
+
+fn copyFileToDir(
+    allocator: std.mem.Allocator,
+    src_path: []const u8,
+    out_dir: std.fs.Dir,
+    out_name: []const u8,
+) !u64 {
+    var src = try openPathForRead(src_path);
+    defer src.close();
+    var dst = try out_dir.createFile(out_name, .{ .truncate = true });
+    defer dst.close();
+    return copyFileContents(allocator, &src, &dst);
 }
 
 fn snapshotFileNameForSlot(allocator: std.mem.Allocator, slot: []const u8, src_path: []const u8) ![]u8 {
@@ -126,6 +133,13 @@ fn writeFilesystemSnapshotManifest(out_dir: std.fs.Dir, entries: []const FsSnaps
     try w.flush();
 }
 
+fn manifestSlotRef(manifest: *FsSnapshotManifest, key: []const u8) ?*?[]u8 {
+    if (std.mem.eql(u8, key, "vda")) return &manifest.vda;
+    if (std.mem.eql(u8, key, "vdb")) return &manifest.vdb;
+    if (std.mem.eql(u8, key, "vdc")) return &manifest.vdc;
+    return null;
+}
+
 fn parseFilesystemSnapshotManifest(allocator: std.mem.Allocator, snapshot_dir: std.fs.Dir) !FsSnapshotManifest {
     var file = try snapshot_dir.openFile("manifest.txt", .{});
     defer file.close();
@@ -153,15 +167,9 @@ fn parseFilesystemSnapshotManifest(allocator: std.mem.Allocator, snapshot_dir: s
             continue;
         }
 
-        if (std.mem.eql(u8, key, "vda")) {
-            if (manifest.vda) |existing| allocator.free(existing);
-            manifest.vda = try allocator.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "vdb")) {
-            if (manifest.vdb) |existing| allocator.free(existing);
-            manifest.vdb = try allocator.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "vdc")) {
-            if (manifest.vdc) |existing| allocator.free(existing);
-            manifest.vdc = try allocator.dupe(u8, value);
+        if (manifestSlotRef(&manifest, key)) |slot| {
+            if (slot.*) |existing| allocator.free(existing);
+            slot.* = try allocator.dupe(u8, value);
         }
     }
 
@@ -186,19 +194,7 @@ fn copySnapshotEntryToPath(
     defer src.close();
     var dst = try openPathForWriteTruncate(target_path);
     defer dst.close();
-
-    var buf = try allocator.alloc(u8, 64 * 1024);
-    defer allocator.free(buf);
-
-    var total: u64 = 0;
-    while (true) {
-        const n = try src.read(buf);
-        if (n == 0) break;
-        try dst.writeAll(buf[0..n]);
-        total += @intCast(n);
-    }
-    try dst.sync();
-    return total;
+    return copyFileContents(allocator, &src, &dst);
 }
 
 fn restoreSlotFromManifest(

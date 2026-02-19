@@ -1850,9 +1850,9 @@ pub const VirtioFsDevice = struct {
             };
             defer self.allocator.free(full_path);
 
-        const stat = statPath(full_path, false) catch {
-            return self.sendError(header, -2, response_buf);
-        };
+            const stat = statPath(full_path, false) catch {
+                return self.sendError(header, -2, response_buf);
+            };
             const nodeid = self.allocateNode(full_path, stat.kind == .directory) catch {
                 return self.sendError(header, -12, response_buf);
             };
@@ -2217,17 +2217,7 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
-        if (payload.len < @sizeOf(FuseLkIn)) return self.sendError(header, -22, response_buf);
-        const lk_in: *const FuseLkIn = @ptrCast(@alignCast(payload.ptr));
-        const handle = self.handles.get(lk_in.fh) orelse return self.sendError(header, -9, response_buf);
-        const file = handle.file orelse return self.sendError(header, -9, response_buf);
-
-        var flock: c.struct_flock = lockToFlock(lk_in.lk);
-        if (c.fcntl(file.handle, c.F_SETLK, &flock) == -1) {
-            return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
-        }
-        return self.sendError(header, 0, response_buf);
+        return self.handleSetlkWithCmd(header, payload, response_buf, c.F_SETLK);
     }
 
     fn handleSetlkw(
@@ -2236,6 +2226,16 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
+        return self.handleSetlkWithCmd(header, payload, response_buf, c.F_SETLKW);
+    }
+
+    fn handleSetlkWithCmd(
+        self: *VirtioFsDevice,
+        header: *const FuseInHeader,
+        payload: []const u8,
+        response_buf: []u8,
+        cmd: c_int,
+    ) VirtioFsError!usize {
         if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
         if (payload.len < @sizeOf(FuseLkIn)) return self.sendError(header, -22, response_buf);
         const lk_in: *const FuseLkIn = @ptrCast(@alignCast(payload.ptr));
@@ -2243,7 +2243,7 @@ pub const VirtioFsDevice = struct {
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
 
         var flock: c.struct_flock = lockToFlock(lk_in.lk);
-        if (c.fcntl(file.handle, c.F_SETLKW, &flock) == -1) {
+        if (c.fcntl(file.handle, cmd, &flock) == -1) {
             return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
         }
         return self.sendError(header, 0, response_buf);
@@ -3121,7 +3121,6 @@ fn statPath(path: []const u8, follow: bool) !StatView {
 }
 
 fn statToFuseAttr(nodeid: u64, stat: *const StatView) FuseAttr {
-
     return .{
         .ino = nodeid,
         .size = stat.size,

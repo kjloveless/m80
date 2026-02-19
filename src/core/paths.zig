@@ -27,6 +27,7 @@
 //! - No dots, slashes, or other special characters
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Error returned when a VM name fails validation.
 pub const VmNameError = error{InvalidName};
@@ -70,7 +71,7 @@ pub fn validateVmName(name: []const u8) bool {
 /// Returns: Allocator-owned path string (caller must free)
 pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
     // windows: %localappdata%\m80
-    if (@import("builtin").os.tag == .windows) {
+    if (builtin.os.tag == .windows) {
         const local = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch null;
         if (local) |base| {
             defer allocator.free(base);

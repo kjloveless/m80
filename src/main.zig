@@ -101,51 +101,37 @@ fn setEnvFlag(allocator: std.mem.Allocator, name: []const u8, value: []const u8)
     _ = setenv(name_z, value_z, 1);
 }
 
+const help_text =
+    \\m80 - cross-platform microvm runtime
+    \\
+    \\usage:
+    \\  m80 init <name>              create a new VM
+    \\  m80 start <name>             start a VM in the background
+    \\  m80 console <name>           attach to a running VM console
+    \\  m80 stop <name>              stop a running VM
+    \\  m80 delete <name>            remove a VM and its files
+    \\  m80 ps                       list all VMs and their status
+    \\  m80 inspect <name>           show VM details
+    \\  m80 snapshot <name> <path>   save running VM disk snapshot to directory
+    \\  m80 restore <name> <path>    restore VM disks from snapshot directory
+    \\  m80 clone <name> <new-name>  clone a VM (copy config)
+    \\  m80 help                     show this help message
+    \\
+;
+
 /// Writes the help text to the provided writer.
 /// This is separated from printHelp() so tests can capture the output.
 ///
 /// Parameters:
 ///   - writer: Any type that implements the Writer interface (e.g., stderr, a buffer)
 pub fn writeHelp(writer: anytype) !void {
-    try writer.print(
-        \\m80 - cross-platform microvm runtime
-        \\
-        \\usage:
-        \\  m80 init <name>              create a new VM
-        \\  m80 start <name>             start a VM in the background
-        \\  m80 console <name>           attach to a running VM console
-        \\  m80 stop <name>              stop a running VM
-        \\  m80 delete <name>            remove a VM and its files
-        \\  m80 ps                       list all VMs and their status
-        \\  m80 inspect <name>           show VM details
-        \\  m80 snapshot <name> <path>   save running VM disk snapshot to directory
-        \\  m80 restore <name> <path>    restore VM disks from snapshot directory
-        \\  m80 clone <name> <new-name>  clone a VM (copy config)
-        \\  m80 help                     show this help message
-        \\
-    , .{});
+    try writer.writeAll(help_text);
 }
 
 /// Convenience wrapper that prints help text to stdout.
 /// Silently ignores any write errors (stdout might be closed/redirected).
 fn printHelp() void {
-    std.debug.print(
-        \\m80 - cross-platform microvm runtime
-        \\
-        \\usage:
-        \\  m80 init <name>              create a new VM
-        \\  m80 start <name>             start a VM in the background
-        \\  m80 console <name>           attach to a running VM console
-        \\  m80 stop <name>              stop a running VM
-        \\  m80 delete <name>            remove a VM and its files
-        \\  m80 ps                       list all VMs and their status
-        \\  m80 inspect <name>           show VM details
-        \\  m80 snapshot <name> <path>   save running VM disk snapshot to directory
-        \\  m80 restore <name> <path>    restore VM disks from snapshot directory
-        \\  m80 clone <name> <new-name>  clone a VM (copy config)
-        \\  m80 help                     show this help message
-        \\
-    , .{});
+    std.debug.print("{s}", .{help_text});
 }
 
 /// Checks if a file exists at the given path and returns its size in bytes.
@@ -552,11 +538,11 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
         vm.restoreFilesystem(cfg_mut, path) catch |e| {
             log.err("filesystem restore failed: {s}", .{@errorName(e)});
             vm.stop() catch {};
-            writeRestoreResult(vm_dir, @errorName(e));
+            writeResultFile(vm_dir, restore_result_file, @errorName(e));
             return e;
         };
         log.info("filesystem restore complete", .{});
-        writeRestoreResult(vm_dir, "ok");
+        writeResultFile(vm_dir, restore_result_file, "ok");
     }
 
     state.setStatus(allocator, name, .running) catch |e| switch (e) {
@@ -621,6 +607,16 @@ const snapshot_result_file = "snapshot.result";
 const restore_request_file = "restore.request";
 const restore_result_file = "restore.result";
 const stop_request_file = "stop.request";
+const vm_action_max_attempts: usize = 600;
+const vm_action_poll_ms: u64 = 200;
+const request_file_max_bytes: usize = 4096;
+const result_file_max_bytes: usize = 1024;
+
+const VmActionWaitResult = union(enum) {
+    ok,
+    failed: []u8,
+    timeout,
+};
 
 fn writeStopRequest(vm_dir: std.fs.Dir) !void {
     var req = try vm_dir.createFile(stop_request_file, .{ .truncate = true });
@@ -637,58 +633,65 @@ fn hasStopRequest(vm_dir: std.fs.Dir) !bool {
     return true;
 }
 
-fn readSnapshotRequest(allocator: std.mem.Allocator, vm_dir: std.fs.Dir) !?[]u8 {
-    var file = vm_dir.openFile(snapshot_request_file, .{}) catch |e| switch (e) {
+fn readOptionalTrimmedFile(
+    allocator: std.mem.Allocator,
+    vm_dir: std.fs.Dir,
+    file_name: []const u8,
+    max_bytes: usize,
+) !?[]u8 {
+    var file = vm_dir.openFile(file_name, .{}) catch |e| switch (e) {
         error.FileNotFound => return null,
         else => return e,
     };
     defer file.close();
 
-    const data = try file.readToEndAlloc(allocator, 4096);
-    errdefer allocator.free(data);
+    const data = try file.readToEndAlloc(allocator, max_bytes);
+    defer allocator.free(data);
 
     const trimmed = std.mem.trim(u8, data, " \t\r\n");
-    if (trimmed.len == 0) {
-        allocator.free(data);
-        return null;
-    }
-
-    const path = try allocator.dupe(u8, trimmed);
-    allocator.free(data);
-    return path;
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
 }
 
-fn readRestoreRequest(allocator: std.mem.Allocator, vm_dir: std.fs.Dir) !?[]u8 {
-    var file = vm_dir.openFile(restore_request_file, .{}) catch |e| switch (e) {
-        error.FileNotFound => return null,
-        else => return e,
-    };
-    defer file.close();
-
-    const data = try file.readToEndAlloc(allocator, 4096);
-    errdefer allocator.free(data);
-
-    const trimmed = std.mem.trim(u8, data, " \t\r\n");
-    if (trimmed.len == 0) {
-        allocator.free(data);
-        return null;
-    }
-
-    const path = try allocator.dupe(u8, trimmed);
-    allocator.free(data);
-    return path;
+fn readPathRequest(
+    allocator: std.mem.Allocator,
+    vm_dir: std.fs.Dir,
+    request_file: []const u8,
+) !?[]u8 {
+    return readOptionalTrimmedFile(allocator, vm_dir, request_file, request_file_max_bytes);
 }
 
-fn writeSnapshotResult(vm_dir: std.fs.Dir, msg: []const u8) void {
-    var file = vm_dir.createFile(snapshot_result_file, .{ .truncate = true }) catch return;
+fn writePathRequest(vm_dir: std.fs.Dir, request_file: []const u8, path: []const u8) !void {
+    var req = try vm_dir.createFile(request_file, .{ .truncate = true });
+    defer req.close();
+    try req.writeAll(path);
+}
+
+fn writeResultFile(vm_dir: std.fs.Dir, result_file: []const u8, msg: []const u8) void {
+    var file = vm_dir.createFile(result_file, .{ .truncate = true }) catch return;
     defer file.close();
     _ = file.writeAll(msg) catch {};
 }
 
-fn writeRestoreResult(vm_dir: std.fs.Dir, msg: []const u8) void {
-    var file = vm_dir.createFile(restore_result_file, .{ .truncate = true }) catch return;
-    defer file.close();
-    _ = file.writeAll(msg) catch {};
+fn waitForVmActionResult(
+    allocator: std.mem.Allocator,
+    vm_dir: std.fs.Dir,
+    result_file: []const u8,
+) !VmActionWaitResult {
+    var attempts: usize = 0;
+    while (attempts < vm_action_max_attempts) : (attempts += 1) {
+        const result = try readOptionalTrimmedFile(allocator, vm_dir, result_file, result_file_max_bytes);
+        if (result) |msg| {
+            vm_dir.deleteFile(result_file) catch {};
+            if (std.mem.eql(u8, msg, "ok")) {
+                allocator.free(msg);
+                return .ok;
+            }
+            return .{ .failed = msg };
+        }
+        std.Thread.sleep(vm_action_poll_ms * std.time.ns_per_ms);
+    }
+    return .timeout;
 }
 
 fn waitForStopOrSnapshot(
@@ -709,30 +712,30 @@ fn waitForStopOrSnapshot(
             vm_dir.deleteFile(stop_request_file) catch {};
             break;
         }
-        if (try readSnapshotRequest(allocator, vm_dir)) |path| {
+        if (try readPathRequest(allocator, vm_dir, snapshot_request_file)) |path| {
             defer allocator.free(path);
             log.info("snapshot request path={s}", .{path});
             vm.snapshotFilesystem(cfg.*, path) catch |e| {
                 log.warn("snapshot failed: {s}", .{@errorName(e)});
-                writeSnapshotResult(vm_dir, @errorName(e));
+                writeResultFile(vm_dir, snapshot_result_file, @errorName(e));
                 vm_dir.deleteFile(snapshot_request_file) catch {};
                 std.Thread.sleep(50 * std.time.ns_per_ms);
                 continue;
             };
-            writeSnapshotResult(vm_dir, "ok");
+            writeResultFile(vm_dir, snapshot_result_file, "ok");
             vm_dir.deleteFile(snapshot_request_file) catch {};
         }
-        if (try readRestoreRequest(allocator, vm_dir)) |path| {
+        if (try readPathRequest(allocator, vm_dir, restore_request_file)) |path| {
             defer allocator.free(path);
             log.info("restore request path={s}", .{path});
             vm.restoreFilesystem(cfg.*, path) catch |e| {
                 log.warn("restore failed: {s}", .{@errorName(e)});
-                writeRestoreResult(vm_dir, @errorName(e));
+                writeResultFile(vm_dir, restore_result_file, @errorName(e));
                 vm_dir.deleteFile(restore_request_file) catch {};
                 std.Thread.sleep(50 * std.time.ns_per_ms);
                 continue;
             };
-            writeRestoreResult(vm_dir, "ok");
+            writeResultFile(vm_dir, restore_result_file, "ok");
             vm_dir.deleteFile(restore_request_file) catch {};
         }
         std.Thread.sleep(200 * std.time.ns_per_ms);
@@ -1117,38 +1120,19 @@ pub fn main() !void {
         vm_dir.deleteFile(snapshot_result_file) catch {};
         vm_dir.deleteFile(snapshot_request_file) catch {};
 
-        // Write snapshot request
-        var req = vm_dir.createFile(snapshot_request_file, .{ .truncate = true }) catch |e| {
+        writePathRequest(vm_dir, snapshot_request_file, snap_path) catch |e| {
             errors.die("snapshot request failed: {s}", .{@errorName(e)});
         };
-        defer req.close();
-        try req.writeAll(snap_path);
-
-        // Wait for result
-        var attempts: usize = 0;
-        while (attempts < 600) : (attempts += 1) {
-            var res = vm_dir.openFile(snapshot_result_file, .{}) catch |e| switch (e) {
-                error.FileNotFound => {
-                    std.Thread.sleep(200 * std.time.ns_per_ms);
-                    continue;
-                },
-                else => errors.die("snapshot result open failed: {s}", .{@errorName(e)}),
-            };
-            defer res.close();
-
-            const result = try res.readToEndAlloc(allocator, 1024);
-            defer allocator.free(result);
-            const trimmed = std.mem.trim(u8, result, " \t\r\n");
-            if (std.mem.eql(u8, trimmed, "ok")) {
-                vm_dir.deleteFile(snapshot_result_file) catch {};
+        switch (waitForVmActionResult(allocator, vm_dir, snapshot_result_file) catch |e| {
+            errors.die("snapshot result read failed: {s}", .{@errorName(e)});
+        }) {
+            .ok => {
                 std.debug.print("snapshot saved: {s}\n", .{snap_path});
                 return;
-            }
-            vm_dir.deleteFile(snapshot_result_file) catch {};
-            errors.die("snapshot failed: {s}", .{trimmed});
+            },
+            .failed => |msg| errors.die("snapshot failed: {s}", .{msg}),
+            .timeout => errors.die("snapshot timed out: {s}", .{snap_path}),
         }
-
-        errors.die("snapshot timed out: {s}", .{snap_path});
     }
 
     // ===== RESTORE COMMAND =====
@@ -1179,39 +1163,21 @@ pub fn main() !void {
             if (isPidAlive(pid)) {
                 vm_dir.deleteFile(restore_result_file) catch {};
                 vm_dir.deleteFile(restore_request_file) catch {};
-                var req = vm_dir.createFile(restore_request_file, .{ .truncate = true }) catch |e| {
-                    errors.die("restore request failed: {s}", .{@errorName(e)});
-                };
-                defer req.close();
-                _ = req.writeAll(snap_path) catch |e| {
+                writePathRequest(vm_dir, restore_request_file, snap_path) catch |e| {
                     errors.die("restore request failed: {s}", .{@errorName(e)});
                 };
 
                 std.debug.print("filesystem restore started: {s}\n", .{name});
-                var attempts: usize = 0;
-                while (attempts < 600) : (attempts += 1) {
-                    var res = vm_dir.openFile(restore_result_file, .{}) catch |e| switch (e) {
-                        error.FileNotFound => {
-                            std.Thread.sleep(200 * std.time.ns_per_ms);
-                            continue;
-                        },
-                        else => errors.die("restore result open failed: {s}", .{@errorName(e)}),
-                    };
-                    defer res.close();
-
-                    const result = try res.readToEndAlloc(allocator, 1024);
-                    defer allocator.free(result);
-                    const trimmed = std.mem.trim(u8, result, " \t\r\n");
-                    if (std.mem.eql(u8, trimmed, "ok")) {
-                        vm_dir.deleteFile(restore_result_file) catch {};
+                switch (waitForVmActionResult(allocator, vm_dir, restore_result_file) catch |e| {
+                    errors.die("restore result read failed: {s}", .{@errorName(e)});
+                }) {
+                    .ok => {
                         std.debug.print("filesystem restore complete: {s}\n", .{name});
                         return;
-                    }
-                    vm_dir.deleteFile(restore_result_file) catch {};
-                    errors.die("filesystem restore failed: {s}", .{trimmed});
+                    },
+                    .failed => |msg| errors.die("filesystem restore failed: {s}", .{msg}),
+                    .timeout => errors.die("filesystem restore timed out: {s}", .{name}),
                 }
-
-                errors.die("filesystem restore timed out: {s}", .{name});
             }
             clearVmPid(vm_dir);
             state.setStatus(allocator, name, .stopped) catch {};

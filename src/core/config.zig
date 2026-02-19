@@ -49,8 +49,6 @@ const mounts = @import("../fs/mounts.zig");
 
 /// Configuration for a virtual machine.
 /// This struct holds all settings needed to create and run a VM.
-/// Configuration for a virtual machine.
-/// This struct holds all settings needed to create and run a VM.
 pub const VmConfig = struct {
     /// Unique identifier for this VM (e.g., "my-web-server").
     /// Must be alphanumeric with underscores/hyphens only.
