@@ -41,6 +41,7 @@ test "import: all modules" {
     _ = @import("vm/hvf.zig");
     _ = @import("vm/dtb.zig");
     _ = @import("vm/boot.zig");
+    _ = @import("vm/guest_mem.zig");
     _ = @import("vm/posix.zig");
     _ = @import("vm/serial.zig");
     _ = @import("vm/snapshot.zig");

@@ -8,11 +8,9 @@ const virtio_fs = @import("../fs/virtio_fs.zig");
 const mounts = @import("../fs/mounts.zig");
 const log = @import("../util/log.zig");
 const serial = @import("serial.zig");
+const guest_mem = @import("guest_mem.zig");
 
-pub const GuestIo = struct {
-    read_bytes: *const fn (u64, []u8) anyerror!void,
-    write_bytes: *const fn (u64, []const u8) anyerror!void,
-};
+pub const GuestIo = guest_mem.GuestIo;
 
 var guest_io: ?GuestIo = null;
 
@@ -25,53 +23,39 @@ fn ensureGuestIo() !GuestIo {
 }
 
 fn readGuestBytes(guest_addr: u64, out: []u8) !void {
-    const io = try ensureGuestIo();
-    try io.read_bytes(guest_addr, out);
+    try guest_mem.readBytesViaIo(try ensureGuestIo(), guest_addr, out);
 }
 
 fn writeGuestBytes(guest_addr: u64, data: []const u8) !void {
-    const io = try ensureGuestIo();
-    try io.write_bytes(guest_addr, data);
+    try guest_mem.writeBytesViaIo(try ensureGuestIo(), guest_addr, data);
 }
 
 fn readGuestU16(guest_addr: u64) !u16 {
-    var buf: [2]u8 = undefined;
-    try readGuestBytes(guest_addr, &buf);
-    return std.mem.readInt(u16, &buf, .little);
+    return guest_mem.readU16ViaIo(try ensureGuestIo(), guest_addr);
 }
 
 fn readGuestU32(guest_addr: u64) !u32 {
-    var buf: [4]u8 = undefined;
-    try readGuestBytes(guest_addr, &buf);
-    return std.mem.readInt(u32, &buf, .little);
+    return guest_mem.readU32ViaIo(try ensureGuestIo(), guest_addr);
 }
 
 fn readGuestU64(guest_addr: u64) !u64 {
-    var buf: [8]u8 = undefined;
-    try readGuestBytes(guest_addr, &buf);
-    return std.mem.readInt(u64, &buf, .little);
+    return guest_mem.readU64ViaIo(try ensureGuestIo(), guest_addr);
 }
 
 fn writeGuestU16(guest_addr: u64, value: u16) !void {
-    var buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &buf, value, .little);
-    try writeGuestBytes(guest_addr, &buf);
+    try guest_mem.writeU16ViaIo(try ensureGuestIo(), guest_addr, value);
 }
 
 fn writeGuestU32(guest_addr: u64, value: u32) !void {
-    var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, value, .little);
-    try writeGuestBytes(guest_addr, &buf);
+    try guest_mem.writeU32ViaIo(try ensureGuestIo(), guest_addr, value);
 }
 
 fn writeGuestU64(guest_addr: u64, value: u64) !void {
-    var buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &buf, value, .little);
-    try writeGuestBytes(guest_addr, &buf);
+    try guest_mem.writeU64ViaIo(try ensureGuestIo(), guest_addr, value);
 }
 
 fn writeGuestByte(guest_addr: u64, value: u8) !void {
-    try writeGuestBytes(guest_addr, &[_]u8{value});
+    try guest_mem.writeByteViaIo(try ensureGuestIo(), guest_addr, value);
 }
 
 pub const InterruptHandler = *const fn (intid: u32, level: bool) void;

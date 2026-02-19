@@ -41,6 +41,7 @@ const HRESULT = i32;
 const config = @import("../core/config.zig");
 const serial = @import("serial.zig");
 const boot = @import("boot.zig");
+const guest_mem = @import("guest_mem.zig");
 const SerialIo = serial.SerialIo;
 const IoExit = serial.IoExit;
 
@@ -594,18 +595,20 @@ fn copyFileToGuest(
     path: []const u8,
     label: []const u8,
 ) !u64 {
-    if (guest_base >= memory_size_bytes) return error.GuestImageTooLarge;
+    const memory_len = std.math.cast(usize, memory_size_bytes) orelse return error.GuestImageTooLarge;
 
     var file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
     const stat = try file.stat();
     if (stat.size > std.math.maxInt(usize)) return error.GuestImageTooLarge;
-    if (stat.size > memory_size_bytes - guest_base) return error.GuestImageTooLarge;
+
+    const range = guest_mem.checkedRange(memory_len, gpa_base, guest_base, @intCast(stat.size)) catch
+        return error.GuestImageTooLarge;
 
     const mem_ptr = mem orelse return error.MemoryAllocFailed;
     const base_ptr: [*]u8 = @ptrCast(@alignCast(mem_ptr));
-    const dst = base_ptr + @as(usize, @intCast(guest_base));
+    const dst = base_ptr[range.offset..range.end];
 
     var buf: [4096]u8 = undefined;
     var reader = file.reader(&buf);
@@ -650,15 +653,20 @@ fn allocGuestMemory(size_bytes: usize) !windows.LPVOID {
 }
 
 fn writeCmdlineToGuest(mem: ?*anyopaque, memory_size_bytes: u64, state: boot.BootState, cmdline: []const u8) !void {
-    const end = state.cmdline_addr + @as(u64, state.cmdline_len) + 1;
-    if (end > memory_size_bytes) return error.GuestImageTooLarge;
+    const memory_len = std.math.cast(usize, memory_size_bytes) orelse return error.GuestImageTooLarge;
+    const expected_with_null = std.math.add(usize, state.cmdline_len, 1) catch return error.GuestImageTooLarge;
+    const actual_with_null = std.math.add(usize, cmdline.len, 1) catch return error.GuestImageTooLarge;
+    if (actual_with_null > expected_with_null) return error.GuestImageTooLarge;
+
+    const range = guest_mem.checkedRange(memory_len, gpa_base, state.cmdline_addr, expected_with_null) catch
+        return error.GuestImageTooLarge;
 
     const mem_ptr = mem orelse return error.MemoryAllocFailed;
     const base_ptr: [*]u8 = @ptrCast(@alignCast(mem_ptr));
-    const dst = base_ptr + @as(usize, @intCast(state.cmdline_addr));
+    const dst = base_ptr[range.offset..range.end];
 
+    @memset(dst, 0);
     @memcpy(dst[0..cmdline.len], cmdline);
-    dst[cmdline.len] = 0;
 }
 
 fn setInitialRegisters(handle: Whp.PartitionHandle, index: u32, state: boot.BootState) !void {

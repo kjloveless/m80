@@ -35,6 +35,7 @@ const config = @import("../core/config.zig");
 const serial = @import("serial.zig");
 const boot = @import("boot.zig");
 const virtio = @import("virtio.zig");
+const guest_mem = @import("guest_mem.zig");
 const virtio_fs = @import("../fs/virtio_fs.zig");
 
 // Linux-only KVM bindings; compiled out on non-Linux hosts.
@@ -455,50 +456,38 @@ fn freeGuestMemory(buffer: []align(std.heap.page_size_min) u8) void {
 }
 
 fn writeGuestBytes(guest_addr: u64, data: []const u8) !void {
-    const memory = active_guest_memory orelse return error.NoGuestMemory;
-    const end_addr = guest_addr + data.len;
-    if (end_addr > memory.len) return error.InvalidGuestLayout;
-    const start_offset: usize = @intCast(guest_addr);
-    const end_offset: usize = @intCast(end_addr);
-    std.mem.copyForwards(u8, memory[start_offset..end_offset], data);
+    const memory: ?[]u8 = if (active_guest_memory) |buf| buf else null;
+    try guest_mem.writeBytes(memory, 0, guest_addr, data);
 }
 
 fn readGuestBytes(guest_addr: u64, out: []u8) !void {
-    const memory = active_guest_memory orelse return error.NoGuestMemory;
-    const end_addr = guest_addr + out.len;
-    if (end_addr > memory.len) return error.InvalidGuestLayout;
-    const start_offset: usize = @intCast(guest_addr);
-    const end_offset: usize = @intCast(end_addr);
-    std.mem.copyForwards(u8, out, memory[start_offset..end_offset]);
+    const memory: ?[]u8 = if (active_guest_memory) |buf| buf else null;
+    try guest_mem.readBytes(memory, 0, guest_addr, out);
 }
 
 fn mapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64, fd: std.posix.fd_t, file_offset: u64, writable: bool) !void {
     if (builtin.os.tag != .linux) return error.NotSupported;
     if (len == 0) return;
     const memory = active_guest_memory orelse return error.NoGuestMemory;
-    const end_addr = guest_addr + len;
-    if (end_addr > memory.len) return error.InvalidGuestLayout;
-    if (len > std.math.maxInt(usize)) return error.InvalidGuestLayout;
+    const range = try guest_mem.checkedRangeU64(memory.len, 0, guest_addr, len);
 
-    const host_addr = @intFromPtr(memory.ptr) + @as(usize, @intCast(guest_addr));
+    const host_addr = @intFromPtr(memory.ptr) + range.offset;
     const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
     const prot: u32 = @intCast(if (writable) (std.posix.PROT.READ | std.posix.PROT.WRITE) else std.posix.PROT.READ);
     const flags = std.posix.MAP{
         .TYPE = .SHARED,
         .FIXED = true,
     };
-    _ = try std.posix.mmap(host_ptr, @intCast(len), prot, flags, fd, @intCast(file_offset));
+    _ = try std.posix.mmap(host_ptr, range.end - range.offset, prot, flags, fd, @intCast(file_offset));
 }
 
 fn unmapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64) !void {
     if (builtin.os.tag != .linux) return error.NotSupported;
     if (len == 0) return;
     const memory = active_guest_memory orelse return error.NoGuestMemory;
-    const end_addr = guest_addr + len;
-    if (end_addr > memory.len) return error.InvalidGuestLayout;
-    if (len > std.math.maxInt(usize)) return error.InvalidGuestLayout;
+    const range = try guest_mem.checkedRangeU64(memory.len, 0, guest_addr, len);
 
-    const host_addr = @intFromPtr(memory.ptr) + @as(usize, @intCast(guest_addr));
+    const host_addr = @intFromPtr(memory.ptr) + range.offset;
     const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
     const prot: u32 = @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE);
     const flags = std.posix.MAP{
@@ -506,7 +495,7 @@ fn unmapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64) !void {
         .FIXED = true,
         .ANONYMOUS = true,
     };
-    _ = try std.posix.mmap(host_ptr, @intCast(len), prot, flags, -1, 0);
+    _ = try std.posix.mmap(host_ptr, range.end - range.offset, prot, flags, -1, 0);
 }
 
 fn buildDaxMapper(memory_size_bytes: u64) virtio_fs.DaxMapper {

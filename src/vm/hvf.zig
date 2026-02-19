@@ -38,6 +38,12 @@ const boot = @import("boot.zig");
 const dtb = @import("dtb.zig");
 const builtin = @import("builtin");
 const virtio = @import("virtio.zig");
+const guest_mem = @import("guest_mem.zig");
+const hvf_boot = @import("hvf/boot.zig");
+const hvf_vcpu = @import("hvf/vcpu.zig");
+const hvf_mmio = @import("hvf/mmio.zig");
+const hvf_net_console = @import("hvf/net_console.zig");
+const hvf_state = @import("hvf/state.zig");
 const virtio_fs = @import("../fs/virtio_fs.zig");
 const vmnet = @import("../net/vmnet.zig");
 const SerialIo = serial.SerialIo;
@@ -50,114 +56,50 @@ const vcpu_stop_signal_interval_ns: u64 = 10 * std.time.ns_per_ms;
 const vcpu_forced_stop_timeout_test_extra_ns: u64 = 250 * std.time.ns_per_ms;
 
 // Guest physical memory layout - standard Linux boot offsets (from RAM base)
-const guest_kernel_offset_x86: u64 = 0x100000; // 1 MB - bzImage load offset
-const guest_kernel_offset_arm64: u64 = 0x80000; // 512 KB - common arm64 Image offset
-const guest_initrd_offset: u64 = 0x4000000; // 64 MB - initrd loaded after kernel
-const guest_cmdline_offset: u64 = 0x20000; // 128 KB - command line before kernel
-const arm64_image_magic: u32 = 0x644d5241; // "ARMd" magic at offset 0x38
-const arm64_memory_base: u64 = 0x40000000; // QEMU virt RAM base
+const guest_kernel_offset_x86: u64 = hvf_boot.guest_kernel_offset_x86;
+const guest_kernel_offset_arm64: u64 = hvf_boot.guest_kernel_offset_arm64;
+const guest_initrd_offset: u64 = hvf_boot.guest_initrd_offset;
+const guest_cmdline_offset: u64 = hvf_boot.guest_cmdline_offset;
+const arm64_image_magic: u32 = hvf_boot.arm64_image_magic;
+const arm64_memory_base: u64 = hvf_boot.arm64_memory_base;
 
 fn guestMemoryBase() u64 {
-    return if (builtin.cpu.arch == .aarch64) arm64_memory_base else 0;
+    return hvf_boot.guestMemoryBase(builtin.cpu.arch);
 }
 
 fn guestKernelOffset() u64 {
-    return if (builtin.cpu.arch == .aarch64) guest_kernel_offset_arm64 else guest_kernel_offset_x86;
+    return hvf_boot.guestKernelOffset(builtin.cpu.arch);
 }
 
 fn guestKernelBase() u64 {
-    return guestMemoryBase() + guestKernelOffset();
+    return hvf_boot.guestKernelBase(builtin.cpu.arch);
 }
 
 fn guestInitrdBase() u64 {
-    return guestMemoryBase() + guest_initrd_offset;
+    return hvf_boot.guestInitrdBase(builtin.cpu.arch);
 }
 
 fn guestCmdlineBase() u64 {
-    return guestMemoryBase() + guest_cmdline_offset;
+    return hvf_boot.guestCmdlineBase(builtin.cpu.arch);
 }
 
-// Default kernel command line (minimal: enable serial console; add root if disk)
 fn defaultCmdlineForConfig(cfg: config.VmConfig) []const u8 {
-    if (builtin.cpu.arch == .aarch64) {
-        if (cfg.disk_path != null) {
-            return if (cfg.disk_readonly)
-                "console=ttyAMA0,115200 earlycon=pl011,0x09000000 root=/dev/vda rootwait ro quiet loglevel=3 systemd.show_status=false systemd.log_level=warning"
-            else
-                "console=ttyAMA0,115200 earlycon=pl011,0x09000000 root=/dev/vda rootwait rw quiet loglevel=3 systemd.show_status=false systemd.log_level=warning";
-        }
-        return "console=ttyAMA0,115200 earlycon=pl011,0x09000000 quiet loglevel=3 systemd.show_status=false systemd.log_level=warning";
-    }
-    if (cfg.disk_path != null) {
-        return if (cfg.disk_readonly)
-            "console=ttyS0 root=/dev/vda rootwait ro quiet loglevel=3 systemd.show_status=false systemd.log_level=warning"
-        else
-            "console=ttyS0 root=/dev/vda rootwait rw quiet loglevel=3 systemd.show_status=false systemd.log_level=warning";
-    }
-    return "console=ttyS0 quiet loglevel=3 systemd.show_status=false systemd.log_level=warning";
+    return hvf_boot.defaultCmdlineForConfig(cfg, builtin.cpu.arch);
 }
 
-/// Builds a mount specification string for the kernel command line.
-/// Format: "m80.mounts=tag1:/path1,tag2:/path2"
-/// Returns null if no mounts are configured.
 fn buildMountSpecString(allocator: std.mem.Allocator, cfg: config.VmConfig) !?[]const u8 {
-    if (cfg.mounts.len == 0) return null;
-
-    var total_len: usize = "m80.mounts=".len;
-    for (cfg.mounts, 0..) |mount, i| {
-        if (i > 0) total_len += 1; // comma
-        total_len += mount.tag.len + 1 + mount.guest_path.len; // tag:guest_path
-    }
-
-    var result = try allocator.alloc(u8, total_len);
-    var pos: usize = 0;
-
-    @memcpy(result[pos..][0.."m80.mounts=".len], "m80.mounts=");
-    pos += "m80.mounts=".len;
-
-    for (cfg.mounts, 0..) |mount, i| {
-        if (i > 0) {
-            result[pos] = ',';
-            pos += 1;
-        }
-        @memcpy(result[pos..][0..mount.tag.len], mount.tag);
-        pos += mount.tag.len;
-        result[pos] = ':';
-        pos += 1;
-        @memcpy(result[pos..][0..mount.guest_path.len], mount.guest_path);
-        pos += mount.guest_path.len;
-    }
-
-    return result;
+    return hvf_boot.buildMountSpecString(allocator, cfg);
 }
 
-/// Builds the complete kernel command line with mount specifications appended.
-/// If the config has a custom kernel_cmdline, uses that; otherwise uses default.
-/// Appends mount specifications if any mounts are configured.
 fn buildCmdlineWithMounts(allocator: std.mem.Allocator, cfg: config.VmConfig) ![]const u8 {
-    const base_cmdline = if (cfg.kernel_cmdline) |value| value else defaultCmdlineForConfig(cfg);
-    const mount_spec = try buildMountSpecString(allocator, cfg);
-
-    if (mount_spec == null) {
-        // No mounts, return the base cmdline (caller should not free if it came from config)
-        return try allocator.dupe(u8, base_cmdline);
-    }
-
-    // Combine base cmdline with mount spec
-    const result = try allocator.alloc(u8, base_cmdline.len + 1 + mount_spec.?.len);
-    @memcpy(result[0..base_cmdline.len], base_cmdline);
-    result[base_cmdline.len] = ' ';
-    @memcpy(result[base_cmdline.len + 1 ..][0..mount_spec.?.len], mount_spec.?);
-    allocator.free(mount_spec.?);
-
-    return result;
+    return hvf_boot.buildCmdlineWithMounts(allocator, cfg, builtin.cpu.arch);
 }
 
-const arm64_page_table_alignment: u64 = 0x1000;
-const arm64_page_table_bytes: u64 = 0x2000;
-const arm64_mair_el1: u64 = 0x000004ff;
-const arm64_tcr_el1: u64 = 0x00003510;
-const arm64_sctlr_el1: u64 = 0x30d00800;
+const arm64_page_table_alignment: u64 = hvf_boot.arm64_page_table_alignment;
+const arm64_page_table_bytes: u64 = hvf_boot.arm64_page_table_bytes;
+const arm64_mair_el1: u64 = hvf_boot.arm64_mair_el1;
+const arm64_tcr_el1: u64 = hvf_boot.arm64_tcr_el1;
+const arm64_sctlr_el1: u64 = hvf_boot.arm64_sctlr_el1;
 
 const gic_dist_base_default: u64 = 0x08000000;
 const gic_redist_base_default: u64 = 0x080a0000;
@@ -165,14 +107,7 @@ const gic_dist_size_default: u64 = 0x10000;
 const gic_redist_size_default: u64 = 0x200000;
 const pl011_irq_offset: u32 = 1;
 
-const GicLayout = struct {
-    dist_base: u64,
-    redist_base: u64,
-    dist_size: u64,
-    redist_size: u64,
-    dist_alignment: usize,
-    redist_alignment: usize,
-};
+const GicLayout = hvf_mmio.GicLayout;
 
 var gic_layout: ?GicLayout = null;
 
@@ -1836,68 +1771,16 @@ fn buildHvfRegSet(regs: boot.BootRegs) HvfRegSet {
     };
 }
 
-const arm64_default_pstate_el1h: u64 = 0x3c5;
+const arm64_default_pstate_el1h: u64 = hvf_boot.arm64_default_pstate_el1h;
 
-const ArmBootLayout = struct {
-    dtb_addr: u64,
-    page_table_addr: u64,
-};
+const ArmBootLayout = hvf_boot.ArmBootLayout;
 
 fn computeArmBootLayout(memory_base: u64, memory_size_bytes: u64, state: boot.BootState, dtb_len: usize) !ArmBootLayout {
-    const cmdline_end = state.cmdline_addr + @as(u64, state.cmdline_len) + 1;
-    const dtb_addr = std.mem.alignForward(u64, cmdline_end, arm64_page_table_alignment);
-    const dtb_end = dtb_addr + @as(u64, dtb_len);
-    const page_table_addr = std.mem.alignForward(u64, dtb_end, arm64_page_table_alignment);
-    const page_table_end = page_table_addr + arm64_page_table_bytes;
-    const memory_end = memory_base + memory_size_bytes;
-
-    if (page_table_end > memory_end) return error.InvalidGuestLayout;
-    if (page_table_end > state.stack_top) return error.InvalidGuestLayout;
-
-    return .{
-        .dtb_addr = dtb_addr,
-        .page_table_addr = page_table_addr,
-    };
+    return hvf_boot.computeArmBootLayout(memory_base, memory_size_bytes, state, dtb_len);
 }
 
 fn buildArmIdentityMap(allocator: std.mem.Allocator, page_table_addr: u64, memory_base: u64) ![]u8 {
-    // Build a minimal two-page (L0 + L1) identity map using 1GB blocks.
-    // This keeps the initial MMU config simple and deterministic.
-    var table = try allocator.alloc(u8, @intCast(arm64_page_table_bytes));
-    errdefer allocator.free(table);
-    @memset(table, 0);
-
-    const l0_addr = page_table_addr;
-    const l1_addr = page_table_addr + arm64_page_table_alignment;
-
-    const l0_entry = l1_addr | 0x3;
-    const l1_entry_flags_normal = @as(u64, 0x701);
-    const l1_entry_flags_device = @as(u64, 0x705);
-
-    std.mem.writeInt(u64, table[0..8], l0_entry, .little);
-    const l1_offset: usize = @intCast(arm64_page_table_alignment);
-    const l1_entries = table[l1_offset .. l1_offset + 0x1000];
-    const block_size: u64 = 0x40000000;
-
-    // Map low 1GB (devices) and RAM base block if different.
-    const low_block: u64 = 0;
-    const low_entry = low_block | l1_entry_flags_device;
-    {
-        const ptr: *[8]u8 = @ptrCast(l1_entries[0..8].ptr);
-        std.mem.writeInt(u64, ptr, low_entry, .little);
-    }
-
-    if (memory_base % block_size != 0) return error.InvalidGuestLayout;
-    const base_index: usize = @intCast(memory_base / block_size);
-    if (base_index != 0) {
-        const entry_offset = base_index * 8;
-        const base_entry = memory_base | l1_entry_flags_normal;
-        const ptr: *[8]u8 = @ptrCast(l1_entries[entry_offset .. entry_offset + 8].ptr);
-        std.mem.writeInt(u64, ptr, base_entry, .little);
-    }
-
-    _ = l0_addr;
-    return table;
+    return hvf_boot.buildArmIdentityMap(allocator, page_table_addr, memory_base);
 }
 
 fn buildHvfArmRegs(state: boot.BootState, layout: ArmBootLayout) HvfArmRegs {
@@ -1973,9 +1856,7 @@ fn updateUartInterrupt() void {
 }
 
 fn alignUp(value: u64, alignment: usize) u64 {
-    if (alignment <= 1) return value;
-    const mask = @as(u64, alignment) - 1;
-    return (value + mask) & ~mask;
+    return hvf_mmio.alignUp(value, alignment);
 }
 
 fn computeGicLayout() GicLayout {
@@ -1990,36 +1871,32 @@ fn computeGicLayout() GicLayout {
         gic_bindings.getRedistributorSize(&redist_size) catch {};
     }
 
-    var dist_base = gic_dist_base_default;
-    if (dist_alignment > 1) {
-        dist_base = alignUp(dist_base, dist_alignment);
-    }
-
-    var redist_base = gic_redist_base_default;
-    const min_redist = dist_base + @as(u64, dist_size);
-    if (redist_base < min_redist) {
-        redist_base = min_redist;
-    }
-    if (redist_alignment > 1) {
-        redist_base = alignUp(redist_base, redist_alignment);
-    }
-    if (redist_base == dist_base) {
-        redist_base = alignUp(dist_base + @as(u64, dist_size), redist_alignment);
-    }
+    const layout = hvf_mmio.computeGicLayout(
+        gic_dist_base_default,
+        gic_redist_base_default,
+        gic_dist_size_default,
+        gic_redist_size_default,
+        .{
+            .dist_alignment = dist_alignment,
+            .redist_alignment = redist_alignment,
+            .dist_size = dist_size,
+            .redist_size = redist_size,
+        },
+    );
 
     log.info(
         "hvf gic layout dist=0x{x} size=0x{x} align={d} redist=0x{x} size=0x{x} align={d}",
-        .{ dist_base, dist_size, dist_alignment, redist_base, redist_size, redist_alignment },
+        .{
+            layout.dist_base,
+            layout.dist_size,
+            layout.dist_alignment,
+            layout.redist_base,
+            layout.redist_size,
+            layout.redist_alignment,
+        },
     );
 
-    return .{
-        .dist_base = dist_base,
-        .redist_base = redist_base,
-        .dist_size = @intCast(dist_size),
-        .redist_size = @intCast(redist_size),
-        .dist_alignment = dist_alignment,
-        .redist_alignment = redist_alignment,
-    };
+    return layout;
 }
 
 fn setupGic() void {
@@ -2094,38 +1971,17 @@ const pl011_reg_imsc: u64 = 0x38;
 const pl011_int_rx: u32 = 1 << 4;
 const pl011_int_tx: u32 = 1 << 5;
 
-const Pl011State = struct {
-    cr: u32 = 0,
-    lcrh: u32 = 0,
-    ibrd: u32 = 0,
-    fbrd: u32 = 0,
-    imsc: u32 = 0,
-    pending: u32 = 0,
-};
+const Pl011State = hvf_state.Pl011State;
 
 var pl011_state = Pl011State{};
 var pl011_seen = std.atomic.Value(bool).init(false);
 
 pub fn capturePl011State() snapshot.Pl011SnapshotState {
-    return .{
-        .cr = pl011_state.cr,
-        .lcrh = pl011_state.lcrh,
-        .ibrd = pl011_state.ibrd,
-        .fbrd = pl011_state.fbrd,
-        .imsc = pl011_state.imsc,
-        .pending = pl011_state.pending,
-    };
+    return hvf_state.capturePl011State(pl011_state);
 }
 
 pub fn restorePl011State(state: snapshot.Pl011SnapshotState) void {
-    pl011_state = .{
-        .cr = state.cr,
-        .lcrh = state.lcrh,
-        .ibrd = state.ibrd,
-        .fbrd = state.fbrd,
-        .imsc = state.imsc,
-        .pending = state.pending,
-    };
+    pl011_state = hvf_state.restorePl011State(state);
     pl011_seen.store(true, .seq_cst);
     updateUartInterrupt();
 }
@@ -2704,26 +2560,7 @@ fn handleArm64SysRegTrap(vcpu: arm64_bindings.VcpuId, exit: HvfArmExitException)
 }
 
 fn decodeVmxIoExit(qualification: u64, rax: u64) IoExit {
-    const size_field: u3 = @intCast(qualification & 0x7);
-    const size: usize = switch (size_field) {
-        0 => 1,
-        1 => 2,
-        2 => 4,
-        3 => 8,
-        else => 1,
-    };
-    const is_write = ((qualification >> 3) & 0x1) == 0;
-    const is_string = ((qualification >> 4) & 0x1) == 1;
-    const has_rep = ((qualification >> 5) & 0x1) == 1;
-    const port: u16 = @intCast(qualification & 0xFFFF);
-    return .{
-        .port = port,
-        .is_write = is_write,
-        .size = size,
-        .rax = rax,
-        .is_string = is_string,
-        .has_rep = has_rep,
-    };
+    return hvf_vcpu.decodeVmxIoExit(qualification, rax);
 }
 
 fn handleVmxIoExit(vcpu: HvfVcpuId) !void {
@@ -2751,18 +2588,10 @@ fn handleVmxIoExit(vcpu: HvfVcpuId) !void {
     try hvfWriteReg(vcpu, .RIP, rip + instr_len);
 }
 
-const ArmExceptionInfo = struct {
-    ec: u8,
-    il: u1,
-    iss: u32,
-};
+const ArmExceptionInfo = hvf_vcpu.ArmExceptionInfo;
 
 fn decodeArmExceptionSyndrome(syndrome: u64) ArmExceptionInfo {
-    return .{
-        .ec = @intCast((syndrome >> 26) & 0x3F),
-        .il = @intCast((syndrome >> 25) & 0x1),
-        .iss = @intCast(syndrome & 0x1FFFFFF),
-    };
+    return hvf_vcpu.decodeArmExceptionSyndrome(syndrome);
 }
 
 const VcpuInit = struct {
@@ -2820,11 +2649,15 @@ fn maybePauseVcpu() void {
 }
 
 fn stopTimeoutWindowNs() u64 {
-    return @as(u64, @intCast(vcpu_stop_signal_attempts)) * vcpu_stop_signal_interval_ns;
+    return hvf_vcpu.stopTimeoutWindowNs(vcpu_stop_signal_attempts, vcpu_stop_signal_interval_ns);
 }
 
 fn forceStopTimeoutTestDelayNs() u64 {
-    return stopTimeoutWindowNs() + vcpu_forced_stop_timeout_test_extra_ns;
+    return hvf_vcpu.forceStopTimeoutTestDelayNs(
+        vcpu_stop_signal_attempts,
+        vcpu_stop_signal_interval_ns,
+        vcpu_forced_stop_timeout_test_extra_ns,
+    );
 }
 
 fn shouldForceStopTimeoutForTests() bool {
@@ -3248,24 +3081,20 @@ fn unmapActiveGuestMemory() void {
 fn mapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64, fd: std.posix.fd_t, file_offset: u64, writable: bool) !void {
     if (len == 0) return;
     const memory = active_guest_memory orelse return error.NoGuestMemory;
-    const base = guestMemoryBase();
-    if (guest_addr < base) return error.InvalidGuestLayout;
-    const offset = guest_addr - base;
-    if (offset + len > memory.len) return error.InvalidGuestLayout;
-    if (len > std.math.maxInt(usize)) return error.InvalidGuestLayout;
+    const range = try guest_mem.checkedRangeU64(memory.len, guestMemoryBase(), guest_addr, len);
 
-    const host_addr = @intFromPtr(memory.ptr) + @as(usize, @intCast(offset));
+    const host_addr = @intFromPtr(memory.ptr) + range.offset;
     const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
     const prot: u32 = @intCast(if (writable) (std.posix.PROT.READ | std.posix.PROT.WRITE) else std.posix.PROT.READ);
     const flags = std.posix.MAP{
         .TYPE = .SHARED,
         .FIXED = true,
     };
-    _ = try std.posix.mmap(host_ptr, @intCast(len), prot, flags, fd, @intCast(file_offset));
+    _ = try std.posix.mmap(host_ptr, range.end - range.offset, prot, flags, fd, @intCast(file_offset));
     if (builtin.os.tag == .macos) {
         if (host_ptr) |ptr| {
-            std.posix.madvise(ptr, @intCast(len), std.posix.MADV.WILLNEED) catch {};
-            std.posix.madvise(ptr, @intCast(len), std.posix.MADV.SEQUENTIAL) catch {};
+            std.posix.madvise(ptr, range.end - range.offset, std.posix.MADV.WILLNEED) catch {};
+            std.posix.madvise(ptr, range.end - range.offset, std.posix.MADV.SEQUENTIAL) catch {};
         }
     }
 }
@@ -3273,13 +3102,9 @@ fn mapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64, fd: std.posix.fd_t, f
 fn unmapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64) !void {
     if (len == 0) return;
     const memory = active_guest_memory orelse return error.NoGuestMemory;
-    const base = guestMemoryBase();
-    if (guest_addr < base) return error.InvalidGuestLayout;
-    const offset = guest_addr - base;
-    if (offset + len > memory.len) return error.InvalidGuestLayout;
-    if (len > std.math.maxInt(usize)) return error.InvalidGuestLayout;
+    const range = try guest_mem.checkedRangeU64(memory.len, guestMemoryBase(), guest_addr, len);
 
-    const host_addr = @intFromPtr(memory.ptr) + @as(usize, @intCast(offset));
+    const host_addr = @intFromPtr(memory.ptr) + range.offset;
     const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
     const prot: u32 = @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE);
     const flags = std.posix.MAP{
@@ -3287,7 +3112,7 @@ fn unmapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64) !void {
         .FIXED = true,
         .ANONYMOUS = true,
     };
-    _ = try std.posix.mmap(host_ptr, @intCast(len), prot, flags, -1, 0);
+    _ = try std.posix.mmap(host_ptr, range.end - range.offset, prot, flags, -1, 0);
 }
 
 fn buildDaxMapper(memory_size_bytes: u64) virtio_fs.DaxMapper {
@@ -3302,70 +3127,39 @@ fn buildDaxMapper(memory_size_bytes: u64) virtio_fs.DaxMapper {
 }
 
 fn writeGuestBytes(guest_addr: u64, data: []const u8) !void {
-    // Caller must ensure guest memory has been mapped and registered via
-    // setActiveGuestMemory (or future HVF memory mapping hooks).
-    const memory = active_guest_memory orelse return error.NoGuestMemory;
-    const base = guestMemoryBase();
-    if (guest_addr < base) return error.InvalidGuestLayout;
-    const offset = guest_addr - base;
-    const end_addr = offset + data.len;
-    if (end_addr > memory.len) return error.InvalidGuestLayout;
-    const start_offset: usize = @intCast(offset);
-    const end_offset: usize = @intCast(end_addr);
-    std.mem.copyForwards(u8, memory[start_offset..end_offset], data);
+    try guest_mem.writeBytes(active_guest_memory, guestMemoryBase(), guest_addr, data);
 }
 
 fn readGuestBytes(guest_addr: u64, out: []u8) !void {
-    const memory = active_guest_memory orelse return error.NoGuestMemory;
-    const base = guestMemoryBase();
-    if (guest_addr < base) return error.InvalidGuestLayout;
-    const offset = guest_addr - base;
-    const end_addr = offset + out.len;
-    if (end_addr > memory.len) return error.InvalidGuestLayout;
-    const start_offset: usize = @intCast(offset);
-    const end_offset: usize = @intCast(end_addr);
-    std.mem.copyForwards(u8, out, memory[start_offset..end_offset]);
+    try guest_mem.readBytes(active_guest_memory, guestMemoryBase(), guest_addr, out);
 }
 
 fn readGuestU16(guest_addr: u64) !u16 {
-    var buf: [2]u8 = undefined;
-    try readGuestBytes(guest_addr, &buf);
-    return std.mem.readInt(u16, &buf, .little);
+    return guest_mem.readU16(active_guest_memory, guestMemoryBase(), guest_addr);
 }
 
 fn readGuestU32(guest_addr: u64) !u32 {
-    var buf: [4]u8 = undefined;
-    try readGuestBytes(guest_addr, &buf);
-    return std.mem.readInt(u32, &buf, .little);
+    return guest_mem.readU32(active_guest_memory, guestMemoryBase(), guest_addr);
 }
 
 fn readGuestU64(guest_addr: u64) !u64 {
-    var buf: [8]u8 = undefined;
-    try readGuestBytes(guest_addr, &buf);
-    return std.mem.readInt(u64, &buf, .little);
+    return guest_mem.readU64(active_guest_memory, guestMemoryBase(), guest_addr);
 }
 
 fn writeGuestU16(guest_addr: u64, value: u16) !void {
-    var buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &buf, value, .little);
-    try writeGuestBytes(guest_addr, &buf);
+    try guest_mem.writeU16(active_guest_memory, guestMemoryBase(), guest_addr, value);
 }
 
 fn writeGuestU32(guest_addr: u64, value: u32) !void {
-    var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, value, .little);
-    try writeGuestBytes(guest_addr, &buf);
+    try guest_mem.writeU32(active_guest_memory, guestMemoryBase(), guest_addr, value);
 }
 
 fn writeGuestU64(guest_addr: u64, value: u64) !void {
-    var buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &buf, value, .little);
-    try writeGuestBytes(guest_addr, &buf);
+    try guest_mem.writeU64(active_guest_memory, guestMemoryBase(), guest_addr, value);
 }
 
 fn writeGuestByte(guest_addr: u64, value: u8) !void {
-    var buf: [1]u8 = .{value};
-    try writeGuestBytes(guest_addr, &buf);
+    try guest_mem.writeByte(active_guest_memory, guestMemoryBase(), guest_addr, value);
 }
 
 const KernelLoadResult = struct {
@@ -4100,80 +3894,15 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 fn allocZ(allocator: std.mem.Allocator, value: []const u8) ![:0]u8 {
-    var buf = try allocator.alloc(u8, value.len + 1);
-    @memcpy(buf[0..value.len], value);
-    buf[value.len] = 0;
-    return buf[0..value.len :0];
+    return hvf_net_console.allocZ(allocator, value);
 }
 
 fn encodeDnsName(out: []u8, domain: []const u8) !usize {
-    if (domain.len == 0) return error.InvalidDnsName;
-    var out_idx: usize = 0;
-    var label_start: usize = 0;
-    while (label_start < domain.len) {
-        const dot = std.mem.indexOfScalarPos(u8, domain, label_start, '.') orelse domain.len;
-        const label_len = dot - label_start;
-        if (label_len == 0 or label_len > 63) return error.InvalidDnsName;
-        if (out_idx + 1 + label_len > out.len) return error.NoSpaceLeft;
-        out[out_idx] = @intCast(label_len);
-        out_idx += 1;
-        @memcpy(out[out_idx .. out_idx + label_len], domain[label_start..dot]);
-        out_idx += label_len;
-        label_start = if (dot < domain.len) dot + 1 else dot;
-    }
-    if (out_idx >= out.len) return error.NoSpaceLeft;
-    out[out_idx] = 0;
-    return out_idx + 1;
+    return hvf_net_console.encodeDnsName(out, domain);
 }
 
 fn buildDnsQueryFrame(frame: []u8, domain: []const u8, dst_ip: [4]u8) ![]const u8 {
-    if (frame.len < 64) return error.NoSpaceLeft;
-    @memset(frame, 0);
-
-    // Ethernet header
-    frame[0..6].* = .{ 0x10, 0x22, 0x33, 0x44, 0x55, 0x66 };
-    frame[6..12].* = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
-    frame[12] = 0x08;
-    frame[13] = 0x00;
-
-    const ip_offset: usize = 14;
-    const udp_offset: usize = ip_offset + 20;
-    const dns_offset: usize = udp_offset + 8;
-    const qname_len = try encodeDnsName(frame[dns_offset + 12 ..], domain);
-    const question_offset = dns_offset + 12 + qname_len;
-    if (question_offset + 4 > frame.len) return error.NoSpaceLeft;
-
-    // DNS header + question
-    frame[dns_offset + 0] = 0x12; // txid
-    frame[dns_offset + 1] = 0x34;
-    frame[dns_offset + 2] = 0x01; // standard query, recursion desired
-    frame[dns_offset + 3] = 0x00;
-    frame[dns_offset + 4] = 0x00; // qdcount=1
-    frame[dns_offset + 5] = 0x01;
-    frame[question_offset + 0] = 0x00; // qtype=A
-    frame[question_offset + 1] = 0x01;
-    frame[question_offset + 2] = 0x00; // qclass=IN
-    frame[question_offset + 3] = 0x01;
-
-    const dns_len: usize = 12 + qname_len + 4;
-    const udp_len: u16 = @intCast(8 + dns_len);
-    const ip_len: u16 = @intCast(20 + udp_len);
-    const frame_len = dns_offset + dns_len;
-
-    // IPv4 header
-    frame[ip_offset + 0] = 0x45;
-    frame[ip_offset + 8] = 64; // ttl
-    frame[ip_offset + 9] = 17; // udp
-    std.mem.writeInt(u16, frame[ip_offset + 2 ..][0..2], ip_len, .big);
-    frame[ip_offset + 12 .. ip_offset + 16].* = .{ 10, 0, 2, 15 };
-    @memcpy(frame[ip_offset + 16 .. ip_offset + 20], &dst_ip);
-
-    // UDP header
-    std.mem.writeInt(u16, frame[udp_offset..][0..2], 12345, .big);
-    std.mem.writeInt(u16, frame[udp_offset + 2 ..][0..2], 53, .big);
-    std.mem.writeInt(u16, frame[udp_offset + 4 ..][0..2], udp_len, .big);
-
-    return frame[0..frame_len];
+    return hvf_net_console.buildDnsQueryFrame(frame, domain, dst_ip);
 }
 
 fn runVirtioNetTxFrame(frame: []const u8, desc_addr: u64, avail_addr: u64, used_addr: u64, data_addr: u64) !void {
