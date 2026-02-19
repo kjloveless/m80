@@ -4,6 +4,8 @@ Timebox: 2026-02-13 to 2026-02-27
 
 Goal: close the highest-risk gaps between current backend/device scaffolding and reliable, testable VM lifecycle behavior on real hosts.
 
+Maintainability tracking: `docs/MAINTAINABILITY-PLAN.md`
+
 ## Week 1 (2026-02-13 to 2026-02-20)
 
 - [ ] KVM lifecycle determinism on Linux

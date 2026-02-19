@@ -16,6 +16,7 @@ Phase 2/5/6: jailer, mounts, and network-policy building blocks are implemented;
 ## In Progress / Next
 
 - **2-week execution plan (2026-02-13 to 2026-02-27):** `docs/NEXT-2-WEEKS.md`
+- **maintainability plan (active refactor tracking):** `docs/MAINTAINABILITY-PLAN.md`
 - **Immediate priorities:** Linux KVM lifecycle determinism, WHP/HVF parity validation, snapshot round-trip baseline.
 - **Hardening priorities:** virtio-net policy enforcement path and jailer enforcement verification.
 

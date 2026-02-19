@@ -15,6 +15,13 @@
 test "import: all modules" {
     // Importing modules here ensures tests are discovered by the runner.
     _ = @import("core.zig");
+    _ = @import("cli/dispatch.zig");
+    _ = @import("cli/help.zig");
+    _ = @import("cli/runtime.zig");
+    _ = @import("cli/commands/console.zig");
+    _ = @import("cli/commands/lifecycle.zig");
+    _ = @import("cli/commands/snapshot_restore.zig");
+    _ = @import("cli/commands/vm_admin.zig");
     _ = @import("core/config.zig");
     _ = @import("core/errors.zig");
     _ = @import("core/paths.zig");
