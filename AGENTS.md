@@ -1,33 +1,46 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/` holds all Zig source code. Entry point is `src/main.zig`, core logic lives under `src/core/`, and hypervisor backends are under `src/vm/`.
-- `src/util/` contains logging and small helpers. `src/jailer/` and `src/net/` are scaffolds for future phases.
-- Docs and plans live in repo root (`README.md`, `PHASES.md`, `m80-prd.md`, `m80-execution-plan.md`).
-- Build outputs are under `zig-out/` and `.zig-cache/` (do not commit).
+- `src/` holds Zig source. Entry point is `src/main.zig`.
+- `src/cli/` contains argument parsing, help text, runtime control helpers, and command implementations.
+- `src/core/` contains config, state, path, and error handling.
+- `src/vm/` contains the platform dispatcher, hypervisor backends, virtio devices, boot helpers, guest memory helpers, and snapshot code.
+- `src/fs/`, `src/net/`, and `src/jailer/` contain filesystem sharing, network policy/vmnet support, and platform hardening code.
+- `src/util/` contains logging and path safety helpers.
+- `docs/PROJECT.md` is the canonical project guide. Keep active status, roadmap, QA notes, and operational runbooks there.
+- Build outputs live under `zig-out/` and `.zig-cache/` and should not be committed.
 
 ## Build, Test, and Development Commands
-- `zig build` — builds the `m80` CLI.
-- `zig build run -- <args>` — runs the CLI (e.g., `zig build run -- help`).
-- `zig build test` — runs the full test suite (uses `src/all_tests.zig` and `src/test_runner.zig`).
+- `zig build` builds the `m80` CLI.
+- `zig build run -- <args>` runs the CLI, for example `zig build run -- help`.
+- `zig build test` runs the full test suite through `src/all_tests.zig` and `src/test_runner.zig`.
+- `make initramfs`, `make hvf-smoke`, and `make hvf-reliability` run optional HVF integration helpers when local images and host support are available.
 
 ## Coding Style & Naming Conventions
-- Follow Zig standard formatting (use `zig fmt` when in doubt).
-- Indentation is 2 spaces, aligned with existing files.
-- Use descriptive names for VM-related config keys (e.g., `kernel_path`, `initrd_path`).
-- Prefer explicit error handling and early returns.
+- Follow Zig standard formatting with `zig fmt`.
+- Indentation is 2 spaces, matching the existing source.
+- Prefer descriptive VM config keys such as `kernel_path`, `initrd_path`, and `network_mode`.
+- Use explicit error handling and early returns.
+- Keep `src/main.zig` focused on parsing, dispatch, and top-level error mapping. Put command logic under `src/cli/commands/`.
 
 ## Testing Guidelines
-- Tests are Zig unit tests co-located with source files and aggregated via `src/all_tests.zig`.
-- Name tests with a short scope prefix, e.g., `config: ...`, `state: ...`, `smoke: ...`.
-- Run `zig build test` after adding or modifying tests.
-- Integration tests may be gated by environment variables (e.g., Windows WHP tests).
+- Tests are Zig unit tests co-located with source files and aggregated by `src/all_tests.zig`.
+- Name tests with a short scope prefix, for example `config: ...`, `state: ...`, or `smoke: ...`.
+- Run `zig build test` after modifying behavior or tests.
+- Integration tests must stay gated by explicit environment variables because WHP, HVF, KVM, vmnet, and boot images are host-specific.
+
+## Documentation Guidelines
+- Do not add new dated phase, TODO, or session-log markdown files.
+- Update `docs/PROJECT.md` when status, roadmap, QA snapshots, integration commands, or operational notes change.
+- Keep `README.md` as a concise user-facing entry point.
 
 ## Commit & Pull Request Guidelines
-- No formal commit convention is documented. Use short, descriptive commit messages.
-- PRs should include a concise summary, testing results (`zig build test` output or note), and any relevant context (e.g., required environment variables for integration tests).
+- Use short, descriptive commit messages.
+- PRs should include a concise summary, testing results, and any relevant platform or environment requirements.
 
 ## Security & Configuration Tips
 - VM configs live in each VM directory as `m80.conf`.
-- Kernel/initrd paths can be relative to the VM directory; validate files before starting.
-- Avoid committing local data directories or artifacts.
+- Kernel/initrd/disk paths can be relative to the VM directory; validate files before starting.
+- Network access is locked down by default. `network_mode=open` requires `M80_ALLOW_OPEN_NETWORK=1`.
+- Jailer enforcement mode is controlled by `M80_JAILER_ENFORCEMENT=observe|strict|off`.
+- Avoid committing local data directories, boot images, disk images, credentials, or generated archives.
