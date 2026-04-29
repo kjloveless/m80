@@ -153,10 +153,26 @@ pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
     );
     try endNode(allocator, &struct_buf);
 
+    try beginNode(allocator, &struct_buf, "clk24m");
+    try propString(allocator, &struct_buf, &strings, "compatible", "fixed-clock");
+    try propU32(allocator, &struct_buf, &strings, "#clock-cells", 0);
+    try propU32(allocator, &struct_buf, &strings, "clock-frequency", 24_000_000);
+    try propU32(allocator, &struct_buf, &strings, "phandle", 2);
+    try endNode(allocator, &struct_buf);
+
+    try beginNode(allocator, &struct_buf, "apb-pclk");
+    try propString(allocator, &struct_buf, &strings, "compatible", "fixed-clock");
+    try propU32(allocator, &struct_buf, &strings, "#clock-cells", 0);
+    try propU32(allocator, &struct_buf, &strings, "clock-frequency", 24_000_000);
+    try propU32(allocator, &struct_buf, &strings, "phandle", 3);
+    try endNode(allocator, &struct_buf);
+
     try beginNode(allocator, &struct_buf, "pl011@9000000");
     try propStrings(allocator, &struct_buf, &strings, "compatible", &.{ "arm,pl011", "arm,primecell" });
     try propReg64(allocator, &struct_buf, &strings, "reg", 0x09000000, 0x1000);
     try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.uart_irq, 4);
+    try propU32x2(allocator, &struct_buf, &strings, "clocks", 2, 3);
+    try propStrings(allocator, &struct_buf, &strings, "clock-names", &.{ "uartclk", "apb_pclk" });
     try propU32(allocator, &struct_buf, &strings, "clock-frequency", 24_000_000);
     try propString(allocator, &struct_buf, &strings, "status", "okay");
     try endNode(allocator, &struct_buf);

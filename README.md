@@ -9,8 +9,8 @@ See [docs/PROJECT.md](docs/PROJECT.md) for the canonical project status, roadmap
 - CLI control plane is implemented; there is no daemon or REST API yet.
 - macOS HVF is the most complete backend path.
 - Windows WHP and Linux/POSIX KVM paths exist but still need real-host lifecycle validation.
-- Jailer, mount, networking-policy, virtio device, and snapshot building blocks are implemented with platform-gated integration work still pending.
-- Latest local validation from 2026-04-29: `zig build test` loaded 340 tests; 322 passed, 18 skipped, 0 failed.
+- Jailer, mount, networking-policy, virtio device, and filesystem-image snapshot building blocks are implemented with platform-gated integration work still pending.
+- Latest local validation from 2026-04-29: `zig build test` loaded 348 tests; 328 passed, 20 skipped, 0 failed.
 
 ## Build
 
@@ -31,8 +31,8 @@ m80 stop <name>              stop a running VM
 m80 delete <name>            remove a VM and its files
 m80 ps                       list all VMs and their status
 m80 inspect <name>           show VM details
-m80 snapshot <name> <path>   copy configured VM disk images into a snapshot directory
-m80 restore <name> <path>    restore configured VM disk images from a snapshot directory
+m80 snapshot <name> <path>   copy configured VM disk images into a filesystem-image snapshot directory
+m80 restore <name> <path>    restore configured VM disk images from a filesystem-image snapshot directory
 m80 clone <name> <new-name>  clone a VM config
 m80 help                     show help
 ```
@@ -51,7 +51,7 @@ kernel_path=images/linux
 initrd_path=images/m80-initramfs.cpio.gz
 disk_path=images/rootfs.ext4
 seed_path=images/nocloud-seed.iso
-kernel_cmdline=console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw
+kernel_cmdline=console=ttyAMA0 root=/dev/vda rootwait rw
 network_mode=locked_down
 ```
 
@@ -93,8 +93,9 @@ Each VM lives under `{data}/vms/{name}/`.
 
 ```bash
 make initramfs
-make hvf-smoke KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz EXPECT="m80 initramfs: boot ok"
-make hvf-reliability KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz CYCLES=20
+make hvf-smoke
+make hvf-reliability CYCLES=20
+make hvf-vmnet-policy
 ```
 
 Most integration tests are gated by environment variables and local boot images. Full commands are in [docs/PROJECT.md](docs/PROJECT.md).

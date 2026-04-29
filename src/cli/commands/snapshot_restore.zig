@@ -36,11 +36,11 @@ pub fn runSnapshot(allocator: std.mem.Allocator, name: []const u8, snap_path: []
         errors.die("snapshot result read failed: {s}", .{@errorName(e)});
     }) {
         .ok => {
-            std.debug.print("snapshot saved: {s}\n", .{snap_path});
+            std.debug.print("filesystem-image snapshot saved: {s}\n", .{snap_path});
             return;
         },
-        .failed => |msg| errors.die("snapshot failed: {s}", .{msg}),
-        .timeout => errors.die("snapshot timed out: {s}", .{snap_path}),
+        .failed => |msg| errors.die("filesystem-image snapshot failed: {s}", .{msg}),
+        .timeout => errors.die("filesystem-image snapshot timed out: {s}", .{snap_path}),
     }
 }
 

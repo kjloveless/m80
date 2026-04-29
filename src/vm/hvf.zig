@@ -1967,6 +1967,14 @@ const pl011_reg_fbrd: u64 = 0x28;
 const pl011_reg_lcrh: u64 = 0x2c;
 const pl011_reg_cr: u64 = 0x30;
 const pl011_reg_imsc: u64 = 0x38;
+const pl011_reg_periph_id0: u64 = 0xfe0;
+const pl011_reg_periph_id1: u64 = 0xfe4;
+const pl011_reg_periph_id2: u64 = 0xfe8;
+const pl011_reg_periph_id3: u64 = 0xfec;
+const pl011_reg_pcell_id0: u64 = 0xff0;
+const pl011_reg_pcell_id1: u64 = 0xff4;
+const pl011_reg_pcell_id2: u64 = 0xff8;
+const pl011_reg_pcell_id3: u64 = 0xffc;
 
 const pl011_int_rx: u32 = 1 << 4;
 const pl011_int_tx: u32 = 1 << 5;
@@ -2119,6 +2127,14 @@ fn handlePl011Mmio(offset: u64, is_write: bool, size: usize, value: u64) u64 {
     if (offset == pl011_reg_lcrh) return pl011_state.lcrh;
     if (offset == pl011_reg_cr) return pl011_state.cr;
     if (offset == pl011_reg_imsc) return pl011_state.imsc;
+    if (offset == pl011_reg_periph_id0) return 0x11;
+    if (offset == pl011_reg_periph_id1) return 0x10;
+    if (offset == pl011_reg_periph_id2) return 0x14;
+    if (offset == pl011_reg_periph_id3) return 0x00;
+    if (offset == pl011_reg_pcell_id0) return 0x0d;
+    if (offset == pl011_reg_pcell_id1) return 0xf0;
+    if (offset == pl011_reg_pcell_id2) return 0x05;
+    if (offset == pl011_reg_pcell_id3) return 0xb1;
     return 0;
 }
 
@@ -2163,18 +2179,11 @@ fn shouldEnableSerialStdin(allocator: std.mem.Allocator) bool {
 }
 
 fn appendSerialInput(bytes: []const u8) void {
-    if (virtio.virtio_console_state.enabled) {
-        const queue = &virtio.virtio_console_state.queues[0];
-        virtio.appendVirtioConsoleInput(bytes);
-        virtio.processVirtioConsoleRxQueue() catch |e| {
-            log.warn("hvf virtio-console rx process failed: {s} ready={} num={d}", .{
-                @errorName(e),
-                queue.ready,
-                queue.num,
-            });
-        };
-    }
     serial_io.append(std.heap.page_allocator, bytes);
+    if (serial_io.hasData()) {
+        pl011_state.pending |= pl011_int_rx;
+        updateUartInterrupt();
+    }
 }
 
 // =============================================================================
@@ -3494,7 +3503,7 @@ pub fn start(cfg: config.VmConfig) !void {
         } else |e| {
             if (e == vmnet.VmnetError.NotAuthorized or e == vmnet.VmnetError.StartFailed) {
                 log.warn(
-                    "hvf vmnet unavailable (check vmnet entitlement/codesign; enable with M80_VMNET_ENTITLEMENTS=1 at build)",
+                    "hvf vmnet unavailable (check codesign.conf binary signing or use M80_TEST_VMNET_ENTITLEMENTS=1 for vmnet integration tests)",
                     .{},
                 );
             } else {
@@ -3776,9 +3785,6 @@ pub fn start(cfg: config.VmConfig) !void {
         simulate_io.store(true, .seq_cst);
     }
     serial_io.setFromEnv(std.heap.page_allocator);
-    if (virtio.virtio_console_state.enabled) {
-        virtio.setVirtioConsoleInputFromEnv(std.heap.page_allocator);
-    }
     serial.setCaptureFromEnv(std.heap.page_allocator);
     serial.clearConsoleBacklog();
     if (startConsoleSocketServer(std.heap.page_allocator)) {
@@ -4383,6 +4389,23 @@ test "hvf: pl011 mmio reflects serial buffer" {
     try std.testing.expect((fr_empty & (1 << 4)) != 0);
 }
 
+test "hvf: console input uses one guest input path" {
+    serial_io.clear(std.testing.allocator);
+    defer serial_io.clear(std.testing.allocator);
+    virtio.resetVirtioConsoleState();
+    defer virtio.resetVirtioConsoleState();
+    virtio.setupVirtioConsole(true);
+    resetPl011State();
+
+    appendSerialInput("x");
+
+    try std.testing.expectEqual(@as(usize, 0), virtio.virtioConsoleInputLen());
+    const byte = handlePl011Mmio(pl011_reg_dr, false, 1, 0);
+    try std.testing.expectEqual(@as(u8, 'x'), @as(u8, @intCast(byte)));
+    const fr_empty = handlePl011Mmio(pl011_reg_fr, false, 4, 0);
+    try std.testing.expect((fr_empty & (1 << 4)) != 0);
+}
+
 test "hvf: setupGic no-op off macos arm64" {
     if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return error.SkipZigTest;
     gic_enabled = false;
@@ -4456,9 +4479,9 @@ test "smoke: hvf arm64 boot emits serial output" {
     cfg_mut.kernel_cmdline = try std.testing.allocator.dupe(
         u8,
         if (disk != null)
-            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8"
+            "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8 m80.smoke=1"
         else
-            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 loglevel=8",
+            "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 loglevel=8 m80.smoke=1",
     );
 
     const start_ms: i64 = std.time.milliTimestamp();
@@ -4563,9 +4586,9 @@ test "smoke: hvf arm64 repeated start-stop reliability" {
     cfg_mut.kernel_cmdline = try std.testing.allocator.dupe(
         u8,
         if (disk != null)
-            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8"
+            "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8 m80.smoke=1"
         else
-            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 loglevel=8",
+            "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 loglevel=8 m80.smoke=1",
     );
 
     var cycle: usize = 0;
@@ -4601,6 +4624,83 @@ test "smoke: hvf arm64 repeated start-stop reliability" {
         try stop();
         try expectLifecycleReset();
     }
+}
+
+test "smoke: hvf arm64 initramfs shell accepts uptime" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
+    const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    defer if (kernel) |k| std.testing.allocator.free(k);
+    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    defer if (initrd) |i| std.testing.allocator.free(i);
+    if (kernel == null or initrd == null) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
+    defer std.testing.allocator.free(out_path);
+
+    var out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+    out_file.close();
+
+    const name_z = try allocZ(std.testing.allocator, "M80_SERIAL_OUT");
+    defer std.testing.allocator.free(name_z);
+    const path_z = try allocZ(std.testing.allocator, out_path);
+    defer std.testing.allocator.free(path_z);
+    if (setenv(name_z, path_z, 1) != 0) return error.SkipZigTest;
+    defer _ = unsetenv(name_z);
+
+    const console_z = try allocZ(std.testing.allocator, "M80_VIRTIO_CONSOLE");
+    defer std.testing.allocator.free(console_z);
+    const console_val_z = try allocZ(std.testing.allocator, "1");
+    defer std.testing.allocator.free(console_val_z);
+    _ = setenv(console_z, console_val_z, 1);
+    defer _ = unsetenv(console_z);
+
+    const cfg = try config.defaultConfig(std.testing.allocator, "test");
+    var cfg_mut = cfg;
+    defer config.freeConfig(std.testing.allocator, &cfg_mut);
+    cfg_mut.kernel_path = try std.testing.allocator.dupe(u8, kernel.?);
+    cfg_mut.initrd_path = try std.testing.allocator.dupe(u8, initrd.?);
+    cfg_mut.kernel_cmdline = try std.testing.allocator.dupe(
+        u8,
+        "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 loglevel=8 m80.smoke=1",
+    );
+
+    var started = false;
+    start(cfg_mut) catch |e| {
+        std.debug.print("hvf initramfs shell test start failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    started = true;
+    defer if (started) stop() catch {};
+
+    var sent_uptime = false;
+    var saw_uptime = false;
+    var tries: usize = 0;
+    while (tries < 40) : (tries += 1) {
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+        if (!sent_uptime and serial.captureContains("m80 initramfs: boot ok")) {
+            appendSerialInput("uptime\n");
+            sent_uptime = true;
+        }
+        if (serial.captureContains("m80 shell: uptime_ms=")) {
+            saw_uptime = true;
+            break;
+        }
+    }
+
+    if (!saw_uptime) {
+        std.debug.print(
+            "hvf initramfs shell capture path={s} mem_len={d}\n",
+            .{ out_path, serial.captureLen() },
+        );
+    }
+
+    try std.testing.expect(sent_uptime);
+    try std.testing.expect(saw_uptime);
 }
 
 test "hvf: integration allowlist blocks non-whitelisted dns egress via virtio-net tx path" {
@@ -4702,9 +4802,9 @@ test "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled" 
     cfg_mut.kernel_cmdline = try std.testing.allocator.dupe(
         u8,
         if (disk != null)
-            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8"
+            "console=ttyAMA0 root=/dev/vda rootwait rw loglevel=8"
         else
-            "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 loglevel=8",
+            "console=ttyAMA0 loglevel=8",
     );
 
     var started = false;
@@ -4775,7 +4875,7 @@ test "hvf: arm64 boot accepts console input" {
     cfg_mut.disk_readonly = false;
     cfg_mut.kernel_cmdline = try std.testing.allocator.dupe(
         u8,
-        if (cmdline) |value| value else "earlycon=pl011,0x09000000 console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw loglevel=8",
+        if (cmdline) |value| value else "console=ttyAMA0 root=/dev/vda rootwait rw loglevel=8",
     );
 
     var started = false;
@@ -4801,19 +4901,13 @@ test "hvf: arm64 boot accepts console input" {
         std.Thread.sleep(500 * std.time.ns_per_ms);
         if (!saw_prompt and serial.captureContains("login:")) {
             saw_prompt = true;
-            virtio.appendVirtioConsoleInput(user_line);
-            virtio.appendVirtioConsoleInput("\n");
-            virtio.processVirtioConsoleRxQueue() catch |e| {
-                std.debug.print("hvf login rx failed: {s}\n", .{@errorName(e)});
-            };
+            appendSerialInput(user_line);
+            appendSerialInput("\n");
         }
         if (saw_prompt and !saw_password and serial.captureContains("Password:")) {
             saw_password = true;
-            virtio.appendVirtioConsoleInput(pass_line);
-            virtio.appendVirtioConsoleInput("\n");
-            virtio.processVirtioConsoleRxQueue() catch |e| {
-                std.debug.print("hvf password rx failed: {s}\n", .{@errorName(e)});
-            };
+            appendSerialInput(pass_line);
+            appendSerialInput("\n");
         }
         if (serial.captureContains(login_expect.?)) {
             saw_shell = true;

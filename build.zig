@@ -77,6 +77,16 @@ fn readCodesignConfig(allocator: std.mem.Allocator, path: []const u8) !CodesignC
     return cfg;
 }
 
+fn envFlagEnabled(allocator: std.mem.Allocator, name: []const u8) bool {
+    const raw = std.process.getEnvVarOwned(allocator, name) catch return false;
+    defer allocator.free(raw);
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    return true;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -100,7 +110,8 @@ pub fn build(b: *std.Build) void {
         exe.linkLibC();
     }
 
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -152,8 +163,9 @@ pub fn build(b: *std.Build) void {
         ) catch CodesignConfig{};
         defer cfg.deinit(b.allocator);
 
-        const entitlements_name: []const u8 = "entitlements/hvf-entitlements.xml";
-        const entitlements_test_name: []const u8 = "entitlements/hvf-entitlements-test.xml";
+        const entitlements_vmnet_name: []const u8 = "entitlements/hvf-entitlements.xml";
+        const entitlements_hypervisor_name: []const u8 = "entitlements/hvf-entitlements-test.xml";
+        const entitlements_test_vmnet_name: []const u8 = "entitlements/hvf-entitlements-vmnet.xml";
         var codesign_identity: []const u8 = cfg.identity orelse "-";
         var codesign_identity_buf: ?[]u8 = null;
         if (std.process.getEnvVarOwned(b.allocator, "M80_CODESIGN_IDENTITY") catch null) |value| {
@@ -174,8 +186,15 @@ pub fn build(b: *std.Build) void {
                 b.allocator.free(value);
             }
         }
-        const entitlements = b.path(entitlements_name);
-        const entitlements_test = b.path(entitlements_test_name);
+        const entitlements_main_name = if (cfg.vmnet_entitlements)
+            entitlements_vmnet_name
+        else
+            entitlements_hypervisor_name;
+        const entitlements = b.path(entitlements_main_name);
+        const entitlements_test = b.path(if (envFlagEnabled(b.allocator, "M80_TEST_VMNET_ENTITLEMENTS"))
+            entitlements_test_vmnet_name
+        else
+            entitlements_hypervisor_name);
 
         const sign_exe = b.addSystemCommand(&[_][]const u8{
             "codesign",
@@ -185,11 +204,15 @@ pub fn build(b: *std.Build) void {
         if (codesign_keychain) |kc| {
             sign_exe.addArgs(&[_][]const u8{ "--keychain", kc });
         }
+        if (cfg.vmnet_entitlements) {
+            sign_exe.addArgs(&[_][]const u8{ "--identifier", "co.themissile.m80" });
+        }
         sign_exe.addArg("--entitlements");
         sign_exe.addFileArg(entitlements);
         sign_exe.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
         sign_exe.addFileArg(exe.getEmittedBin());
         sign_exe.step.dependOn(&exe.step);
+        run_cmd.step.dependOn(&sign_exe.step);
 
         const sign_installed = b.addSystemCommand(&[_][]const u8{
             "codesign",
@@ -199,11 +222,15 @@ pub fn build(b: *std.Build) void {
         if (codesign_keychain) |kc| {
             sign_installed.addArgs(&[_][]const u8{ "--keychain", kc });
         }
+        if (cfg.vmnet_entitlements) {
+            sign_installed.addArgs(&[_][]const u8{ "--identifier", "co.themissile.m80" });
+        }
         sign_installed.addArg("--entitlements");
         sign_installed.addFileArg(entitlements);
         sign_installed.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
         sign_installed.addArg(b.getInstallPath(.bin, exe.name));
-        sign_installed.step.dependOn(b.getInstallStep());
+        sign_installed.step.dependOn(&install_exe.step);
+        b.getInstallStep().dependOn(&sign_installed.step);
 
         const sign_tests = b.addSystemCommand(&[_][]const u8{
             "codesign",
@@ -214,85 +241,11 @@ pub fn build(b: *std.Build) void {
             sign_tests.addArgs(&[_][]const u8{ "--keychain", kc });
         }
         sign_tests.addArg("--entitlements");
-        sign_tests.addFileArg(entitlements_test); // Use test entitlements without vmnet
+        sign_tests.addFileArg(entitlements_test);
         sign_tests.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
         sign_tests.addFileArg(unit_tests.getEmittedBin());
         sign_tests.step.dependOn(&unit_tests.step);
         run_unit_tests.step.dependOn(&sign_tests.step);
-
-        // Create app bundle with vmnet entitlements and provisioning profile
-        if (cfg.vmnet_entitlements and cfg.provisioning_profile != null) {
-            const app_bundle_step = b.step("bundle", "create m80.app bundle with vmnet support");
-            const bundle_path = b.getInstallPath(.bin, "m80.app");
-
-            // Create bundle directory structure (depends on signed exe, not install)
-            const mkdir_contents = b.addSystemCommand(&[_][]const u8{
-                "mkdir", "-p",
-            });
-            mkdir_contents.addArg(b.fmt("{s}/Contents/MacOS", .{bundle_path}));
-            mkdir_contents.step.dependOn(&sign_exe.step);
-
-            // Copy binary to bundle (use the build output, not installed)
-            const copy_binary = b.addSystemCommand(&[_][]const u8{ "cp" });
-            copy_binary.addFileArg(exe.getEmittedBin());
-            copy_binary.addArg(b.fmt("{s}/Contents/MacOS/{s}", .{ bundle_path, exe.name }));
-            copy_binary.step.dependOn(&mkdir_contents.step);
-
-            // Write Info.plist using shell to avoid install step dependency
-            const write_plist = b.addSystemCommand(&[_][]const u8{ "sh", "-c" });
-            write_plist.addArg(b.fmt(
-                \\cat > {s}/Contents/Info.plist << 'PLIST_EOF'
-                \\<?xml version="1.0" encoding="UTF-8"?>
-                \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                \\<plist version="1.0">
-                \\<dict>
-                \\    <key>CFBundleExecutable</key>
-                \\    <string>m80</string>
-                \\    <key>CFBundleIdentifier</key>
-                \\    <string>co.themissile.m80</string>
-                \\    <key>CFBundleName</key>
-                \\    <string>m80</string>
-                \\    <key>CFBundleVersion</key>
-                \\    <string>1.0</string>
-                \\    <key>CFBundleShortVersionString</key>
-                \\    <string>1.0</string>
-                \\    <key>LSMinimumSystemVersion</key>
-                \\    <string>11.0</string>
-                \\</dict>
-                \\</plist>
-                \\PLIST_EOF
-            , .{bundle_path}));
-            write_plist.step.dependOn(&copy_binary.step);
-
-            // Copy provisioning profile (expand ~ in path)
-            const profile_path = cfg.provisioning_profile.?;
-            const copy_profile = b.addSystemCommand(&[_][]const u8{ "sh", "-c" });
-            copy_profile.addArg(b.fmt("cp {s} {s}/Contents/embedded.provisionprofile", .{ profile_path, bundle_path }));
-            copy_profile.step.dependOn(&write_plist.step);
-
-            // Sign the bundle
-            const sign_bundle = b.addSystemCommand(&[_][]const u8{
-                "codesign",
-                "--sign",
-                codesign_identity,
-            });
-            if (codesign_keychain) |kc| {
-                sign_bundle.addArgs(&[_][]const u8{ "--keychain", kc });
-            }
-            sign_bundle.addArg("--entitlements");
-            sign_bundle.addFileArg(entitlements);
-            sign_bundle.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
-            sign_bundle.addArg(bundle_path);
-            sign_bundle.step.dependOn(&copy_profile.step);
-
-            app_bundle_step.dependOn(&sign_bundle.step);
-
-            // Make bundle part of default install
-            b.getInstallStep().dependOn(&sign_bundle.step);
-            run_cmd.step.dependOn(&sign_bundle.step);
-        } else {
-            run_cmd.step.dependOn(&sign_installed.step);
-        }
 
         if (codesign_identity_buf) |buf| b.allocator.free(buf);
         if (codesign_keychain_buf) |buf| b.allocator.free(buf);

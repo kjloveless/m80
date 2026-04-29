@@ -13,17 +13,66 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+static int broadcast_output = 0;
+
 static void write_line(const char *msg) {
   const char *suffix = "\n";
-  int fd = open("/dev/console", O_WRONLY | O_NOCTTY);
-  if (fd < 0) {
-    fd = open("/dev/kmsg", O_WRONLY | O_NOCTTY);
+  if (broadcast_output) {
+    const char *paths[] = {
+        "/dev/hvc0",
+        "/dev/ttyAMA0",
+        "/dev/console",
+        "/dev/kmsg",
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+      int flags = O_WRONLY | O_NOCTTY | O_NONBLOCK;
+      if (strcmp(paths[i], "/dev/hvc0") == 0) {
+        flags = O_RDWR | O_NOCTTY | O_NONBLOCK;
+      }
+      int fd = open(paths[i], flags);
+      if (fd >= 0) {
+        write(fd, msg, strlen(msg));
+        write(fd, suffix, 1);
+        close(fd);
+      }
+    }
+    return;
   }
+
+  const char *paths[] = {
+      "/dev/ttyAMA0",
+      "/dev/console",
+  };
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    int fd = open(paths[i], O_WRONLY | O_NOCTTY | O_NONBLOCK);
+    if (fd >= 0) {
+      write(fd, msg, strlen(msg));
+      write(fd, suffix, 1);
+      close(fd);
+      return;
+    }
+  }
+}
+
+static void write_kmsg_line(const char *msg) {
+  int fd = open("/dev/kmsg", O_WRONLY | O_NOCTTY | O_NONBLOCK);
   if (fd >= 0) {
     write(fd, msg, strlen(msg));
-    write(fd, suffix, 1);
+    write(fd, "\n", 1);
     close(fd);
   }
+}
+
+static void yield_cpu(void) {
+  syscall(SYS_sched_yield);
+}
+
+static int open_console_path(const char *path) {
+  return open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+}
+
+static int open_input_path(const char *path) {
+  return open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK);
 }
 
 static int load_module_file(const char *path) {
@@ -100,6 +149,32 @@ static void load_required_modules(void) {
   }
 }
 
+static void load_console_modules(void) {
+  const char *modules[] = {
+      "/lib/modules/6.1.0-42-cloud-arm64/kernel/drivers/virtio/virtio.ko",
+      "/lib/modules/6.1.0-42-cloud-arm64/kernel/drivers/virtio/virtio_ring.ko",
+      "/lib/modules/6.1.0-42-cloud-arm64/kernel/drivers/virtio/virtio_mmio.ko",
+      "/lib/modules/6.1.0-42-cloud-arm64/kernel/drivers/char/virtio_console.ko",
+  };
+  for (size_t i = 0; i < sizeof(modules) / sizeof(modules[0]); i++) {
+    if (load_module_file(modules[i]) != 0) {
+      write_line("m80 initramfs: console module load failed");
+    }
+  }
+}
+
+static void start_console_modules(void) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    load_console_modules();
+    _exit(0);
+  }
+  if (pid < 0) {
+    write_line("m80 initramfs: console module fork failed");
+    load_console_modules();
+  }
+}
+
 static void ensure_dev_nodes(void) {
   mkdir("/dev", 0755);
   if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) != 0) {
@@ -127,23 +202,23 @@ static long read_uptime_ms(void) {
 }
 
 static int open_console(void) {
-  int fd = open("/dev/console", O_RDWR | O_NOCTTY);
-  if (fd < 0) {
-    mknod("/dev/console", S_IFCHR | 0600, makedev(5, 1));
-    fd = open("/dev/console", O_RDWR | O_NOCTTY);
+  mknod("/dev/ttyAMA0", S_IFCHR | 0600, makedev(204, 64));
+  for (int i = 0; i < 200000; i++) {
+    int fd = open_input_path("/dev/ttyAMA0");
+    if (fd >= 0) {
+      return fd;
+    }
+    yield_cpu();
   }
-  if (fd < 0) {
-    fd = open("/dev/ttyAMA0", O_RDWR | O_NOCTTY);
+
+  mknod("/dev/hvc0", S_IFCHR | 0600, makedev(229, 0));
+  for (;;) {
+    int fd = open_input_path("/dev/hvc0");
+    if (fd >= 0) {
+      return fd;
+    }
+    yield_cpu();
   }
-  if (fd < 0) {
-    fd = open("/dev/ttyS0", O_RDWR | O_NOCTTY);
-  }
-  if (fd >= 0) {
-    dup2(fd, 0);
-    dup2(fd, 1);
-    dup2(fd, 2);
-  }
-  return fd;
 }
 
 static int read_cmdline(char *buf, size_t max) {
@@ -183,13 +258,19 @@ static int cmdline_has_token(const char *cmdline, const char *token) {
   size_t len = strlen(token);
   const char *p = cmdline;
   while (*p) {
-    while (*p == ' ') p++;
-    if (strncmp(p, token, len) == 0 && (p[len] == '\0' || p[len] == ' ')) {
+    while (*p == ' ' || *p == '\n' || *p == '\r') p++;
+    if (strncmp(p, token, len) == 0 &&
+        (p[len] == '\0' || p[len] == ' ' || p[len] == '\n' || p[len] == '\r')) {
       return 1;
     }
-    while (*p && *p != ' ') p++;
+    while (*p && *p != ' ' && *p != '\n' && *p != '\r') p++;
   }
   return 0;
+}
+
+static int cmdline_has_root(const char *cmdline) {
+  char root_dev[256];
+  return find_param_value(cmdline, "root", root_dev, sizeof(root_dev)) == 0;
 }
 
 static int wait_for_path(const char *path, int attempts, int delay_ms) {
@@ -650,6 +731,13 @@ static ssize_t read_line(int fd, char *buf, size_t max) {
   while (pos + 1 < max) {
     char c = 0;
     ssize_t n = read(fd, &c, 1);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      if (pos == 0) {
+        return 0;
+      }
+      yield_cpu();
+      continue;
+    }
     if (n <= 0) {
       return -1;
     }
@@ -666,11 +754,22 @@ static ssize_t read_line(int fd, char *buf, size_t max) {
 }
 
 static void write_prompt(void) {
-  const char *prompt = "m80> ";
-  write(1, prompt, strlen(prompt));
+}
+
+static void shell_write_line(const char *msg) {
+  int fd = open("/dev/ttyAMA0", O_WRONLY | O_NOCTTY | O_NONBLOCK);
+  if (fd >= 0) {
+    write(fd, msg, strlen(msg));
+    write(fd, "\n", 1);
+    close(fd);
+  }
+  if (broadcast_output) {
+    write_kmsg_line(msg);
+  }
 }
 
 static void shell_loop(void) {
+  write_kmsg_line("m80 initramfs: entering shell loop");
   int fd = open_console();
   if (fd < 0) {
     write_line("m80 initramfs: console unavailable");
@@ -678,13 +777,21 @@ static void shell_loop(void) {
       sleep(1);
     }
   }
+  write_kmsg_line("m80 initramfs: shell console open");
+  shell_write_line("m80 initramfs: shell console open");
 
   for (;;) {
     char line[256];
-    write_prompt();
+    static int prompt_pending = 1;
+    if (prompt_pending) {
+      write_prompt();
+      prompt_pending = 0;
+    }
     if (read_line(fd, line, sizeof(line)) <= 0) {
+      yield_cpu();
       continue;
     }
+    prompt_pending = 1;
     char *cmd = line;
     while (*cmd == ' ' || *cmd == '\t') {
       cmd++;
@@ -693,7 +800,7 @@ static void shell_loop(void) {
       continue;
     }
     if (strcmp(cmd, "help") == 0) {
-      write_line("m80 shell: help uptime echo reboot poweroff halt");
+      shell_write_line("m80 shell: help uptime echo reboot poweroff halt");
       continue;
     }
     if (strcmp(cmd, "uptime") == 0) {
@@ -701,14 +808,14 @@ static void shell_loop(void) {
       if (uptime_ms >= 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "m80 shell: uptime_ms=%ld", uptime_ms);
-        write_line(buf);
+        shell_write_line(buf);
       } else {
-        write_line("m80 shell: uptime_ms=unavailable");
+        shell_write_line("m80 shell: uptime_ms=unavailable");
       }
       continue;
     }
     if (strncmp(cmd, "echo ", 5) == 0) {
-      write_line(cmd + 5);
+      shell_write_line(cmd + 5);
       continue;
     }
     if (strcmp(cmd, "reboot") == 0) {
@@ -721,7 +828,7 @@ static void shell_loop(void) {
       reboot(RB_POWER_OFF);
       continue;
     }
-    write_line("m80 shell: unknown command");
+    shell_write_line("m80 shell: unknown command");
   }
 }
 
@@ -733,11 +840,26 @@ int main(void) {
   mount("proc", "/proc", "proc", 0, NULL);
   mount("sysfs", "/sys", "sysfs", 0, NULL);
 
+  char cmdline[1024] = {0};
+  int have_cmdline = read_cmdline(cmdline, sizeof(cmdline)) == 0;
+  if (have_cmdline && (cmdline_has_token(cmdline, "m80.smoke=1") || cmdline_has_token(cmdline, "m80.console_broadcast=1"))) {
+    broadcast_output = 1;
+  }
+
+  if (broadcast_output) {
+    write_line("m80 initramfs: boot ok");
+  }
+  if (!have_cmdline || !cmdline_has_root(cmdline)) {
+    write_line("m80 initramfs: rootless shell mode");
+    start_console_modules();
+    write_line("m80 initramfs: console modules started");
+    shell_loop();
+  }
+
   load_required_modules();
 
-  write_line("m80 initramfs: boot ok");
-  write_line("m80 initramfs: hello, world");
-  {
+  if (broadcast_output) {
+    write_line("m80 initramfs: hello, world");
     long uptime_ms = read_uptime_ms();
     if (uptime_ms >= 0) {
       char buf[128];

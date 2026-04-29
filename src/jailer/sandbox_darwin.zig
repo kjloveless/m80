@@ -15,8 +15,6 @@
 //!
 //! ## VMM Profile Permissions
 //! The VMM profile allows only what's needed for hypervisor operation:
-//! - `hv-create`: Create Hypervisor Framework VMs
-//! - `mach-vm*`: Virtual memory operations for guest RAM
 //! - `mach-lookup`: Access Mach services
 //! - File read for kernel/initrd images
 //! - Optional network access
@@ -43,9 +41,18 @@ pub const VmmSandboxOptions = struct {
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
     disk_path: ?[]const u8 = null,
+    disk_readonly: bool = false,
     seed_path: ?[]const u8 = null,
     data_disk_path: ?[]const u8 = null,
+    data_disk_readonly: bool = false,
+    mount_roots: []const []const u8 = &.{},
+    shared_paths: []const SharedPath = &.{},
     allow_network: bool = false,
+};
+
+pub const SharedPath = struct {
+    path: []const u8,
+    writable: bool = false,
 };
 
 pub const SandboxProfile = struct {
@@ -76,30 +83,47 @@ pub const SandboxProfile = struct {
         try w.writeAll("(allow signal (target self))\n");
         try w.writeAll("(allow process-info* (target self))\n\n");
 
-        try w.writeAll("(allow mach-vm*)\n");
-        try w.writeAll("(allow hv-create)\n\n");
+        // Hypervisor entitlement checks are handled by code signing. Sandbox.framework
+        // does not expose public SBPL operations for HVF create/map calls.
 
         if (options.vm_directory) |vm_dir| {
-            try w.print("(allow file-read* (subpath \"{s}\"))\n", .{vm_dir});
+            try writePathRule(w, "file-read*", "subpath", vm_dir);
             if (options.allow_write_vm_dir) {
-                try w.print("(allow file-write* (subpath \"{s}\"))\n", .{vm_dir});
+                try writePathRule(w, "file-write*", "subpath", vm_dir);
             }
         }
 
+        try w.writeAll("(allow file-read-metadata)\n");
+
         if (options.kernel_path) |kernel| {
-            try w.print("(allow file-read* (literal \"{s}\"))\n", .{kernel});
+            try writePathRule(w, "file-read*", "literal", kernel);
         }
         if (options.initrd_path) |initrd| {
-            try w.print("(allow file-read* (literal \"{s}\"))\n", .{initrd});
+            try writePathRule(w, "file-read*", "literal", initrd);
         }
         if (options.disk_path) |disk| {
-            try w.print("(allow file-read* (literal \"{s}\"))\n", .{disk});
+            try writePathRule(w, "file-read*", "literal", disk);
+            if (!options.disk_readonly) {
+                try writePathRule(w, "file-write*", "literal", disk);
+            }
         }
         if (options.seed_path) |seed| {
-            try w.print("(allow file-read* (literal \"{s}\"))\n", .{seed});
+            try writePathRule(w, "file-read*", "literal", seed);
         }
         if (options.data_disk_path) |data_disk| {
-            try w.print("(allow file-read* (literal \"{s}\"))\n", .{data_disk});
+            try writePathRule(w, "file-read*", "literal", data_disk);
+            if (!options.data_disk_readonly) {
+                try writePathRule(w, "file-write*", "literal", data_disk);
+            }
+        }
+        for (options.mount_roots) |root| {
+            try writePathRule(w, "file-read*", "subpath", root);
+        }
+        for (options.shared_paths) |shared| {
+            try writePathRule(w, "file-read*", "subpath", shared.path);
+            if (shared.writable) {
+                try writePathRule(w, "file-write*", "subpath", shared.path);
+            }
         }
 
         try w.writeAll("\n(allow file-read* (subpath \"/System/Library/Frameworks\"))\n");
@@ -149,9 +173,9 @@ pub const SandboxProfile = struct {
         @memcpy(profile_z[0..self.profile.items.len], self.profile.items);
 
         var error_buf: ?[*:0]u8 = null;
-        const SANDBOX_NAMED: u64 = 0x0001;
 
-        const result = sandbox_init_fn.?(profile_z, SANDBOX_NAMED, &error_buf);
+        // Passing zero tells sandbox_init that profile_z is an SBPL source string.
+        const result = sandbox_init_fn.?(profile_z, 0, &error_buf);
         if (result != 0) {
             if (error_buf) |err| {
                 log.err("sandbox_init failed: {s}", .{err});
@@ -165,6 +189,35 @@ pub const SandboxProfile = struct {
         log.info("macOS sandbox applied", .{});
     }
 };
+
+fn writeSbplString(writer: anytype, value: []const u8) !void {
+    try writer.writeByte('"');
+    for (value) |ch| {
+        switch (ch) {
+            '\\', '"' => {
+                try writer.writeByte('\\');
+                try writer.writeByte(ch);
+            },
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try writer.print("\\x{x:0>2}", .{ch});
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn writePathRule(writer: anytype, operation: []const u8, predicate: []const u8, path: []const u8) !void {
+    try writer.print("(allow {s} ({s} ", .{ operation, predicate });
+    try writeSbplString(writer, path);
+    try writer.writeAll("))\n");
+}
 
 pub fn applyVmmSandbox(allocator: std.mem.Allocator, options: VmmSandboxOptions) SandboxError!void {
     if (builtin.os.tag != .macos) return;
@@ -202,7 +255,7 @@ test "sandbox_darwin: SandboxProfile buildVmmProfile" {
     try std.testing.expect(s.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, s, "(version 1)") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "(deny default)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "hv-create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "mach-lookup") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "/Users/test/vms/myvm") != null);
 }
 
@@ -259,6 +312,22 @@ test "sandbox_darwin: profile with initrd path" {
     try std.testing.expect(std.mem.indexOf(u8, s, "/path/to/initrd") != null);
 }
 
+test "sandbox_darwin: paths are SBPL escaped" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{
+        .vm_directory = "/tmp/m80 \"quoted\"",
+        .kernel_path = "/tmp/m80\\kernel\npath",
+    });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "(subpath \"/tmp/m80 \\\"quoted\\\"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(literal \"/tmp/m80\\\\kernel\\npath\")") != null);
+}
+
 test "sandbox_darwin: profile with disk path" {
     const allocator = std.testing.allocator;
 
@@ -271,6 +340,23 @@ test "sandbox_darwin: profile with disk path" {
 
     const s = profile.getProfileString();
     try std.testing.expect(std.mem.indexOf(u8, s, "/path/to/disk.img") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-write* (literal \"/path/to/disk.img\"))") != null);
+}
+
+test "sandbox_darwin: readonly disk path does not allow writes" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{
+        .disk_path = "/path/to/disk.img",
+        .disk_readonly = true,
+    });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-read* (literal \"/path/to/disk.img\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-write* (literal \"/path/to/disk.img\"))") == null);
 }
 
 test "sandbox_darwin: profile with seed path" {
@@ -301,6 +387,51 @@ test "sandbox_darwin: profile with data disk path" {
     try std.testing.expect(std.mem.indexOf(u8, s, "/path/to/data.img") != null);
 }
 
+test "sandbox_darwin: shared paths use subpath permissions" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    const shared = [_]SharedPath{
+        .{ .path = "/shared/ro", .writable = false },
+        .{ .path = "/shared/rw", .writable = true },
+    };
+    try profile.buildVmmProfile(.{ .shared_paths = &shared });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-read* (subpath \"/shared/ro\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-write* (subpath \"/shared/ro\"))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-read* (subpath \"/shared/rw\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-write* (subpath \"/shared/rw\"))") != null);
+}
+
+test "sandbox_darwin: mount roots are readable for validation" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    const roots = [_][]const u8{"/allowed/root"};
+    try profile.buildVmmProfile(.{ .mount_roots = &roots });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-read* (subpath \"/allowed/root\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-write* (subpath \"/allowed/root\"))") == null);
+}
+
+test "sandbox_darwin: profile allows metadata for path validation" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{});
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow file-read-metadata)") != null);
+}
+
 test "sandbox_darwin: profile denies process-exec and process-fork" {
     const allocator = std.testing.allocator;
 
@@ -314,7 +445,7 @@ test "sandbox_darwin: profile denies process-exec and process-fork" {
     try std.testing.expect(std.mem.indexOf(u8, s, "(deny process-fork)") != null);
 }
 
-test "sandbox_darwin: profile allows hypervisor access" {
+test "sandbox_darwin: profile leaves hypervisor access to entitlements" {
     const allocator = std.testing.allocator;
 
     var profile = SandboxProfile.init(allocator);
@@ -323,8 +454,9 @@ test "sandbox_darwin: profile allows hypervisor access" {
     try profile.buildVmmProfile(.{});
 
     const s = profile.getProfileString();
-    try std.testing.expect(std.mem.indexOf(u8, s, "(allow hv-create)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "(allow mach-vm*)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow mach-lookup)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "hv-create") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "mach-vm") == null);
 }
 
 test "sandbox_darwin: profile allows system library access" {

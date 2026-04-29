@@ -36,6 +36,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const paths = @import("../core/paths.zig");
 const vm_config = @import("../core/config.zig");
+const mounts = @import("../fs/mounts.zig");
 const log = @import("../util/log.zig");
 const acl = @import("acl.zig");
 const seccomp = @import("seccomp.zig");
@@ -214,14 +215,32 @@ fn applyLinuxSeccomp(self: *Jailer) JailerError!void {
 }
 
 fn applyDarwinSandbox(self: *Jailer, vm_dir: ?[]const u8, vm_cfg: ?*const vm_config.VmConfig) JailerError!void {
+    var shared_paths: []sandbox_darwin.SharedPath = &.{};
+    if (vm_cfg) |cfg| {
+        if (cfg.mounts.len > 0) {
+            shared_paths = self.allocator.alloc(sandbox_darwin.SharedPath, cfg.mounts.len) catch return JailerError.OutOfMemory;
+            for (cfg.mounts, 0..) |mount_cfg, i| {
+                shared_paths[i] = .{
+                    .path = mount_cfg.host_path,
+                    .writable = mount_cfg.access == mounts.MountAccess.read_write,
+                };
+            }
+        }
+    }
+    defer if (shared_paths.len > 0) self.allocator.free(shared_paths);
+
     const options = sandbox_darwin.VmmSandboxOptions{
         .vm_directory = effectiveVmDir(self.root, vm_dir),
         .allow_write_vm_dir = true,
         .kernel_path = maybePath(vm_cfg, "kernel_path"),
         .initrd_path = maybePath(vm_cfg, "initrd_path"),
         .disk_path = maybePath(vm_cfg, "disk_path"),
+        .disk_readonly = if (vm_cfg) |cfg| cfg.disk_readonly else false,
         .seed_path = maybePath(vm_cfg, "seed_path"),
         .data_disk_path = maybePath(vm_cfg, "data_disk_path"),
+        .data_disk_readonly = if (vm_cfg) |cfg| cfg.data_disk_readonly else false,
+        .mount_roots = if (vm_cfg) |cfg| cfg.mount_roots else &.{},
+        .shared_paths = shared_paths,
         .allow_network = allowSandboxNetwork(vm_cfg),
     };
     sandbox_darwin.applyVmmSandbox(self.allocator, options) catch |e| {
@@ -301,6 +320,33 @@ fn buildIntegrationVmConfig(allocator: std.mem.Allocator, tmp: *std.testing.TmpD
     cfg.initrd_path = try std.fs.path.join(allocator, &[_][]const u8{ vm_dir, "initrd" });
     cfg.network_mode = .locked_down;
     return cfg;
+}
+
+fn runJailerIntegrationChild(mode: EnforcementMode) !void {
+    const allocator = std.testing.allocator;
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("M80_TEST_JAILER_CHILD_MODE", @tagName(mode));
+
+    const argv = [_][]const u8{
+        exe_path,
+        "--test-filter",
+        "jailer: integration child applies darwin sandbox",
+    };
+    var child = std.process.Child.init(&argv, allocator);
+    child.env_map = &env_map;
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.ChildSandboxTestFailed,
+    }
 }
 
 /// Drops privileges to the specified UID/GID
@@ -674,25 +720,22 @@ test "jailer: integration observe mode exercises platform hardening path" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     try requireIntegrationEnv("M80_TEST_JAILER_INTEGRATION");
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var cfg = try buildIntegrationVmConfig(std.testing.allocator, &tmp);
-    defer vm_config.freeConfig(std.testing.allocator, &cfg);
-    const vm_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(vm_dir);
-
-    var jailer = try Jailer.initWithConfig(
-        std.testing.allocator,
-        integrationTestJailerConfig(.observe),
-    );
-    defer jailer.deinit();
-    try jailer.prepareForVm(vm_dir, &cfg);
+    try runJailerIntegrationChild(.observe);
 }
 
-test "jailer: integration strict mode fails when hardening cannot be applied" {
+test "jailer: integration strict mode applies platform hardening" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     try requireIntegrationEnv("M80_TEST_JAILER_INTEGRATION");
 
+    try runJailerIntegrationChild(.strict);
+}
+
+test "jailer: integration child applies darwin sandbox" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const mode_text = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_JAILER_CHILD_MODE") catch return error.SkipZigTest;
+    defer std.testing.allocator.free(mode_text);
+    const mode = EnforcementMode.fromString(mode_text) orelse return error.InvalidConfig;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var cfg = try buildIntegrationVmConfig(std.testing.allocator, &tmp);
@@ -702,13 +745,10 @@ test "jailer: integration strict mode fails when hardening cannot be applied" {
 
     var jailer = try Jailer.initWithConfig(
         std.testing.allocator,
-        integrationTestJailerConfig(.strict),
+        integrationTestJailerConfig(mode),
     );
     defer jailer.deinit();
-    try std.testing.expectError(
-        JailerError.SecurityPolicyFailed,
-        jailer.prepareForVm(vm_dir, &cfg),
-    );
+    try jailer.prepareForVm(vm_dir, &cfg);
 }
 
 test "jailer: dropPrivileges is no-op on windows" {

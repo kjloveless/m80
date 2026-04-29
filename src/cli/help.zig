@@ -11,8 +11,8 @@ pub const help_text =
     \\  m80 delete <name>            remove a VM and its files
     \\  m80 ps                       list all VMs and their status
     \\  m80 inspect <name>           show VM details
-    \\  m80 snapshot <name> <path>   save running VM disk snapshot to directory
-    \\  m80 restore <name> <path>    restore VM disks from snapshot directory
+    \\  m80 snapshot <name> <path>   save filesystem-image snapshot to directory
+    \\  m80 restore <name> <path>    restore filesystem images from snapshot directory
     \\  m80 clone <name> <new-name>  clone a VM (copy config)
     \\  m80 help                     show this help message
     \\

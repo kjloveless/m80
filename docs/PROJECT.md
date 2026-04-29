@@ -31,8 +31,8 @@ m80 stop <name>              stop a running VM
 m80 delete <name>            remove a VM and its files
 m80 ps                       list all VMs and their status
 m80 inspect <name>           show VM details
-m80 snapshot <name> <path>   copy configured VM disk images into a snapshot directory
-m80 restore <name> <path>    restore configured VM disk images from a snapshot directory
+m80 snapshot <name> <path>   copy configured VM disk images into a filesystem-image snapshot directory
+m80 restore <name> <path>    restore configured VM disk images from a filesystem-image snapshot directory
 m80 clone <name> <new-name>  clone a VM config
 m80 help                     show help
 ```
@@ -57,7 +57,7 @@ seed_path=images/nocloud-seed.iso
 disk_readonly=false
 data_disk_path=images/data.ext4
 data_disk_readonly=false
-kernel_cmdline=console=ttyAMA0 console=hvc0 root=/dev/vda rootwait rw
+kernel_cmdline=console=ttyAMA0 root=/dev/vda rootwait rw
 mount_roots=/Users/you/projects
 mounts=code:/Users/you/projects/m80:/mnt/code:rw:virtiofs
 virtio_fs_queues=1
@@ -88,7 +88,7 @@ Implemented or partially implemented device paths:
 - Virtio-fs with FUSE request handling and read-only/read-write checks.
 - Virtio-net policy code and vmnet bridge scaffolding on macOS.
 
-Snapshot commands currently operate on configured filesystem images. They copy disk slots (`disk_path`, `seed_path`, `data_disk_path`) into a directory with a `manifest.txt`, then restore those images later. Full memory/vCPU snapshot code exists in `src/vm/snapshot.zig` and HVF paths, but it is not the regular CLI snapshot contract yet.
+Snapshot commands operate on configured filesystem images. They copy disk slots (`disk_path`, `seed_path`, `data_disk_path`) into a directory with a `manifest.txt`, then restore those images later. Full memory/vCPU snapshot code exists in `src/vm/snapshot.zig` and HVF paths, but it is not wired into the regular CLI snapshot contract.
 
 ### Networking
 
@@ -133,9 +133,9 @@ Current local QA snapshot from 2026-04-29:
 
 ```text
 zig build test
-340 tests loaded
-322 passed
-18 skipped
+348 tests loaded
+328 passed
+20 skipped
 0 failed
 0 leaks
 ```
@@ -149,16 +149,13 @@ HVF smoke test with a small initramfs:
 ```bash
 make initramfs
 
-make hvf-smoke \
-  KERNEL=images/linux \
-  INITRD=images/m80-initramfs.cpio.gz \
-  EXPECT="m80 initramfs: boot ok"
+make hvf-smoke
 ```
 
 Equivalent direct command:
 
 ```bash
-M80_TEST_KERNEL=images/linux \
+M80_TEST_KERNEL=images/debian-kernels/boot/vmlinuz-6.1.0-42-cloud-arm64 \
 M80_TEST_INITRD=images/m80-initramfs.cpio.gz \
 M80_TEST_SERIAL_EXPECT="m80 initramfs: boot ok" \
 zig build test -- --test-filter "smoke: hvf arm64 boot emits serial output"
@@ -177,41 +174,33 @@ zig build test -- --test-filter "hvf: arm64 boot accepts console input"
 HVF reliability loop:
 
 ```bash
-make hvf-reliability \
-  KERNEL=images/linux \
-  INITRD=images/m80-initramfs.cpio.gz \
-  CYCLES=20 \
-  EXPECT="m80 initramfs: boot ok"
+make hvf-reliability CYCLES=20
 ```
 
 Nightly-depth reliability loop:
 
 ```bash
-make hvf-reliability-nightly \
-  KERNEL=images/linux \
-  INITRD=images/m80-initramfs.cpio.gz \
-  EXPECT="m80 initramfs: boot ok"
+make hvf-reliability-nightly
 ```
 
 Platform-gated network policy path:
 
 ```bash
-M80_TEST_HVF_NET_POLICY_INTEGRATION=1 \
-zig build test -- --test-filter "hvf: integration allowlist blocks non-whitelisted dns egress via virtio-net tx path"
+make hvf-vmnet-policy
 ```
 
 Deterministic timeout-path test:
 
 ```bash
 M80_TEST_HVF_FORCE_STOP_TIMEOUT=1 \
-M80_TEST_KERNEL=images/linux \
+M80_TEST_KERNEL=images/debian-kernels/boot/vmlinuz-6.1.0-42-cloud-arm64 \
 M80_TEST_INITRD=images/m80-initramfs.cpio.gz \
 zig build test -- --test-filter "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled"
 ```
 
 ## macOS Code Signing
 
-Normal HVF builds use `entitlements/hvf-entitlements.xml` and ad-hoc signing.
+Normal HVF-only builds use a hypervisor-only entitlement. When `vmnet_entitlements=true`, the installed single binary uses the vmnet entitlement set.
 
 vmnet requires a restricted Apple entitlement. The build reads optional signing config from `codesign.conf` or `M80_CODESIGN_CONFIG`:
 
@@ -222,15 +211,19 @@ vmnet_entitlements=true
 provisioning_profile=/path/to/profile.provisionprofile
 ```
 
+`provisioning_profile` may be present for local signing context, but the canonical artifact remains the single `zig-out/bin/m80` executable.
+
 Environment overrides:
 
 ```text
 M80_CODESIGN_IDENTITY
 M80_CODESIGN_KEYCHAIN
 M80_CODESIGN_CONFIG
+M80_TEST_VMNET_ENTITLEMENTS
 ```
 
-When vmnet support is enabled and a provisioning profile is configured, the build can produce an app bundle with `entitlements/hvf-entitlements-vmnet.xml`.
+When vmnet support is enabled in `codesign.conf`, the normal `zig-out/bin/m80` executable is signed directly with hypervisor and vmnet entitlements.
+`M80_TEST_VMNET_ENTITLEMENTS=1` signs the Zig test binary with vmnet entitlements so the vmnet policy integration test can fail or pass instead of skipping on entitled hosts.
 
 Useful checks:
 
@@ -290,9 +283,9 @@ Use this list instead of resurrecting old phase files.
    - Keep HVF macOS arm64 smoke, login, and reliability tests reproducible.
 
 2. Snapshot contract cleanup
-   - Decide whether `m80 snapshot` means filesystem image snapshot, full VM state snapshot, or two explicit commands.
+   - Keep `m80 snapshot` and `m80 restore` scoped to filesystem-image snapshots.
    - Keep disk-image snapshot/restore tests separate from memory/vCPU snapshot tests.
-   - Document backend support per snapshot type.
+   - Document backend support per snapshot type before exposing full VM-state snapshots.
 
 3. Networking hardening
    - Finish vmnet-backed virtio-net validation on entitled macOS hosts.

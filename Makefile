@@ -1,15 +1,16 @@
-.PHONY: hvf-smoke hvf-reliability hvf-reliability-nightly initramfs
+.PHONY: hvf-smoke hvf-reliability hvf-reliability-nightly hvf-vmnet-policy initramfs
+
+KERNEL ?= images/debian-kernels/boot/vmlinuz-6.1.0-42-cloud-arm64
+INITRD ?= images/m80-initramfs.cpio.gz
+EXPECT ?= m80 initramfs: boot ok
+CYCLES ?= 20
 
 initramfs:
 	@scripts/build-initramfs.sh
 
 hvf-smoke:
-	@if [ -z "$(KERNEL)" ] || [ -z "$(INITRD)" ]; then \
-		echo "usage: make hvf-smoke KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz [EXPECT=\"m80 initramfs: boot ok\"]" >&2; \
-		exit 2; \
-	fi
-	@EXPECT_VAL="${EXPECT:-m80 initramfs: boot ok}"; \
-	scripts/run-hvf-smoke.sh "$(KERNEL)" "$(INITRD)" "$$EXPECT_VAL"
+	@scripts/run-hvf-smoke.sh "$(KERNEL)" "$(INITRD)" "$(EXPECT)"
+
 boot-hvf-login:
 	@echo "Running HVF login test (requires local images/ and rootfs creds)"
 	@M80_TEST_KERNEL=images/fc-aarch64-vmlinux.bin \
@@ -19,18 +20,12 @@ boot-hvf-login:
 		zig build test -- --test-filter "hvf: arm64 boot accepts console input"
 
 hvf-reliability:
-	@if [ -z "$(KERNEL)" ] || [ -z "$(INITRD)" ]; then \
-		echo "usage: make hvf-reliability KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz [CYCLES=20] [EXPECT=\"m80 initramfs: boot ok\"]" >&2; \
-		exit 2; \
-	fi
-	@CYCLES_VAL="${CYCLES:-20}"; \
-	EXPECT_VAL="${EXPECT:-m80 initramfs: boot ok}"; \
-	scripts/run-hvf-reliability.sh "$(KERNEL)" "$(INITRD)" "$$CYCLES_VAL" "$$EXPECT_VAL"
+	@scripts/run-hvf-reliability.sh "$(KERNEL)" "$(INITRD)" "$(CYCLES)" "$(EXPECT)"
 
 hvf-reliability-nightly:
-	@if [ -z "$(KERNEL)" ] || [ -z "$(INITRD)" ]; then \
-		echo "usage: make hvf-reliability-nightly KERNEL=images/linux INITRD=images/m80-initramfs.cpio.gz [EXPECT=\"m80 initramfs: boot ok\"]" >&2; \
-		exit 2; \
-	fi
-	@EXPECT_VAL="${EXPECT:-m80 initramfs: boot ok}"; \
-	scripts/run-hvf-reliability.sh "$(KERNEL)" "$(INITRD)" "200" "$$EXPECT_VAL"
+	@scripts/run-hvf-reliability.sh "$(KERNEL)" "$(INITRD)" "200" "$(EXPECT)"
+
+hvf-vmnet-policy:
+	@M80_TEST_VMNET_ENTITLEMENTS=1 \
+		M80_TEST_HVF_NET_POLICY_INTEGRATION=1 \
+		zig build test -- --test-filter "hvf: integration allowlist blocks non-whitelisted dns egress via virtio-net tx path"
