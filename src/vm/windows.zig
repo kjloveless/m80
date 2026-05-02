@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const log = @import("../util/log.zig");
+const env_util = @import("../util/env.zig");
 const builtin = @import("builtin");
 
 const windows = std.os.windows;
@@ -833,9 +834,7 @@ test "windows: start rejects already running state" {
 
 test "integration: cpuid/io port exits keep vcpu running" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const integration_flag = std.process.getEnvVarOwned(std.testing.allocator, "M80_WHP_INTEGRATION") catch null;
-    defer if (integration_flag) |v| std.testing.allocator.free(v);
-    if (integration_flag == null) return error.SkipZigTest;
+    if (!env_util.integrationEnabled(std.testing.allocator, "whp")) return error.SkipZigTest;
 
     const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
     defer if (kernel) |k| std.testing.allocator.free(k);

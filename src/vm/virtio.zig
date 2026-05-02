@@ -220,8 +220,8 @@ pub var gic_virtio_net_intid: ?u32 = null;
 pub var virtio_net_irq_level = false;
 var virtio_net_rx_mutex = std.Thread.Mutex{};
 
-/// Pending DNS REFUSED responses waiting for RX buffers
-const PendingRefusedQueue = struct {
+/// Pending blocked-DNS responses waiting for RX buffers.
+const PendingBlockedDnsQueue = struct {
     const max_pending = 16;
     const max_frame_len = 1500;
     frames: [max_pending][max_frame_len]u8 = undefined,
@@ -230,49 +230,49 @@ const PendingRefusedQueue = struct {
     tail: usize = 0,
     count: usize = 0,
 };
-var pending_refused_queue = PendingRefusedQueue{};
-var pending_refused_mutex = std.Thread.Mutex{};
+var pending_blocked_dns_queue = PendingBlockedDnsQueue{};
+var pending_blocked_dns_mutex = std.Thread.Mutex{};
 
-fn resetPendingRefusedQueue() void {
-    pending_refused_mutex.lock();
-    defer pending_refused_mutex.unlock();
-    pending_refused_queue = .{};
+fn resetPendingBlockedDnsQueue() void {
+    pending_blocked_dns_mutex.lock();
+    defer pending_blocked_dns_mutex.unlock();
+    pending_blocked_dns_queue = .{};
 }
 
-fn queuePendingRefused(frame: []const u8) bool {
-    if (pending_refused_queue.count >= PendingRefusedQueue.max_pending) return false;
-    if (frame.len > PendingRefusedQueue.max_frame_len) return false;
+fn queuePendingBlockedDns(frame: []const u8) bool {
+    if (pending_blocked_dns_queue.count >= PendingBlockedDnsQueue.max_pending) return false;
+    if (frame.len > PendingBlockedDnsQueue.max_frame_len) return false;
 
-    const idx = pending_refused_queue.tail;
-    @memcpy(pending_refused_queue.frames[idx][0..frame.len], frame);
-    pending_refused_queue.lengths[idx] = frame.len;
-    pending_refused_queue.tail = (pending_refused_queue.tail + 1) % PendingRefusedQueue.max_pending;
-    pending_refused_queue.count += 1;
+    const idx = pending_blocked_dns_queue.tail;
+    @memcpy(pending_blocked_dns_queue.frames[idx][0..frame.len], frame);
+    pending_blocked_dns_queue.lengths[idx] = frame.len;
+    pending_blocked_dns_queue.tail = (pending_blocked_dns_queue.tail + 1) % PendingBlockedDnsQueue.max_pending;
+    pending_blocked_dns_queue.count += 1;
     return true;
 }
 
-fn drainPendingRefused() void {
-    pending_refused_mutex.lock();
-    defer pending_refused_mutex.unlock();
+fn drainPendingBlockedDns() void {
+    pending_blocked_dns_mutex.lock();
+    defer pending_blocked_dns_mutex.unlock();
 
-    while (pending_refused_queue.count > 0) {
-        const idx = pending_refused_queue.head;
-        const len = pending_refused_queue.lengths[idx];
-        const frame = pending_refused_queue.frames[idx][0..len];
+    while (pending_blocked_dns_queue.count > 0) {
+        const idx = pending_blocked_dns_queue.head;
+        const len = pending_blocked_dns_queue.lengths[idx];
+        const frame = pending_blocked_dns_queue.frames[idx][0..len];
 
         virtioNetRxPacket(frame) catch |e| {
             // Still no buffers, leave remaining in queue
             if (e == error.NoBuffersAvailable) return;
-            log.warn("virtio-net pending refused send failed: {s}", .{@errorName(e)});
+            log.warn("virtio-net pending blocked DNS response send failed: {s}", .{@errorName(e)});
             // Remove failed frame and continue
-            pending_refused_queue.head = (pending_refused_queue.head + 1) % PendingRefusedQueue.max_pending;
-            pending_refused_queue.count -= 1;
+            pending_blocked_dns_queue.head = (pending_blocked_dns_queue.head + 1) % PendingBlockedDnsQueue.max_pending;
+            pending_blocked_dns_queue.count -= 1;
             continue;
         };
 
-        pending_refused_queue.head = (pending_refused_queue.head + 1) % PendingRefusedQueue.max_pending;
-        pending_refused_queue.count -= 1;
-        log.info("virtio-net dns nxdomain sent (queued)", .{});
+        pending_blocked_dns_queue.head = (pending_blocked_dns_queue.head + 1) % PendingBlockedDnsQueue.max_pending;
+        pending_blocked_dns_queue.count -= 1;
+        log.info("virtio-net dns blocked response sent (queued)", .{});
     }
 }
 
@@ -559,7 +559,7 @@ pub fn resetVirtioNetState() void {
     virtio_net_irq_level = false;
     virtio_net_seen.store(false, .seq_cst);
     net_tx_callback = null;
-    resetPendingRefusedQueue();
+    resetPendingBlockedDnsQueue();
     resetNetworkPolicyState();
 }
 
@@ -1042,9 +1042,9 @@ pub fn outboundFrameAllowed(frame: []const u8) bool {
     return policy.isIpAllowed(dst_ip);
 }
 
-/// Check if frame is a blocked DNS query and send REFUSED response if so.
-/// Returns true if a REFUSED response was sent (caller should drop original packet).
-pub fn maybeSendDnsRefused(frame: []const u8) bool {
+/// Check if frame is a blocked DNS query and send a synthetic NXDOMAIN response if so.
+/// Returns true when the original packet should be dropped.
+pub fn maybeSendDnsBlockedResponse(frame: []const u8) bool {
     net_policy_mutex.lock();
     defer net_policy_mutex.unlock();
     if (net_policy_state == null) return false;
@@ -1076,16 +1076,21 @@ pub fn maybeSendDnsRefused(frame: []const u8) bool {
     const domain = dns.parseQueryDomain(payload, &name_buf) catch return false;
     if (policy.isDomainAllowedOnPort(domain, dst_port)) return false;
 
-    // Domain is blocked - send REFUSED response
+    // Domain is blocked - return an immediate negative DNS answer.
     const dst_ip: [4]u8 = frame[ip_offset + 16 ..][0..4].*;
     log.info("virtio-net dns blocked: {s} (to {d}.{d}.{d}.{d})", .{ domain, dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3] });
-    sendDnsRefusedResponse(frame, ip_offset, ihl, udp_offset, payload_offset);
+    sendDnsBlockedResponse(frame, ip_offset, ihl, udp_offset, payload_offset);
     return true;
 }
 
-fn sendDnsRefusedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offset: usize, payload_offset: usize) void {
-    // Build response packet by copying and modifying the query
-    var response: [1500]u8 = undefined;
+fn buildDnsBlockedResponse(
+    frame: []const u8,
+    ip_offset: usize,
+    ihl: u8,
+    udp_offset: usize,
+    payload_offset: usize,
+    response: *[PendingBlockedDnsQueue.max_frame_len]u8,
+) []const u8 {
     const frame_len = @min(frame.len, response.len);
     @memcpy(response[0..frame_len], frame[0..frame_len]);
 
@@ -1121,34 +1126,50 @@ fn sendDnsRefusedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offs
     response[udp_offset + 6] = 0;
     response[udp_offset + 7] = 0;
 
-    // Modify DNS header: set QR=1 (response) and RCODE=5 (REFUSED)
+    // Modify DNS header: set QR=1 (response) and RCODE=3 (NXDOMAIN).
+    // NXDOMAIN makes common resolvers fail the lookup immediately; REFUSED
+    // often triggers retries against every configured DNS server.
     // DNS flags are at payload_offset + 2..4
     // Original flags format: QR(1) OPCODE(4) AA(1) TC(1) RD(1) | RA(1) Z(3) RCODE(4)
-    // We want: QR=1, keep OPCODE, set AA=1, clear TC, keep RD, set RA=1, RCODE=5 (REFUSED)
     const orig_flags = std.mem.readInt(u16, response[payload_offset + 2 ..][0..2], .big);
     const opcode = (orig_flags >> 11) & 0xF;
     const rd = (orig_flags >> 8) & 1;
-    // QR=1, OPCODE kept, AA=1, TC=0, RD kept, RA=1, Z=0, RCODE=5 (REFUSED)
-    const new_flags: u16 = (1 << 15) | (opcode << 11) | (1 << 10) | (rd << 8) | (1 << 7) | 5;
+    // QR=1, OPCODE kept, AA=1, TC=0, RD kept, RA=1, Z=0, RCODE=3 (NXDOMAIN)
+    const new_flags: u16 = (1 << 15) | (opcode << 11) | (1 << 10) | (rd << 8) | (1 << 7) | 3;
     std.mem.writeInt(u16, response[payload_offset + 2 ..][0..2], new_flags, .big);
 
+    // Keep the original question and make sure there are no answer/authority/additional records.
+    std.mem.writeInt(u16, response[payload_offset + 6 ..][0..2], 0, .big);
+    std.mem.writeInt(u16, response[payload_offset + 8 ..][0..2], 0, .big);
+    std.mem.writeInt(u16, response[payload_offset + 10 ..][0..2], 0, .big);
+
+    return response[0..frame_len];
+}
+
+fn queueDnsBlockedResponse(response: []const u8, reason: []const u8) void {
+    pending_blocked_dns_mutex.lock();
+    defer pending_blocked_dns_mutex.unlock();
+    if (queuePendingBlockedDns(response)) {
+        log.info("virtio-net dns blocked response queued ({s})", .{reason});
+    } else {
+        log.warn("virtio-net dns blocked response dropped (queue full)", .{});
+    }
+}
+
+fn sendDnsBlockedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offset: usize, payload_offset: usize) void {
+    var response_buf: [PendingBlockedDnsQueue.max_frame_len]u8 = undefined;
+    const response = buildDnsBlockedResponse(frame, ip_offset, ihl, udp_offset, payload_offset, &response_buf);
+
     // Send response back to guest
-    virtioNetRxPacket(response[0..frame_len]) catch |e| {
-        if (e == error.NoBuffersAvailable) {
-            // Queue for later delivery when guest posts RX buffers
-            pending_refused_mutex.lock();
-            defer pending_refused_mutex.unlock();
-            if (queuePendingRefused(response[0..frame_len])) {
-                log.info("virtio-net dns refused queued (no buffers)", .{});
-            } else {
-                log.warn("virtio-net dns refused dropped (queue full)", .{});
-            }
-            return;
+    virtioNetRxPacket(response) catch |e| {
+        switch (e) {
+            error.NoBuffersAvailable => queueDnsBlockedResponse(response, "no buffers"),
+            error.QueueNotReady => queueDnsBlockedResponse(response, "queue not ready"),
+            else => log.warn("virtio-net dns blocked response send failed: {s}", .{@errorName(e)}),
         }
-        log.warn("virtio-net dns refused send failed: {s}", .{@errorName(e)});
         return;
     };
-    log.info("virtio-net dns refused sent", .{});
+    log.info("virtio-net dns blocked response sent", .{});
 }
 
 pub fn virtioConsoleInputLen() usize {
@@ -1744,8 +1765,8 @@ pub fn processVirtioNetTxQueue() !void {
                     cb(frame_buf[0..frame_len]);
                 }
             } else {
-                // If blocked DNS query, send REFUSED response back to guest
-                _ = maybeSendDnsRefused(frame_buf[0..frame_len]);
+                // If blocked DNS query, send an immediate negative response back to guest.
+                _ = maybeSendDnsBlockedResponse(frame_buf[0..frame_len]);
             }
         }
 
@@ -2235,8 +2256,8 @@ pub fn handleVirtioNetMmio(offset: u64, is_write: bool, size: usize, value: u64)
             virtio_mmio_reg_queue_notify => {
                 const queue_index: u16 = @intCast(v32 & 0xFFFF);
                 if (queue_index == 0) {
-                    // Guest posted RX buffers, drain pending REFUSED responses
-                    drainPendingRefused();
+                    // Guest posted RX buffers, drain pending blocked-DNS responses.
+                    drainPendingBlockedDns();
                 } else if (queue_index == 1) {
                     processVirtioNetTxQueue() catch |e| {
                         log.warn("hvf virtio-net tx notify failed: {s}", .{@errorName(e)});
@@ -2920,7 +2941,7 @@ test "virtio: outboundFrameAllowed with no policy" {
     try std.testing.expect(outboundFrameAllowed(&frame));
 }
 
-test "virtio: maybeSendDnsRefused returns false with no policy" {
+test "virtio: maybeSendDnsBlockedResponse returns false with no policy" {
     net_policy_mutex.lock();
     const saved = net_policy_state;
     net_policy_state = null;
@@ -2931,10 +2952,10 @@ test "virtio: maybeSendDnsRefused returns false with no policy" {
         net_policy_mutex.unlock();
     }
     const frame = [_]u8{0} ** 100;
-    try std.testing.expect(!maybeSendDnsRefused(&frame));
+    try std.testing.expect(!maybeSendDnsBlockedResponse(&frame));
 }
 
-test "virtio: maybeSendDnsRefused returns false for non-DNS" {
+test "virtio: maybeSendDnsBlockedResponse returns false for non-DNS" {
     net_policy_mutex.lock();
     const saved = net_policy_state;
     // Set up allowlist policy
@@ -2956,11 +2977,11 @@ test "virtio: maybeSendDnsRefused returns false for non-DNS" {
     // IP header at offset 14
     frame[14] = 0x45; // version 4, IHL 5
     frame[23] = 6; // protocol TCP (not UDP)
-    // maybeSendDnsRefused should return false for non-UDP
-    try std.testing.expect(!maybeSendDnsRefused(&frame));
+    // maybeSendDnsBlockedResponse should return false for non-UDP
+    try std.testing.expect(!maybeSendDnsBlockedResponse(&frame));
 }
 
-test "virtio: maybeSendDnsRefused returns false for allowed domain" {
+test "virtio: maybeSendDnsBlockedResponse returns false for allowed domain" {
     net_policy_mutex.lock();
     const saved = net_policy_state;
     // Set up allowlist policy with allowed domain
@@ -3011,8 +3032,96 @@ test "virtio: maybeSendDnsRefused returns false for allowed domain" {
     frame[64] = 'o';
     frame[65] = 'm';
     frame[66] = 0;
-    // maybeSendDnsRefused should return false for allowed domain
-    try std.testing.expect(!maybeSendDnsRefused(&frame));
+    // maybeSendDnsBlockedResponse should return false for allowed domain
+    try std.testing.expect(!maybeSendDnsBlockedResponse(&frame));
+}
+
+test "virtio: blocked DNS response is NXDOMAIN" {
+    var frame: [100]u8 = undefined;
+    @memset(&frame, 0);
+    frame[0..6].* = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    frame[6..12].* = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 17;
+    frame[26..30].* = .{ 10, 0, 2, 15 };
+    frame[30..34].* = .{ 8, 8, 8, 8 };
+    std.mem.writeInt(u16, frame[34..36], 0x1234, .big);
+    std.mem.writeInt(u16, frame[36..38], 53, .big);
+    frame[42] = 0x12;
+    frame[43] = 0x34;
+    std.mem.writeInt(u16, frame[44..46], 0x0100, .big);
+    std.mem.writeInt(u16, frame[46..48], 1, .big);
+    std.mem.writeInt(u16, frame[48..50], 1, .big);
+    std.mem.writeInt(u16, frame[50..52], 1, .big);
+    std.mem.writeInt(u16, frame[52..54], 1, .big);
+    frame[54] = 7;
+    @memcpy(frame[55..62], "blocked");
+    frame[62] = 4;
+    @memcpy(frame[63..67], "test");
+    frame[67] = 0;
+
+    var response_buf: [PendingBlockedDnsQueue.max_frame_len]u8 = undefined;
+    const response = buildDnsBlockedResponse(&frame, 14, 20, 34, 42, &response_buf);
+
+    try std.testing.expectEqualSlices(u8, frame[6..12], response[0..6]);
+    try std.testing.expectEqualSlices(u8, frame[0..6], response[6..12]);
+    try std.testing.expectEqualSlices(u8, frame[30..34], response[26..30]);
+    try std.testing.expectEqualSlices(u8, frame[26..30], response[30..34]);
+    try std.testing.expectEqual(@as(u16, 53), std.mem.readInt(u16, response[34..36], .big));
+    try std.testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, response[36..38], .big));
+    try std.testing.expectEqual(@as(u16, 0x8583), std.mem.readInt(u16, response[44..46], .big));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, response[46..48], .big));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, response[48..50], .big));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, response[50..52], .big));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, response[52..54], .big));
+}
+
+test "virtio: blocked DNS response queues when rx queue is not ready" {
+    net_policy_mutex.lock();
+    const saved_policy = net_policy_state;
+    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
+    policy.mode = .allowlist;
+    net_policy_state = policy;
+    net_policy_mutex.unlock();
+    const saved_net = virtio_net_state;
+    defer {
+        net_policy_mutex.lock();
+        if (net_policy_state) |*p| p.deinit();
+        net_policy_state = saved_policy;
+        net_policy_mutex.unlock();
+        virtio_net_state = saved_net;
+        resetPendingBlockedDnsQueue();
+    }
+    resetPendingBlockedDnsQueue();
+    virtio_net_state = .{ .enabled = true };
+
+    var frame: [100]u8 = undefined;
+    @memset(&frame, 0);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 17;
+    frame[36] = 0x00;
+    frame[37] = 0x35;
+    frame[42] = 0x12;
+    frame[43] = 0x34;
+    frame[44] = 0x01;
+    frame[45] = 0x00;
+    frame[46] = 0x00;
+    frame[47] = 0x01;
+    frame[54] = 7;
+    @memcpy(frame[55..62], "blocked");
+    frame[62] = 4;
+    @memcpy(frame[63..67], "test");
+    frame[67] = 0;
+
+    try std.testing.expect(maybeSendDnsBlockedResponse(&frame));
+
+    pending_blocked_dns_mutex.lock();
+    defer pending_blocked_dns_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), pending_blocked_dns_queue.count);
 }
 
 test "virtio: dns allowlist respects port rules" {
@@ -3064,7 +3173,7 @@ test "virtio: dns allowlist respects port rules" {
     frame[66] = 0;
 
     try std.testing.expect(!outboundFrameAllowed(&frame));
-    try std.testing.expect(maybeSendDnsRefused(&frame));
+    try std.testing.expect(maybeSendDnsBlockedResponse(&frame));
 }
 
 test "virtio: outboundFrameAllowed enforces port rules for resolved IPs" {

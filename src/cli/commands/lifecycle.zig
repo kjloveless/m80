@@ -350,8 +350,6 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     if (ensure_deb) {
         try ensureDebVmConfig(allocator);
     }
-    const restore_path = std.process.getEnvVarOwned(allocator, "M80_RESTORE_PATH") catch null;
-    defer if (restore_path) |path| allocator.free(path);
 
     var jailer = try Jailer.init(allocator);
     defer jailer.deinit();
@@ -405,18 +403,6 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
         ),
         else => errors.die("start failed: {s}", .{@errorName(e)}),
     };
-
-    if (restore_path) |path| {
-        log.info("restoring filesystem snapshot: {s}", .{path});
-        vm.restoreFilesystem(cfg_mut, path) catch |e| {
-            log.err("filesystem restore failed: {s}", .{@errorName(e)});
-            vm.stop() catch {};
-            runtime.writeResultFile(vm_dir, runtime.restore_result_file, @errorName(e));
-            return e;
-        };
-        log.info("filesystem restore complete", .{});
-        runtime.writeResultFile(vm_dir, runtime.restore_result_file, "ok");
-    }
 
     state.setStatus(allocator, name, .running) catch |e| switch (e) {
         error.InvalidArgs => errors.die("invalid vm name: {s}\n", .{name}),
