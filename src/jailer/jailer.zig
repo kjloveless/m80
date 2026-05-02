@@ -38,6 +38,7 @@ const paths = @import("../core/paths.zig");
 const vm_config = @import("../core/config.zig");
 const mounts = @import("../fs/mounts.zig");
 const log = @import("../util/log.zig");
+const env_util = @import("../util/env.zig");
 const acl = @import("acl.zig");
 const seccomp = @import("seccomp.zig");
 const sandbox_darwin = @import("sandbox_darwin.zig");
@@ -269,18 +270,8 @@ fn applyPlatformHardening(self: *Jailer, vm_dir: ?[]const u8, vm_cfg: ?*const vm
     }
 }
 
-fn integrationEnvEnabled(allocator: std.mem.Allocator, name: []const u8) bool {
-    const value = std.process.getEnvVarOwned(allocator, name) catch return false;
-    defer allocator.free(value);
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len == 0) return false;
-    if (std.mem.eql(u8, trimmed, "0")) return false;
-    if (std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
-    return true;
-}
-
-fn requireIntegrationEnv(name: []const u8) !void {
-    if (!integrationEnvEnabled(std.testing.allocator, name)) {
+fn requireIntegrationSelector(name: []const u8) !void {
+    if (!env_util.integrationEnabled(std.testing.allocator, name)) {
         return error.SkipZigTest;
     }
 }
@@ -327,17 +318,17 @@ fn runJailerIntegrationChild(mode: EnforcementMode) !void {
     const exe_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
 
-    var env_map = try std.process.getEnvMap(allocator);
-    defer env_map.deinit();
-    try env_map.put("M80_TEST_JAILER_CHILD_MODE", @tagName(mode));
-
+    const filter = switch (mode) {
+        .observe => "jailer-child: observe applies darwin sandbox",
+        .strict => "jailer-child: strict applies darwin sandbox",
+        .off => return error.InvalidConfig,
+    };
     const argv = [_][]const u8{
         exe_path,
         "--test-filter",
-        "jailer: integration child applies darwin sandbox",
+        filter,
     };
     var child = std.process.Child.init(&argv, allocator);
-    child.env_map = &env_map;
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
@@ -718,24 +709,19 @@ test "jailer: EnforcementMode fromString" {
 
 test "jailer: integration observe mode exercises platform hardening path" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
-    try requireIntegrationEnv("M80_TEST_JAILER_INTEGRATION");
+    try requireIntegrationSelector("jailer");
 
     try runJailerIntegrationChild(.observe);
 }
 
 test "jailer: integration strict mode applies platform hardening" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
-    try requireIntegrationEnv("M80_TEST_JAILER_INTEGRATION");
+    try requireIntegrationSelector("jailer");
 
     try runJailerIntegrationChild(.strict);
 }
 
-test "jailer: integration child applies darwin sandbox" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
-    const mode_text = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_JAILER_CHILD_MODE") catch return error.SkipZigTest;
-    defer std.testing.allocator.free(mode_text);
-    const mode = EnforcementMode.fromString(mode_text) orelse return error.InvalidConfig;
-
+fn runJailerIntegrationChildBody(mode: EnforcementMode) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var cfg = try buildIntegrationVmConfig(std.testing.allocator, &tmp);
@@ -749,6 +735,36 @@ test "jailer: integration child applies darwin sandbox" {
     );
     defer jailer.deinit();
     try jailer.prepareForVm(vm_dir, &cfg);
+}
+
+fn currentTestFilterIs(expected: []const u8) bool {
+    const args = std.process.argsAlloc(std.testing.allocator) catch return false;
+    defer std.process.argsFree(std.testing.allocator, args);
+
+    var idx: usize = 0;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (std.mem.eql(u8, arg, "--test-filter")) {
+            return idx + 1 < args.len and std.mem.eql(u8, args[idx + 1], expected);
+        }
+        const prefix = "--test-filter=";
+        if (std.mem.startsWith(u8, arg, prefix)) {
+            return std.mem.eql(u8, arg[prefix.len..], expected);
+        }
+    }
+    return false;
+}
+
+test "jailer-child: observe applies darwin sandbox" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!currentTestFilterIs("jailer-child: observe applies darwin sandbox")) return error.SkipZigTest;
+    try runJailerIntegrationChildBody(.observe);
+}
+
+test "jailer-child: strict applies darwin sandbox" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!currentTestFilterIs("jailer-child: strict applies darwin sandbox")) return error.SkipZigTest;
+    try runJailerIntegrationChildBody(.strict);
 }
 
 test "jailer: dropPrivileges is no-op on windows" {

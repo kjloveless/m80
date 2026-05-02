@@ -21,7 +21,7 @@ mkdir -p "${artifacts_dir}"
 echo "hvf reliability: kernel=${kernel_path} initrd=${initrd_path} cycles=${cycles}" | tee -a "${log_path}"
 
 set +e
-M80_TEST_HVF_RELIABILITY=1 \
+M80_TEST_INTEGRATION=hvf-reliability \
 M80_TEST_HVF_RELIABILITY_CYCLES="${cycles}" \
 M80_TEST_KERNEL="${kernel_path}" \
 M80_TEST_INITRD="${initrd_path}" \

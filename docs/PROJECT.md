@@ -99,6 +99,7 @@ Networking is deny-by-default:
 - `open`: full access, but only with explicit environment opt-in.
 
 `allowed_domains` accepts exact domains, wildcard subdomains such as `*.example.com`, and optional single-port rules such as `example.com:443`. `allowed_ips` accepts IPv4 and CIDR entries.
+Blocked DNS lookups receive a synthetic NXDOMAIN response so guest applications fail quickly instead of waiting on DNS retries or TCP timeouts.
 
 On macOS, vmnet requires `com.apple.developer.networking.vmnet`. If vmnet cannot initialize because of signing or entitlement state, m80 logs the issue and leaves networking disabled for that VM.
 
@@ -129,18 +130,19 @@ zig build test
 
 Tests are aggregated through `src/all_tests.zig` and run with `src/test_runner.zig`.
 
-Current local QA snapshot from 2026-04-29:
+Current local QA snapshot from 2026-05-02:
 
 ```text
 zig build test
-348 tests loaded
-328 passed
-20 skipped
+354 tests loaded
+333 passed
+21 skipped
 0 failed
 0 leaks
 ```
 
 The skipped tests are expected on hosts that do not provide the relevant OS, hypervisor, entitlement, or integration environment variables.
+Platform integration tests are enabled with `M80_TEST_INTEGRATION=<selector>`, where selectors include `hvf-reliability`, `hvf-net`, `jailer`, `whp`, and `all`.
 
 ## Integration Tests
 
@@ -192,7 +194,6 @@ make hvf-vmnet-policy
 Deterministic timeout-path test:
 
 ```bash
-M80_TEST_HVF_FORCE_STOP_TIMEOUT=1 \
 M80_TEST_KERNEL=images/debian-kernels/boot/vmlinuz-6.1.0-42-cloud-arm64 \
 M80_TEST_INITRD=images/m80-initramfs.cpio.gz \
 zig build test -- --test-filter "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled"

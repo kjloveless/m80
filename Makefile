@@ -27,5 +27,5 @@ hvf-reliability-nightly:
 
 hvf-vmnet-policy:
 	@M80_TEST_VMNET_ENTITLEMENTS=1 \
-		M80_TEST_HVF_NET_POLICY_INTEGRATION=1 \
+		M80_TEST_INTEGRATION=hvf-net \
 		zig build test -- --test-filter "hvf: integration allowlist blocks non-whitelisted dns egress via virtio-net tx path"

@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const log = @import("../util/log.zig");
+const env_util = @import("../util/env.zig");
 const config = @import("../core/config.zig");
 const serial = @import("serial.zig");
 const boot = @import("boot.zig");
@@ -54,6 +55,7 @@ const mb_to_bytes: u64 = 1024 * 1024;
 const vcpu_stop_signal_attempts: usize = 200;
 const vcpu_stop_signal_interval_ns: u64 = 10 * std.time.ns_per_ms;
 const vcpu_forced_stop_timeout_test_extra_ns: u64 = 250 * std.time.ns_per_ms;
+var force_stop_timeout_for_tests = std.atomic.Value(bool).init(false);
 
 // Guest physical memory layout - standard Linux boot offsets (from RAM base)
 const guest_kernel_offset_x86: u64 = hvf_boot.guest_kernel_offset_x86;
@@ -2671,7 +2673,12 @@ fn forceStopTimeoutTestDelayNs() u64 {
 
 fn shouldForceStopTimeoutForTests() bool {
     if (!builtin.is_test) return false;
-    return envFlagPresent(std.heap.page_allocator, "M80_TEST_HVF_FORCE_STOP_TIMEOUT");
+    return force_stop_timeout_for_tests.load(.seq_cst);
+}
+
+fn setForceStopTimeoutForTests(enabled: bool) void {
+    if (!builtin.is_test) return;
+    force_stop_timeout_for_tests.store(enabled, .seq_cst);
 }
 
 fn maybeDelayVcpuThreadExitForTests() void {
@@ -3461,8 +3468,8 @@ pub fn start(cfg: config.VmConfig) !void {
         log.err("hvf virtio-blk setup failed: {s}", .{@errorName(e)});
         return e;
     };
-    const enable_virtio_console = envFlagPresent(std.heap.page_allocator, "M80_VIRTIO_CONSOLE") or
-        (cfg.kernel_cmdline != null and std.mem.indexOf(u8, cfg.kernel_cmdline.?, "hvc0") != null);
+    const enable_virtio_console =
+        cfg.kernel_cmdline != null and std.mem.indexOf(u8, cfg.kernel_cmdline.?, "hvc0") != null;
     virtio.setupVirtioConsole(enable_virtio_console);
     virtio.setupVirtioRng(true);
     const dax_mapper = buildDaxMapper(size_bytes_u64);
@@ -3785,7 +3792,6 @@ pub fn start(cfg: config.VmConfig) !void {
         simulate_io.store(true, .seq_cst);
     }
     serial_io.setFromEnv(std.heap.page_allocator);
-    serial.setCaptureFromEnv(std.heap.page_allocator);
     serial.clearConsoleBacklog();
     if (startConsoleSocketServer(std.heap.page_allocator)) {
         console_server_started = true;
@@ -3896,19 +3902,18 @@ pub fn stop() !void {
 // =============================================================================
 // Tests use the "hvf:" prefix to identify which module they belong to.
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
-fn allocZ(allocator: std.mem.Allocator, value: []const u8) ![:0]u8 {
-    return hvf_net_console.allocZ(allocator, value);
-}
-
 fn encodeDnsName(out: []u8, domain: []const u8) !usize {
     return hvf_net_console.encodeDnsName(out, domain);
 }
 
 fn buildDnsQueryFrame(frame: []u8, domain: []const u8, dst_ip: [4]u8) ![]const u8 {
     return hvf_net_console.buildDnsQueryFrame(frame, domain, dst_ip);
+}
+
+fn prepareSerialCapture(out_path: []const u8) !void {
+    var out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+    out_file.close();
+    try serial.setCapturePath(std.testing.allocator, out_path);
 }
 
 fn runVirtioNetTxFrame(frame: []const u8, desc_addr: u64, avail_addr: u64, used_addr: u64, data_addr: u64) !void {
@@ -4448,22 +4453,8 @@ test "smoke: hvf arm64 boot emits serial output" {
     const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
     defer std.testing.allocator.free(out_path);
 
-    var out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-    out_file.close();
-
-    const name_z = try allocZ(std.testing.allocator, "M80_SERIAL_OUT");
-    defer std.testing.allocator.free(name_z);
-    const path_z = try allocZ(std.testing.allocator, out_path);
-    defer std.testing.allocator.free(path_z);
-    if (setenv(name_z, path_z, 1) != 0) return error.SkipZigTest;
-    defer _ = unsetenv(name_z);
-
-    const console_z = try allocZ(std.testing.allocator, "M80_VIRTIO_CONSOLE");
-    defer std.testing.allocator.free(console_z);
-    const console_val_z = try allocZ(std.testing.allocator, "1");
-    defer std.testing.allocator.free(console_val_z);
-    _ = setenv(console_z, console_val_z, 1);
-    defer _ = unsetenv(console_z);
+    try prepareSerialCapture(out_path);
+    defer serial.clearCapture(std.testing.allocator);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
@@ -4526,9 +4517,7 @@ test "smoke: hvf arm64 boot emits serial output" {
 test "smoke: hvf arm64 repeated start-stop reliability" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
-    const enabled = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_HVF_RELIABILITY") catch null;
-    defer if (enabled) |v| std.testing.allocator.free(v);
-    if (enabled == null or !std.mem.eql(u8, enabled.?, "1")) return error.SkipZigTest;
+    if (!env_util.integrationEnabled(std.testing.allocator, "hvf-reliability")) return error.SkipZigTest;
 
     const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
     defer if (kernel) |k| std.testing.allocator.free(k);
@@ -4554,23 +4543,7 @@ test "smoke: hvf arm64 repeated start-stop reliability" {
     defer std.testing.allocator.free(dir_path);
     const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
     defer std.testing.allocator.free(out_path);
-
-    var out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-    out_file.close();
-
-    const serial_out_z = try allocZ(std.testing.allocator, "M80_SERIAL_OUT");
-    defer std.testing.allocator.free(serial_out_z);
-    const serial_out_path_z = try allocZ(std.testing.allocator, out_path);
-    defer std.testing.allocator.free(serial_out_path_z);
-    if (setenv(serial_out_z, serial_out_path_z, 1) != 0) return error.SkipZigTest;
-    defer _ = unsetenv(serial_out_z);
-
-    const console_z = try allocZ(std.testing.allocator, "M80_VIRTIO_CONSOLE");
-    defer std.testing.allocator.free(console_z);
-    const console_val_z = try allocZ(std.testing.allocator, "1");
-    defer std.testing.allocator.free(console_val_z);
-    _ = setenv(console_z, console_val_z, 1);
-    defer _ = unsetenv(console_z);
+    defer serial.clearCapture(std.testing.allocator);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
@@ -4593,6 +4566,8 @@ test "smoke: hvf arm64 repeated start-stop reliability" {
 
     var cycle: usize = 0;
     while (cycle < reliability_cycles) : (cycle += 1) {
+        try prepareSerialCapture(out_path);
+
         var started = false;
         start(cfg_mut) catch |e| {
             std.debug.print("hvf reliability start cycle={d} failed: {s}\n", .{ cycle, @errorName(e) });
@@ -4642,22 +4617,8 @@ test "smoke: hvf arm64 initramfs shell accepts uptime" {
     const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
     defer std.testing.allocator.free(out_path);
 
-    var out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-    out_file.close();
-
-    const name_z = try allocZ(std.testing.allocator, "M80_SERIAL_OUT");
-    defer std.testing.allocator.free(name_z);
-    const path_z = try allocZ(std.testing.allocator, out_path);
-    defer std.testing.allocator.free(path_z);
-    if (setenv(name_z, path_z, 1) != 0) return error.SkipZigTest;
-    defer _ = unsetenv(name_z);
-
-    const console_z = try allocZ(std.testing.allocator, "M80_VIRTIO_CONSOLE");
-    defer std.testing.allocator.free(console_z);
-    const console_val_z = try allocZ(std.testing.allocator, "1");
-    defer std.testing.allocator.free(console_val_z);
-    _ = setenv(console_z, console_val_z, 1);
-    defer _ = unsetenv(console_z);
+    try prepareSerialCapture(out_path);
+    defer serial.clearCapture(std.testing.allocator);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
@@ -4706,9 +4667,7 @@ test "smoke: hvf arm64 initramfs shell accepts uptime" {
 test "hvf: integration allowlist blocks non-whitelisted dns egress via virtio-net tx path" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
-    const enabled = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_HVF_NET_POLICY_INTEGRATION") catch null;
-    defer if (enabled) |v| std.testing.allocator.free(v);
-    if (enabled == null or !std.mem.eql(u8, enabled.?, "1")) return error.SkipZigTest;
+    if (!env_util.integrationEnabled(std.testing.allocator, "hvf-net")) return error.SkipZigTest;
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
@@ -4776,17 +4735,8 @@ test "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled" 
     defer if (disk) |d| std.testing.allocator.free(d);
     if (kernel == null or (initrd == null and disk == null)) return error.SkipZigTest;
 
-    const force_timeout_z = try allocZ(std.testing.allocator, "M80_TEST_HVF_FORCE_STOP_TIMEOUT");
-    defer std.testing.allocator.free(force_timeout_z);
-    const one_z = try allocZ(std.testing.allocator, "1");
-    defer std.testing.allocator.free(one_z);
-    if (setenv(force_timeout_z, one_z, 1) != 0) return error.SkipZigTest;
-    defer _ = unsetenv(force_timeout_z);
-
-    const console_z = try allocZ(std.testing.allocator, "M80_VIRTIO_CONSOLE");
-    defer std.testing.allocator.free(console_z);
-    _ = setenv(console_z, one_z, 1);
-    defer _ = unsetenv(console_z);
+    setForceStopTimeoutForTests(true);
+    defer setForceStopTimeoutForTests(false);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
@@ -4847,22 +4797,8 @@ test "hvf: arm64 boot accepts console input" {
     const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
     defer std.testing.allocator.free(out_path);
 
-    var out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-    out_file.close();
-
-    const name_z = try allocZ(std.testing.allocator, "M80_SERIAL_OUT");
-    defer std.testing.allocator.free(name_z);
-    const path_z = try allocZ(std.testing.allocator, out_path);
-    defer std.testing.allocator.free(path_z);
-    if (setenv(name_z, path_z, 1) != 0) return error.SkipZigTest;
-    defer _ = unsetenv(name_z);
-
-    const console_z = try allocZ(std.testing.allocator, "M80_VIRTIO_CONSOLE");
-    defer std.testing.allocator.free(console_z);
-    const console_val_z = try allocZ(std.testing.allocator, "1");
-    defer std.testing.allocator.free(console_val_z);
-    _ = setenv(console_z, console_val_z, 1);
-    defer _ = unsetenv(console_z);
+    try prepareSerialCapture(out_path);
+    defer serial.clearCapture(std.testing.allocator);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;

@@ -10,7 +10,7 @@ See [docs/PROJECT.md](docs/PROJECT.md) for the canonical project status, roadmap
 - macOS HVF is the most complete backend path.
 - Windows WHP and Linux/POSIX KVM paths exist but still need real-host lifecycle validation.
 - Jailer, mount, networking-policy, virtio device, and filesystem-image snapshot building blocks are implemented with platform-gated integration work still pending.
-- Latest local validation from 2026-04-29: `zig build test` loaded 348 tests; 328 passed, 20 skipped, 0 failed.
+- Latest local validation from 2026-05-02: `zig build test` loaded 354 tests; 333 passed, 21 skipped, 0 failed.
 
 ## Build
 

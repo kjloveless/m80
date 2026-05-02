@@ -36,6 +36,7 @@ test "import: all modules" {
     _ = @import("main.zig");
     _ = @import("net/dns.zig");
     _ = @import("net/policy.zig");
+    _ = @import("util/env.zig");
     _ = @import("util/log.zig");
     _ = @import("util/path.zig");
     _ = @import("vm/hvf.zig");
