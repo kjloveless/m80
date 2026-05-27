@@ -33,7 +33,7 @@ const VmRecord = struct {
 
 const TcpStream = struct {
     guest_cid: u32,
-    fd: std.posix.fd_t,
+    stream: std.Io.net.Stream,
 };
 
 const DaemonState = struct {
@@ -65,7 +65,7 @@ const DaemonState = struct {
 
         var stream_it = self.tcp_streams.iterator();
         while (stream_it.next()) |entry| {
-            fs.closeFd(entry.value_ptr.fd);
+            closeTcpStream(entry.value_ptr.stream);
         }
         self.tcp_streams.deinit();
 
@@ -403,7 +403,7 @@ fn removeTcpStreamsForCidLocked(state: *DaemonState, guest_cid: u32) void {
         }
         const stream_id = found orelse return;
         if (state.tcp_streams.fetchRemove(stream_id)) |entry| {
-            fs.closeFd(entry.value.fd);
+            closeTcpStream(entry.value.stream);
         }
     }
 }
@@ -684,39 +684,134 @@ fn isTcpTargetAllowed(record: *const VmRecord, host: []const u8, port: u16) bool
     return isDomainAllowed(record, host, port);
 }
 
-fn ipv4TextFromAddrInfo(ai: *std.c.addrinfo, buf: []u8) ?[]const u8 {
-    if (ai.family != std.c.AF.INET) return null;
-    const addr = ai.addr orelse return null;
-    const in_addr: *const std.c.sockaddr.in = @ptrCast(@alignCast(addr));
-    const bytes: [4]u8 = @bitCast(in_addr.addr);
-    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch null;
+fn closeTcpStream(stream: std.Io.net.Stream) void {
+    stream.close(fs.io());
 }
 
-fn ipv6TextFromAddrInfo(ai: *std.c.addrinfo, buf: []u8) ?[]const u8 {
-    if (ai.family != std.c.AF.INET6) return null;
-    const addr = ai.addr orelse return null;
-    const in6_addr: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(addr));
-    return formatIpv6Bytes(buf, in6_addr.addr);
+fn closeSocket(socket: std.Io.net.Socket) void {
+    socket.close(fs.io());
 }
 
-fn ipv4IsSensitive(value: []const u8) bool {
-    const ip = ipv4ToU32(value) orelse return true;
-    return (ip & 0xff000000) == 0x00000000 or // 0.0.0.0/8
-        (ip & 0xff000000) == 0x0a000000 or // 10.0.0.0/8
-        (ip & 0xff000000) == 0x7f000000 or // 127.0.0.0/8
-        (ip & 0xffc00000) == 0x64400000 or // 100.64.0.0/10
-        (ip & 0xfff00000) == 0xac100000 or // 172.16.0.0/12
-        (ip & 0xffff0000) == 0xa9fe0000 or // 169.254.0.0/16
-        (ip & 0xffff0000) == 0xc0a80000 or // 192.168.0.0/16
-        (ip & 0xffff0000) == 0xc6120000 or // 198.18.0.0/15
-        (ip & 0xf0000000) == 0xe0000000; // multicast and reserved
+fn shortTimeout(ms: i64) std.Io.Timeout {
+    return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
 }
 
-fn ipv6IsSensitiveFromAddrInfo(ai: *std.c.addrinfo) bool {
-    if (ai.family != std.c.AF.INET6) return false;
-    const addr = ai.addr orelse return true;
-    const in6_addr: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(addr));
-    const bytes = in6_addr.addr;
+const TcpReadResult = struct {
+    len: usize = 0,
+    eof: bool = false,
+};
+
+fn tcpStreamReadAvailable(stream: std.Io.net.Stream, buffer: []u8) !TcpReadResult {
+    if (buffer.len == 0) return .{};
+    return switch (builtin.os.tag) {
+        .windows => tcpStreamReadAvailableWindows(stream, buffer),
+        else => tcpStreamReadAvailablePosix(stream, buffer),
+    };
+}
+
+fn tcpStreamReadAvailablePosix(stream: std.Io.net.Stream, buffer: []u8) !TcpReadResult {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = stream.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(fds[0..], 1);
+    if (ready == 0) return .{};
+
+    const revents = fds[0].revents;
+    if ((revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return error.SocketUnconnected;
+    if ((revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0) return .{};
+
+    const n = std.posix.read(stream.socket.handle, buffer) catch |e| switch (e) {
+        error.WouldBlock => return .{},
+        else => return e,
+    };
+    if (n == 0) return .{ .eof = true };
+    return .{ .len = n };
+}
+
+fn tcpStreamReadAvailableWindows(stream: std.Io.net.Stream, buffer: []u8) !TcpReadResult {
+    const windows = std.os.windows;
+    var afd_buffer = [_]windows.AFD.WSABUF(.@"var"){.{
+        .len = @intCast(buffer.len),
+        .buf = buffer.ptr,
+    }};
+    var recv_info = windows.AFD.RECV_INFO{
+        .BufferArray = &afd_buffer,
+        .BufferCount = afd_buffer.len,
+        .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+        .TdiFlags = .{ .NORMAL = true },
+    };
+
+    const io_handle = fs.io();
+    var storage: [1]std.Io.Operation.Storage = undefined;
+    var batch = std.Io.Batch.init(&storage);
+    defer batch.cancel(io_handle);
+
+    _ = batch.add(.{ .device_io_control = .{
+        .file = .{ .handle = stream.socket.handle, .flags = .{ .nonblocking = true } },
+        .code = windows.IOCTL.AFD.RECEIVE,
+        .in = std.mem.asBytes(&recv_info),
+    } });
+    batch.awaitConcurrent(io_handle, shortTimeout(1)) catch |e| switch (e) {
+        error.Timeout => return .{},
+        else => return e,
+    };
+
+    const completion = batch.next() orelse return .{};
+    const iosb = completion.result.device_io_control;
+    switch (iosb.u.Status) {
+        .SUCCESS => {
+            const n: usize = @intCast(iosb.Information);
+            if (n == 0) return .{ .eof = true };
+            return .{ .len = n };
+        },
+        .CANCELLED => return .{},
+        .END_OF_FILE,
+        .PIPE_BROKEN,
+        .LOCAL_DISCONNECT,
+        .REMOTE_DISCONNECT,
+        .GRACEFUL_DISCONNECT,
+        .CONNECTION_DISCONNECTED,
+        => return .{ .eof = true },
+        .CONNECTION_RESET => return error.ConnectionResetByPeer,
+        .INVALID_CONNECTION,
+        .DEVICE_NOT_CONNECTED,
+        .ADDRESS_CLOSED,
+        => return error.SocketUnconnected,
+        .TIMEOUT,
+        .IO_TIMEOUT,
+        => return .{},
+        .INSUFFICIENT_RESOURCES,
+        .INVALID_USER_BUFFER,
+        .NO_MEMORY,
+        .QUOTA_EXCEEDED,
+        .WORKING_SET_QUOTA,
+        => return error.SystemResources,
+        else => |status| return windows.unexpectedStatus(status),
+    }
+}
+
+fn unspecifiedFor(address: std.Io.net.IpAddress) std.Io.net.IpAddress {
+    return switch (address) {
+        .ip4 => .{ .ip4 = .unspecified(0) },
+        .ip6 => .{ .ip6 = .unspecified(0) },
+    };
+}
+
+fn addressText(address: std.Io.net.IpAddress, buf: []u8) ?[]const u8 {
+    return switch (address) {
+        .ip4 => |ip4| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+            ip4.bytes[0],
+            ip4.bytes[1],
+            ip4.bytes[2],
+            ip4.bytes[3],
+        }) catch null,
+        .ip6 => |ip6| formatIpv6Bytes(buf, ip6.bytes),
+    };
+}
+
+fn ipv6IsSensitiveBytes(bytes: [16]u8) bool {
     const all_zero = blk: {
         for (bytes) |byte| {
             if (byte != 0) break :blk false;
@@ -732,93 +827,121 @@ fn ipv6IsSensitiveFromAddrInfo(ai: *std.c.addrinfo) bool {
     return all_zero or loopback or bytes[0] == 0xff or (bytes[0] == 0xfe and (bytes[1] & 0xc0) == 0x80) or (bytes[0] & 0xfe) == 0xfc;
 }
 
-fn resolvedAddrAllowed(record: *const VmRecord, host_is_ip_literal: bool, ai: *std.c.addrinfo) bool {
+fn resolvedAddressAllowed(record: *const VmRecord, host_is_ip_literal: bool, address: std.Io.net.IpAddress) bool {
     if (host_is_ip_literal or record.network_mode != .allowlist) return true;
+
     var ip_buf: [64]u8 = undefined;
-    if (ipv4TextFromAddrInfo(ai, &ip_buf)) |ip| {
-        if (!ipv4IsSensitive(ip)) return true;
-        return isIpAllowed(record, ip);
-    }
-    if (ipv6TextFromAddrInfo(ai, &ip_buf)) |ip| {
-        if (!ipv6IsSensitiveFromAddrInfo(ai)) return true;
-        return isIpAllowed(record, ip);
-    }
-    return false;
+    const ip = addressText(address, &ip_buf) orelse return false;
+    return switch (address) {
+        .ip4 => if (!ipv4IsSensitive(ip)) true else isIpAllowed(record, ip),
+        .ip6 => |ip6| if (!ipv6IsSensitiveBytes(ip6.bytes)) true else isIpAllowed(record, ip),
+    };
 }
 
-fn waitForConnect(fd: std.posix.fd_t) !void {
-    var fds = [_]std.posix.pollfd{.{
-        .fd = fd,
-        .events = @intCast(std.c.POLL.OUT),
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&fds, 5000);
-    if (ready == 0) return error.Timeout;
+fn lookupAddresses(
+    host: []const u8,
+    port: u16,
+    family: ?std.Io.net.IpAddress.Family,
+    results: *std.ArrayList(std.Io.net.IpAddress),
+    allocator: std.mem.Allocator,
+) !void {
+    const host_name = std.Io.net.HostName.init(host) catch return error.InvalidRequest;
+    var lookup_buffer: [32]std.Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+    std.Io.net.HostName.lookup(host_name, fs.io(), &lookup_queue, .{
+        .port = port,
+        .family = family,
+    }) catch return error.NameResolutionFailed;
 
-    var socket_error: c_int = 0;
-    var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
-    const rc = std.c.getsockopt(fd, std.c.SOL.SOCKET, std.c.SO.ERROR, &socket_error, &socket_error_len);
-    if (rc != 0 or socket_error != 0) return error.ConnectFailed;
+    while (true) {
+        const result = lookup_queue.getOne(fs.io()) catch |e| switch (e) {
+            error.Closed => break,
+            else => return e,
+        };
+        switch (result) {
+            .address => |address| try results.append(allocator, address),
+            .canonical_name => {},
+        }
+    }
+    if (results.items.len == 0) return error.NameResolutionFailed;
 }
 
-fn connectAddrInfo(ai: *std.c.addrinfo) !std.posix.fd_t {
-    const fd_rc = std.c.socket(@intCast(ai.family), @intCast(ai.socktype), @intCast(ai.protocol));
-    switch (std.c.errno(fd_rc)) {
-        .SUCCESS => {},
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        else => return error.ConnectFailed,
-    }
-    const fd: std.posix.fd_t = @intCast(fd_rc);
-    errdefer fs.closeFd(fd);
+fn collectTargetAddresses(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    family: ?std.Io.net.IpAddress.Family,
+) !std.ArrayList(std.Io.net.IpAddress) {
+    var addresses: std.ArrayList(std.Io.net.IpAddress) = .empty;
+    errdefer addresses.deinit(allocator);
 
-    try net.setNonblocking(fd, true);
-    const addr = ai.addr orelse return error.ConnectFailed;
-    const rc = std.c.connect(fd, addr, ai.addrlen);
-    switch (std.c.errno(rc)) {
-        .SUCCESS => {},
-        .INPROGRESS => try waitForConnect(fd),
-        .ISCONN => {},
-        else => return error.ConnectFailed,
+    if (std.Io.net.IpAddress.parse(host, port)) |address| {
+        if (family) |required| {
+            if (std.meta.activeTag(address) != required) return error.NameResolutionFailed;
+        }
+        try addresses.append(allocator, address);
+    } else |_| {
+        try lookupAddresses(host, port, family, &addresses, allocator);
     }
-    return fd;
+    return addresses;
 }
 
-fn openTcpConnection(allocator: std.mem.Allocator, record: *const VmRecord, host: []const u8, port: u16) !std.posix.fd_t {
+fn ipv4IsSensitive(value: []const u8) bool {
+    const ip = ipv4ToU32(value) orelse return true;
+    return (ip & 0xff000000) == 0x00000000 or // 0.0.0.0/8
+        (ip & 0xff000000) == 0x0a000000 or // 10.0.0.0/8
+        (ip & 0xff000000) == 0x7f000000 or // 127.0.0.0/8
+        (ip & 0xffc00000) == 0x64400000 or // 100.64.0.0/10
+        (ip & 0xfff00000) == 0xac100000 or // 172.16.0.0/12
+        (ip & 0xffff0000) == 0xa9fe0000 or // 169.254.0.0/16
+        (ip & 0xffff0000) == 0xc0a80000 or // 192.168.0.0/16
+        (ip & 0xffff0000) == 0xc6120000 or // 198.18.0.0/15
+        (ip & 0xf0000000) == 0xe0000000; // multicast and reserved
+}
+
+fn openTcpConnection(allocator: std.mem.Allocator, record: *const VmRecord, host: []const u8, port: u16) !std.Io.net.Stream {
     if (host.len == 0 or host.len > 253 or std.mem.indexOfScalar(u8, host, 0) != null) {
         return error.InvalidRequest;
     }
     const host_is_ip_literal = isIpLiteral(host);
 
-    const host_z = try allocator.dupeZ(u8, host);
-    defer allocator.free(host_z);
-    var service_buf: [6]u8 = undefined;
-    const service_z = try std.fmt.bufPrintZ(&service_buf, "{d}", .{port});
-
-    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
-    hints.family = std.c.AF.UNSPEC;
-    hints.socktype = std.c.SOCK.STREAM;
-    hints.protocol = std.c.IPPROTO.TCP;
-
-    var res: ?*std.c.addrinfo = null;
-    const gai = std.c.getaddrinfo(host_z, service_z, &hints, &res);
-    if (@intFromEnum(gai) != 0) return error.NameResolutionFailed;
-    defer if (res) |addr| std.c.freeaddrinfo(addr);
+    var addresses = try collectTargetAddresses(allocator, host, port, null);
+    defer addresses.deinit(allocator);
 
     var last_error: anyerror = error.ConnectFailed;
-    var current = res;
-    while (current) |ai| : (current = ai.next) {
-        if (!resolvedAddrAllowed(record, host_is_ip_literal, ai)) {
+    for (addresses.items) |address| {
+        if (!resolvedAddressAllowed(record, host_is_ip_literal, address)) {
             last_error = error.BlockedResolvedAddress;
             continue;
         }
-        const fd = connectAddrInfo(ai) catch |e| {
+        const stream = address.connect(fs.io(), .{
+            .mode = .stream,
+            .protocol = .tcp,
+            .timeout = .none,
+        }) catch |e| {
             last_error = e;
             continue;
         };
-        return fd;
+        return stream;
     }
     return last_error;
+}
+
+fn udpExchangeAddress(address: std.Io.net.IpAddress, payload: []const u8, response: []u8, timeout_ms: i64) !usize {
+    const bind_address = unspecifiedFor(address);
+    var socket = try bind_address.bind(fs.io(), .{ .mode = .dgram, .protocol = .udp });
+    defer closeSocket(socket);
+
+    try socket.send(fs.io(), &address, payload);
+    const deadline = sync.nanoTimestamp() + @as(i128, timeout_ms) * std.time.ns_per_ms;
+    while (true) {
+        const remaining_ns = deadline - sync.nanoTimestamp();
+        if (remaining_ns <= 0) return error.Timeout;
+        const remaining_ms: i64 = @intCast(@max(@as(i128, 1), @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        const message = try socket.receiveTimeout(fs.io(), response, shortTimeout(remaining_ms));
+        if (!message.from.eql(&address)) continue;
+        return message.data.len;
+    }
 }
 
 fn udpExchange(allocator: std.mem.Allocator, record: *const VmRecord, host: []const u8, port: u16, payload: []const u8, response: []u8) !usize {
@@ -828,83 +951,31 @@ fn udpExchange(allocator: std.mem.Allocator, record: *const VmRecord, host: []co
     if (payload.len == 0 or payload.len > 4096) return error.InvalidRequest;
 
     const host_is_ip_literal = isIpLiteral(host);
-    const host_z = try allocator.dupeZ(u8, host);
-    defer allocator.free(host_z);
-    var service_buf: [6]u8 = undefined;
-    const service_z = try std.fmt.bufPrintZ(&service_buf, "{d}", .{port});
-
-    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
-    hints.family = std.c.AF.UNSPEC;
-    hints.socktype = std.c.SOCK.DGRAM;
-    hints.protocol = std.c.IPPROTO.UDP;
-
-    var res: ?*std.c.addrinfo = null;
-    const gai = std.c.getaddrinfo(host_z, service_z, &hints, &res);
-    if (@intFromEnum(gai) != 0) return error.NameResolutionFailed;
-    defer if (res) |addr| std.c.freeaddrinfo(addr);
+    var addresses = try collectTargetAddresses(allocator, host, port, null);
+    defer addresses.deinit(allocator);
 
     var last_error: anyerror = error.NetworkError;
-    var current = res;
-    while (current) |ai| : (current = ai.next) {
-        if (!resolvedAddrAllowed(record, host_is_ip_literal, ai)) {
+    for (addresses.items) |address| {
+        if (!resolvedAddressAllowed(record, host_is_ip_literal, address)) {
             last_error = error.BlockedResolvedAddress;
             continue;
         }
 
-        const fd_rc = std.c.socket(@intCast(ai.family), @intCast(ai.socktype), @intCast(ai.protocol));
-        switch (std.c.errno(fd_rc)) {
-            .SUCCESS => {},
-            else => {
-                last_error = error.NetworkError;
-                continue;
-            },
-        }
-        const fd: std.posix.fd_t = @intCast(fd_rc);
-        defer fs.closeFd(fd);
-
-        const addr = ai.addr orelse {
-            last_error = error.NetworkError;
-            continue;
-        };
-        if (std.c.connect(fd, addr, ai.addrlen) != 0) {
-            last_error = error.NetworkError;
-            continue;
-        }
-        try net.setNonblocking(fd, true);
-
-        const sent = std.c.send(fd, payload.ptr, payload.len, 0);
-        switch (std.c.errno(sent)) {
-            .SUCCESS => if (@as(usize, @intCast(sent)) != payload.len) {
-                last_error = error.NetworkError;
-                continue;
-            },
-            else => {
-                last_error = error.NetworkError;
-                continue;
-            },
-        }
-
-        var fds = [_]std.posix.pollfd{.{
-            .fd = fd,
-            .events = @intCast(std.c.POLL.IN),
-            .revents = 0,
-        }};
-        const ready = std.posix.poll(&fds, 2000) catch |e| {
+        const received = udpExchangeAddress(address, payload, response, 2000) catch |e| {
             last_error = e;
             continue;
         };
-        if (ready == 0) {
-            last_error = error.Timeout;
-            continue;
-        }
-
-        const received = std.c.recv(fd, response.ptr, response.len, 0);
-        return switch (std.c.errno(received)) {
-            .SUCCESS => @intCast(received),
-            else => error.NetworkError,
-        };
+        return received;
     }
     return last_error;
+}
+
+fn icmpIdentifier() u16 {
+    if (builtin.os.tag == .windows) {
+        const now_bits: u128 = @bitCast(sync.nanoTimestamp());
+        return @truncate(now_bits);
+    }
+    return @truncate(@as(u32, @intCast(std.c.getpid())));
 }
 
 fn internetChecksum(bytes: []const u8) u16 {
@@ -923,21 +994,12 @@ fn internetChecksum(bytes: []const u8) u16 {
 fn icmpEchoIp4(ip: []const u8, payload: []const u8, response: []u8) !usize {
     if (payload.len > 1024) return error.InvalidRequest;
     const parsed = std.Io.net.IpAddress.parseIp4(ip, 0) catch return error.InvalidRequest;
-    const bytes = parsed.ip4.bytes;
-    var addr: std.c.sockaddr.in = .{
-        .port = 0,
-        .addr = @bitCast(bytes),
-    };
-
-    const fd_rc = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, std.c.IPPROTO.ICMP);
-    switch (std.c.errno(fd_rc)) {
-        .SUCCESS => {},
-        .ACCES, .PERM => return error.AccessDenied,
-        else => return error.NetworkError,
-    }
-    const fd: std.posix.fd_t = @intCast(fd_rc);
-    defer fs.closeFd(fd);
-    try net.setNonblocking(fd, true);
+    const bind_address = std.Io.net.IpAddress{ .ip4 = .unspecified(0) };
+    var socket = try bind_address.bind(fs.io(), .{
+        .mode = .dgram,
+        .protocol = .icmp,
+    });
+    defer closeSocket(socket);
 
     var packet: [1032]u8 = undefined;
     const packet_len = 8 + payload.len;
@@ -945,7 +1007,7 @@ fn icmpEchoIp4(ip: []const u8, payload: []const u8, response: []u8) !usize {
     packet[1] = 0;
     packet[2] = 0;
     packet[3] = 0;
-    const ident: u16 = @truncate(@as(u32, @intCast(std.c.getpid())));
+    const ident = icmpIdentifier();
     packet[4] = @intCast(ident >> 8);
     packet[5] = @intCast(ident & 0xff);
     packet[6] = 0;
@@ -955,46 +1017,20 @@ fn icmpEchoIp4(ip: []const u8, payload: []const u8, response: []u8) !usize {
     packet[2] = @intCast(checksum >> 8);
     packet[3] = @intCast(checksum & 0xff);
 
-    const sent = std.c.sendto(fd, &packet, packet_len, 0, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in));
-    switch (std.c.errno(sent)) {
-        .SUCCESS => if (@as(usize, @intCast(sent)) != packet_len) return error.NetworkError,
-        else => return error.NetworkError,
-    }
-
-    var fds = [_]std.posix.pollfd{.{
-        .fd = fd,
-        .events = @intCast(std.c.POLL.IN),
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&fds, 2000);
-    if (ready == 0) return error.Timeout;
-
-    const received = std.c.recvfrom(fd, response.ptr, response.len, 0, null, null);
-    return switch (std.c.errno(received)) {
-        .SUCCESS => @intCast(received),
-        else => error.NetworkError,
-    };
+    try socket.send(fs.io(), &parsed, packet[0..packet_len]);
+    const message = try socket.receiveTimeout(fs.io(), response, shortTimeout(2000));
+    return message.data.len;
 }
 
 fn icmpEchoIp6(ip: []const u8, payload: []const u8, response: []u8) !usize {
     if (payload.len > 1024) return error.InvalidRequest;
     const parsed = std.Io.net.IpAddress.parseIp6(ip, 0) catch return error.InvalidRequest;
-    var addr: std.c.sockaddr.in6 = .{
-        .port = 0,
-        .flowinfo = 0,
-        .addr = parsed.ip6.bytes,
-        .scope_id = 0,
-    };
-
-    const fd_rc = std.c.socket(std.c.AF.INET6, std.c.SOCK.DGRAM, std.c.IPPROTO.ICMPV6);
-    switch (std.c.errno(fd_rc)) {
-        .SUCCESS => {},
-        .ACCES, .PERM => return error.AccessDenied,
-        else => return error.NetworkError,
-    }
-    const fd: std.posix.fd_t = @intCast(fd_rc);
-    defer fs.closeFd(fd);
-    try net.setNonblocking(fd, true);
+    const bind_address = std.Io.net.IpAddress{ .ip6 = .unspecified(0) };
+    var socket = try bind_address.bind(fs.io(), .{
+        .mode = .dgram,
+        .protocol = .icmpv6,
+    });
+    defer closeSocket(socket);
 
     var packet: [1032]u8 = undefined;
     const packet_len = 8 + payload.len;
@@ -1002,32 +1038,16 @@ fn icmpEchoIp6(ip: []const u8, payload: []const u8, response: []u8) !usize {
     packet[1] = 0;
     packet[2] = 0;
     packet[3] = 0;
-    const ident: u16 = @truncate(@as(u32, @intCast(std.c.getpid())));
+    const ident = icmpIdentifier();
     packet[4] = @intCast(ident >> 8);
     packet[5] = @intCast(ident & 0xff);
     packet[6] = 0;
     packet[7] = 1;
     @memcpy(packet[8..packet_len], payload);
 
-    const sent = std.c.sendto(fd, &packet, packet_len, 0, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in6));
-    switch (std.c.errno(sent)) {
-        .SUCCESS => if (@as(usize, @intCast(sent)) != packet_len) return error.NetworkError,
-        else => return error.NetworkError,
-    }
-
-    var fds = [_]std.posix.pollfd{.{
-        .fd = fd,
-        .events = @intCast(std.c.POLL.IN),
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&fds, 2000);
-    if (ready == 0) return error.Timeout;
-
-    const received = std.c.recvfrom(fd, response.ptr, response.len, 0, null, null);
-    return switch (std.c.errno(received)) {
-        .SUCCESS => @intCast(received),
-        else => error.NetworkError,
-    };
+    try socket.send(fs.io(), &parsed, packet[0..packet_len]);
+    const message = try socket.receiveTimeout(fs.io(), response, shortTimeout(2000));
+    return message.data.len;
 }
 
 fn icmpEcho(ip: []const u8, payload: []const u8, response: []u8) !usize {
@@ -1073,41 +1093,7 @@ fn loadResolverServers(allocator: std.mem.Allocator, servers: *[4][16]u8) usize 
 
 fn sendDnsQuery(server: []const u8, query: []const u8, response: []u8) !usize {
     const ip = std.Io.net.IpAddress.parseIp4(server, 53) catch return error.InvalidRequest;
-    const bytes = ip.ip4.bytes;
-    var addr: std.c.sockaddr.in = .{
-        .port = std.mem.nativeToBig(u16, 53),
-        .addr = @bitCast(bytes),
-    };
-
-    const fd_rc = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, std.c.IPPROTO.UDP);
-    switch (std.c.errno(fd_rc)) {
-        .SUCCESS => {},
-        else => return error.NetworkError,
-    }
-    const fd: std.posix.fd_t = @intCast(fd_rc);
-    defer fs.closeFd(fd);
-    try net.setNonblocking(fd, true);
-
-    const sent = std.c.sendto(fd, query.ptr, query.len, 0, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in));
-    switch (std.c.errno(sent)) {
-        .SUCCESS => if (@as(usize, @intCast(sent)) != query.len) return error.NetworkError,
-        .AGAIN => return error.NetworkError,
-        else => return error.NetworkError,
-    }
-
-    var fds = [_]std.posix.pollfd{.{
-        .fd = fd,
-        .events = @intCast(std.c.POLL.IN),
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&fds, 2000);
-    if (ready == 0) return error.Timeout;
-
-    const received = std.c.recvfrom(fd, response.ptr, response.len, 0, null, null);
-    return switch (std.c.errno(received)) {
-        .SUCCESS => @intCast(received),
-        else => error.NetworkError,
-    };
+    return udpExchangeAddress(ip, query, response, 2000);
 }
 
 fn forwardDnsQueryHex(allocator: std.mem.Allocator, request_hex: []const u8) ![]u8 {
@@ -1239,7 +1225,9 @@ fn handleRegisterVm(state: *DaemonState, allocator: std.mem.Allocator, id: u64, 
     } else null;
 
     var guest_socket_path: ?[]u8 = null;
+    var replaced_guest_socket_path: ?[]u8 = null;
     var ownership_moved = false;
+    defer if (replaced_guest_socket_path) |path| allocator.free(path);
     errdefer if (!ownership_moved) {
         allocator.free(name_owned);
         if (metadata_file) |path| allocator.free(path);
@@ -1255,6 +1243,7 @@ fn handleRegisterVm(state: *DaemonState, allocator: std.mem.Allocator, id: u64, 
         removeTcpStreamsForCidLocked(state, entry.value.guest_cid);
         removeDnsAllowancesForCidLocked(state, entry.value.guest_cid);
         fs.cwd().deleteFile(entry.value.guest_socket_path) catch {};
+        replaced_guest_socket_path = allocator.dupe(u8, entry.value.guest_socket_path) catch null;
         freeVmRecord(allocator, entry.value);
     }
     const cid = state.next_cid;
@@ -1285,6 +1274,7 @@ fn handleRegisterVm(state: *DaemonState, allocator: std.mem.Allocator, id: u64, 
         return e;
     };
     state.mutex.unlock();
+    if (replaced_guest_socket_path) |path| net.wakeLocalSocket(path);
     ownership_moved = true;
 
     startGuestSocketServer(state, cid, guest_socket_path.?) catch |e| {
@@ -1305,14 +1295,20 @@ fn handleRegisterVm(state: *DaemonState, allocator: std.mem.Allocator, id: u64, 
 
 fn handleUnregisterVm(state: *DaemonState, allocator: std.mem.Allocator, id: u64, params: std.json.ObjectMap) ![]u8 {
     const name = jsonString(params, "name") orelse return protocol.buildErrorPayload(allocator, id, "missing vm name");
+    var removed_guest_socket_path: ?[]u8 = null;
+    defer if (removed_guest_socket_path) |path| allocator.free(path);
+
     state.mutex.lock();
-    defer state.mutex.unlock();
     if (state.vms.fetchRemove(name)) |entry| {
         removeTcpStreamsForCidLocked(state, entry.value.guest_cid);
         removeDnsAllowancesForCidLocked(state, entry.value.guest_cid);
         fs.cwd().deleteFile(entry.value.guest_socket_path) catch {};
+        removed_guest_socket_path = allocator.dupe(u8, entry.value.guest_socket_path) catch null;
         freeVmRecord(allocator, entry.value);
     }
+    state.mutex.unlock();
+
+    if (removed_guest_socket_path) |path| net.wakeLocalSocket(path);
     return protocol.buildSuccessPayload(allocator, id, .{ .removed = true });
 }
 
@@ -1347,21 +1343,19 @@ fn rejectGuestVmIdentity(allocator: std.mem.Allocator, id: u64, params: std.json
     return null;
 }
 
-fn handleTcpOpen(state: *DaemonState, allocator: std.mem.Allocator, guest_cid: u32, id: u64, record: *const VmRecord, params: std.json.ObjectMap) ![]u8 {
-    const host = jsonString(params, "host") orelse return protocol.buildErrorPayload(allocator, id, "missing host");
-    const port = jsonInt(u16, params, "port") orelse return protocol.buildErrorPayload(allocator, id, "missing port");
+fn handleTcpOpenTarget(state: *DaemonState, allocator: std.mem.Allocator, guest_cid: u32, id: u64, record: *const VmRecord, host: []const u8, port: u16) ![]u8 {
     if (port == 0) return protocol.buildErrorPayload(allocator, id, "invalid port");
     if (!isTcpTargetAllowed(record, host, port)) {
         return protocol.buildErrorPayload(allocator, id, "tcp blocked by network policy");
     }
 
-    const fd = openTcpConnection(allocator, record, host, port) catch |e| {
+    const stream = openTcpConnection(allocator, record, host, port) catch |e| {
         if (e == error.BlockedResolvedAddress) {
             return protocol.buildErrorPayload(allocator, id, "tcp blocked by network policy");
         }
         return protocol.buildErrorPayload(allocator, id, "tcp connect failed");
     };
-    errdefer fs.closeFd(fd);
+    errdefer closeTcpStream(stream);
 
     state.mutex.lock();
     var registered = false;
@@ -1378,13 +1372,26 @@ fn handleTcpOpen(state: *DaemonState, allocator: std.mem.Allocator, guest_cid: u
     }
     const stream_id = state.next_tcp_stream_id;
     state.next_tcp_stream_id += 1;
-    state.tcp_streams.put(stream_id, .{ .guest_cid = guest_cid, .fd = fd }) catch |e| {
+    state.tcp_streams.put(stream_id, .{ .guest_cid = guest_cid, .stream = stream }) catch |e| {
         state.mutex.unlock();
         return e;
     };
     state.mutex.unlock();
 
     return protocol.buildSuccessPayload(allocator, id, .{ .stream_id = stream_id });
+}
+
+fn handleTcpOpen(state: *DaemonState, allocator: std.mem.Allocator, guest_cid: u32, id: u64, record: *const VmRecord, params: std.json.ObjectMap) ![]u8 {
+    const host = jsonString(params, "host") orelse return protocol.buildErrorPayload(allocator, id, "missing host");
+    const port = jsonInt(u16, params, "port") orelse return protocol.buildErrorPayload(allocator, id, "missing port");
+    return handleTcpOpenTarget(state, allocator, guest_cid, id, record, host, port);
+}
+
+fn handleTcpConnect(state: *DaemonState, allocator: std.mem.Allocator, guest_cid: u32, id: u64, record: *const VmRecord, params: std.json.ObjectMap) ![]u8 {
+    const ip = jsonString(params, "ip") orelse return protocol.buildErrorPayload(allocator, id, "missing ip");
+    const port = jsonInt(u16, params, "port") orelse return protocol.buildErrorPayload(allocator, id, "missing port");
+    if (!isIpLiteral(ip)) return protocol.buildErrorPayload(allocator, id, "invalid tcp target");
+    return handleTcpOpenTarget(state, allocator, guest_cid, id, record, ip, port);
 }
 
 fn handleTcpWrite(state: *DaemonState, allocator: std.mem.Allocator, guest_cid: u32, id: u64, params: std.json.ObjectMap) ![]u8 {
@@ -1394,20 +1401,40 @@ fn handleTcpWrite(state: *DaemonState, allocator: std.mem.Allocator, guest_cid: 
     defer allocator.free(data);
 
     var result: enum { ok, not_found, write_failed } = .ok;
+    var stream: ?TcpStream = null;
     state.mutex.lock();
-    if (state.tcp_streams.getPtr(stream_id)) |stream| {
-        if (stream.guest_cid != guest_cid) {
+    if (state.tcp_streams.fetchRemove(stream_id)) |entry| {
+        if (entry.value.guest_cid != guest_cid) {
+            state.tcp_streams.put(stream_id, entry.value) catch closeTcpStream(entry.value.stream);
             result = .not_found;
         } else {
-            writeFullFd(stream.fd, data) catch {
-                if (state.tcp_streams.fetchRemove(stream_id)) |entry| fs.closeFd(entry.value.fd);
-                result = .write_failed;
-            };
+            stream = entry.value;
         }
     } else {
         result = .not_found;
     }
     state.mutex.unlock();
+
+    if (stream) |entry| {
+        var write_buf: [4096]u8 = undefined;
+        var writer = entry.stream.writer(fs.io(), &write_buf);
+        writer.interface.writeAll(data) catch {
+            closeTcpStream(entry.stream);
+            return protocol.buildErrorPayload(allocator, id, "tcp write failed");
+        };
+        writer.interface.flush() catch {
+            closeTcpStream(entry.stream);
+            return protocol.buildErrorPayload(allocator, id, "tcp write failed");
+        };
+
+        state.mutex.lock();
+        state.tcp_streams.put(stream_id, entry) catch {
+            state.mutex.unlock();
+            closeTcpStream(entry.stream);
+            return protocol.buildErrorPayload(allocator, id, "tcp write failed");
+        };
+        state.mutex.unlock();
+    }
 
     return switch (result) {
         .ok => protocol.buildSuccessPayload(allocator, id, .{ .written = data.len }),
@@ -1423,35 +1450,42 @@ fn handleTcpRead(state: *DaemonState, allocator: std.mem.Allocator, guest_cid: u
     var read_buf: [8192]u8 = undefined;
     var read_len: usize = 0;
     var eof = false;
-    var would_block = false;
     var result: enum { ok, not_found, read_failed } = .ok;
+    var stream: ?TcpStream = null;
 
     state.mutex.lock();
-    if (state.tcp_streams.getPtr(stream_id)) |stream| {
-        if (stream.guest_cid != guest_cid) {
+    if (state.tcp_streams.fetchRemove(stream_id)) |entry| {
+        if (entry.value.guest_cid != guest_cid) {
+            state.tcp_streams.put(stream_id, entry.value) catch closeTcpStream(entry.value.stream);
             result = .not_found;
         } else {
-            const n = fs.readFd(stream.fd, read_buf[0..max_bytes]) catch |e| switch (e) {
-                error.WouldBlock => blk: {
-                    would_block = true;
-                    break :blk 0;
-                },
-                else => blk: {
-                    if (state.tcp_streams.fetchRemove(stream_id)) |entry| fs.closeFd(entry.value.fd);
-                    result = .read_failed;
-                    break :blk 0;
-                },
-            };
-            read_len = n;
-            if (result == .ok and n == 0 and !would_block) {
-                if (state.tcp_streams.fetchRemove(stream_id)) |entry| fs.closeFd(entry.value.fd);
-                eof = true;
-            }
+            stream = entry.value;
         }
     } else {
         result = .not_found;
     }
     state.mutex.unlock();
+
+    if (stream) |entry| {
+        const read = tcpStreamReadAvailable(entry.stream, read_buf[0..max_bytes]) catch {
+            closeTcpStream(entry.stream);
+            result = .read_failed;
+            return protocol.buildErrorPayload(allocator, id, "tcp read failed");
+        };
+        read_len = read.len;
+        if (read.eof) {
+            closeTcpStream(entry.stream);
+            eof = true;
+        } else {
+            state.mutex.lock();
+            state.tcp_streams.put(stream_id, entry) catch {
+                state.mutex.unlock();
+                closeTcpStream(entry.stream);
+                return protocol.buildErrorPayload(allocator, id, "tcp read failed");
+            };
+            state.mutex.unlock();
+        }
+    }
 
     if (result == .not_found) return protocol.buildErrorPayload(allocator, id, "tcp stream not found");
     if (result == .read_failed) return protocol.buildErrorPayload(allocator, id, "tcp read failed");
@@ -1468,7 +1502,7 @@ fn handleTcpClose(state: *DaemonState, allocator: std.mem.Allocator, guest_cid: 
     if (state.tcp_streams.get(stream_id)) |stream| {
         if (stream.guest_cid == guest_cid) {
             if (state.tcp_streams.fetchRemove(stream_id)) |entry| {
-                fs.closeFd(entry.value.fd);
+                closeTcpStream(entry.value.stream);
                 closed = true;
             }
         }
@@ -1610,9 +1644,7 @@ fn handleGuestRequest(state: *DaemonState, allocator: std.mem.Allocator, guest_c
     }
 
     if (std.mem.eql(u8, method, "tcp.connect")) {
-        const ip = jsonString(params, "ip") orelse return protocol.buildErrorPayload(allocator, id, "missing ip");
-        if (!isIpAllowed(&record, ip)) return protocol.buildErrorPayload(allocator, id, "tcp blocked by network policy");
-        return protocol.buildErrorPayload(allocator, id, "tcp transport not implemented");
+        return handleTcpConnect(state, allocator, guest_cid, id, &record, params);
     }
 
     if (std.mem.eql(u8, method, "udp.exchange") or std.mem.eql(u8, method, "udp.send")) {
@@ -1704,12 +1736,8 @@ fn socketServerLoop(ctx: SocketServerCtx) void {
         if (!ctx.state.hasGuestCid(cid)) return;
     }
 
-    fs.cwd().deleteFile(ctx.path) catch {};
-    const address = net.Address.initUnix(ctx.path) catch |e| {
-        log.err("daemon socket invalid path: {s}", .{@errorName(e)});
-        return;
-    };
-    var server = net.Address.listen(address, .{
+    if (builtin.os.tag != .windows) fs.cwd().deleteFile(ctx.path) catch {};
+    var server = net.listenLocalSocket(ctx.path, .{
         .kernel_backlog = 8,
         .reuse_address = false,
         .force_nonblocking = true,
@@ -1763,8 +1791,6 @@ fn socketServerLoop(ctx: SocketServerCtx) void {
 }
 
 pub fn run(allocator: std.mem.Allocator) !void {
-    if (builtin.os.tag == .windows) return error.NotSupported;
-
     const daemon_dir = try core.paths.daemonDir(allocator);
     defer allocator.free(daemon_dir);
     try fs.cwd().makePath(daemon_dir);
@@ -1811,6 +1837,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
     while (!state.shutting_down.load(.seq_cst)) {
         sync.sleep(100 * std.time.ns_per_ms);
     }
+
+    net.wakeLocalSocket(control_path);
+    net.wakeLocalSocket(register_path);
 
     control_thread.join();
     register_thread.join();
@@ -2027,6 +2056,11 @@ fn tcpEchoOnce(server: *std.Io.net.Server) void {
     writeFullFd(stream.socket.handle, buf[0..n]) catch {};
 }
 
+fn tcpAcceptCloseOnce(server: *std.Io.net.Server) void {
+    var stream = server.accept(fs.io()) catch return;
+    stream.close(fs.io());
+}
+
 fn udpEchoOnce(fd: std.posix.fd_t) void {
     var buf: [128]u8 = undefined;
     var peer: std.c.sockaddr.storage = undefined;
@@ -2108,6 +2142,48 @@ test "daemon server: tcp streams are cid-bound and enforce ip allowlist" {
         sync.sleep(10 * std.time.ns_per_ms);
     }
     try std.testing.expect(received);
+}
+
+test "daemon server: tcp connect aliases tcp open stream registration" {
+    var state = DaemonState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const register =
+        \\{"version":1,"id":1,"method":"vm.register","params":{"name":"alpha","memory_mb":512,"cpu_cores":1,"network_mode":"allowlist","network_services":[],"network_allowed_domains":[],"network_allowed_ips":["127.0.0.1"],"mounts":[],"started_at":1234}}
+    ;
+    const register_response = try dispatchRequest(&state, std.testing.allocator, .register, null, register);
+    defer std.testing.allocator.free(register_response);
+
+    const listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen_addr.listen(fs.io(), .{ .kernel_backlog = 1, .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const thread = try std.Thread.spawn(.{}, tcpAcceptCloseOnce, .{&server});
+    defer {
+        server.deinit(fs.io());
+        thread.join();
+    }
+
+    const connect_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":1,\"id\":2,\"method\":\"tcp.connect\",\"params\":{{\"ip\":\"127.0.0.1\",\"port\":{d}}}}}",
+        .{port},
+    );
+    defer std.testing.allocator.free(connect_payload);
+    const connect_response = try dispatchRequest(&state, std.testing.allocator, .guest, 16, connect_payload);
+    defer std.testing.allocator.free(connect_response);
+    var connect_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, connect_response, .{});
+    defer connect_parsed.deinit();
+    const stream_id: u64 = @intCast(connect_parsed.value.object.get("result").?.object.get("stream_id").?.integer);
+
+    const close_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":1,\"id\":3,\"method\":\"tcp.close\",\"params\":{{\"stream_id\":{d}}}}}",
+        .{stream_id},
+    );
+    defer std.testing.allocator.free(close_payload);
+    const close_response = try dispatchRequest(&state, std.testing.allocator, .guest, 16, close_payload);
+    defer std.testing.allocator.free(close_response);
+    try std.testing.expect((try responseErrorString(std.testing.allocator, close_response)) == null);
 }
 
 test "daemon server: udp exchange enforces policy before host socket use" {

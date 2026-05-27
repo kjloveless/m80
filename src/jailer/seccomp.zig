@@ -87,6 +87,11 @@ pub const BpfInstruction = extern struct {
     }
 };
 
+const BpfProgram = extern struct {
+    len: c_ushort,
+    filter: [*]BpfInstruction,
+};
+
 /// Linux x86_64 syscall numbers for VMM allowlist
 pub const Syscall = struct {
     pub const read: u32 = 0;
@@ -182,19 +187,19 @@ pub const SeccompFilter = struct {
         if (builtin.os.tag != .linux) return;
 
         const PR_SET_NO_NEW_PRIVS = 38;
-        const prctl_result = std.os.linux.prctl(@enumFromInt(PR_SET_NO_NEW_PRIVS), .{ 1, 0, 0, 0 });
-        if (prctl_result != 0) {
+        const prctl_result = std.os.linux.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        if (std.os.linux.errno(prctl_result) != .SUCCESS) {
             log.err("prctl SET_NO_NEW_PRIVS failed", .{});
             return SeccompError.SetNoNewPrivsFailed;
         }
 
-        const prog = std.os.linux.sock_fprog{
+        var prog = BpfProgram{
             .len = @intCast(self.instructions.items.len),
             .filter = @ptrCast(self.instructions.items.ptr),
         };
 
-        const seccomp_result = std.os.linux.seccomp(.SET_MODE_FILTER, 0, @ptrCast(&prog));
-        if (seccomp_result != 0) {
+        const seccomp_result = std.os.linux.seccomp(std.os.linux.SECCOMP.SET_MODE_FILTER, 0, @ptrCast(&prog));
+        if (std.os.linux.errno(seccomp_result) != .SUCCESS) {
             log.err("seccomp SET_MODE_FILTER failed", .{});
             return SeccompError.SeccompFailed;
         }
@@ -216,8 +221,8 @@ pub fn applyVmmSeccompFilter(allocator: std.mem.Allocator) SeccompError!void {
 pub fn isSeccompAvailable() bool {
     if (builtin.os.tag != .linux) return false;
     const PR_GET_SECCOMP = 21;
-    const result = std.os.linux.prctl(@enumFromInt(PR_GET_SECCOMP), .{ 0, 0, 0, 0 });
-    return @as(isize, @bitCast(result)) >= 0;
+    const result = std.os.linux.prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    return std.os.linux.errno(result) == .SUCCESS;
 }
 
 // =============================================================================
@@ -270,7 +275,7 @@ test "seccomp: buildAllowlist includes default and allow" {
     var filter = SeccompFilter.init(allocator, .errno_eperm);
     defer filter.deinit();
 
-    const allowed = [_]u32{ Syscall.read };
+    const allowed = [_]u32{Syscall.read};
     try filter.buildAllowlist(&allowed);
 
     const last = filter.instructions.items[filter.instructions.items.len - 1];

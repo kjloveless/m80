@@ -312,7 +312,9 @@ pub fn main(init: std.process.Init) !void {
     // Detect if we're in a TTY for fancy output
     const use_ansi = blk: {
         // Check stderr (fd 2) for TTY
-        if (@hasDecl(std.c, "isatty")) break :blk std.c.isatty(std.posix.STDERR_FILENO) != 0;
+        if (builtin.os.tag != .windows and @hasDecl(std.c, "isatty")) {
+            break :blk std.c.isatty(std.posix.STDERR_FILENO) != 0;
+        }
         // Fallback: assume TTY on most systems
         break :blk true;
     };

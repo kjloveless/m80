@@ -390,17 +390,7 @@ pub fn verifyPrivilegesDropped() JailerError!void {
 fn dropSupplementaryGroups() !void {
     if (builtin.os.tag == .windows) return;
 
-    // On Linux, use syscall directly
-    if (builtin.os.tag == .linux) {
-        const result = std.os.linux.syscall(.setgroups, .{ 0, @as(usize, 0) });
-        if (@as(isize, @bitCast(result)) < 0) {
-            log.err("setgroups failed", .{});
-            return error.SystemError;
-        }
-        return;
-    }
-
-    // POSIX path (macOS/BSD): clear supplemental groups explicitly.
+    // Clear supplemental groups explicitly.
     if (setgroups(0, null) != 0) {
         log.err("setgroups failed", .{});
         return error.SystemError;
@@ -433,22 +423,18 @@ fn performChroot(path: []const u8) JailerError!void {
 
     // chroot is Linux-specific via syscall
     if (builtin.os.tag == .linux) {
-        var path_buf: [fs.max_path_bytes]u8 = undefined;
-        if (path.len >= path_buf.len) return JailerError.InvalidConfig;
-
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-
-        const result = std.os.linux.syscall(.chroot, .{@intFromPtr(&path_buf)});
-        if (@as(isize, @bitCast(result)) < 0) {
+        const path_buf = std.posix.toPosixPath(path) catch return JailerError.InvalidConfig;
+        const result = std.os.linux.chroot(&path_buf);
+        if (std.os.linux.errno(result) != .SUCCESS) {
             log.err("chroot to {s} failed", .{path});
             return JailerError.ChrootFailed;
         }
 
-        std.posix.chdir("/") catch |e| {
-            log.err("chdir after chroot failed: {}", .{e});
+        const chdir_result = std.os.linux.chdir("/");
+        if (std.os.linux.errno(chdir_result) != .SUCCESS) {
+            log.err("chdir after chroot failed", .{});
             return JailerError.ChrootFailed;
-        };
+        }
 
         log.info("chroot to {s} successful", .{path});
         return;

@@ -36,13 +36,21 @@ const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const c = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("unistd.h");
-    @cInclude("sys/mount.h");
+    if (builtin.os.tag == .linux) {
+        @cInclude("sys/vfs.h");
+    } else {
+        @cInclude("sys/mount.h");
+    }
     @cInclude("sys/xattr.h");
     @cInclude("fcntl.h");
     @cInclude("sys/ioctl.h");
 });
 const mounts = @import("mounts.zig");
 const path_util = @import("../util/path.zig");
+
+fn ioctlRequest(request: u32) if (builtin.os.tag == .windows) u32 else @typeInfo(@TypeOf(c.ioctl)).@"fn".params[1].type.? {
+    return @intCast(request);
+}
 
 pub const VirtioFsError = error{
     InvalidRequest,
@@ -809,7 +817,7 @@ pub const VirtioFsDevice = struct {
         }
 
         const link_buf = response_buf[out_header_size..];
-        const link_len = fs.readLink(node.path, link_buf) catch |e| switch (e) {
+        const link_len = fs.readLink(node.path, link_buf) catch |e| switch (@as(anyerror, e)) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.NotLink => return self.sendError(header, -22, response_buf),
@@ -851,7 +859,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        fs.symLink(target.slice, full_path) catch |e| switch (e) {
+        fs.symLink(target.slice, full_path) catch |e| switch (@as(anyerror, e)) {
             error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.FileNotFound => return self.sendError(header, -2, response_buf),
@@ -908,7 +916,7 @@ pub const VirtioFsDevice = struct {
         if (self.validateAccess(old_path, .rename)) |errno| return self.sendError(header, errno, response_buf);
         if (self.validateAccess(new_path, .create)) |errno| return self.sendError(header, errno, response_buf);
 
-        fs.renamePath(old_path, new_path) catch |e| switch (e) {
+        fs.renamePath(old_path, new_path) catch |e| switch (@as(anyerror, e)) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.NotDir => return self.sendError(header, -20, response_buf),
@@ -973,7 +981,7 @@ pub const VirtioFsDevice = struct {
         if (self.validateAccess(old_path, .rename)) |errno| return self.sendError(header, errno, response_buf);
         if (self.validateAccess(new_path, .create)) |errno| return self.sendError(header, errno, response_buf);
 
-        fs.renamePath(old_path, new_path) catch |e| switch (e) {
+        fs.renamePath(old_path, new_path) catch |e| switch (@as(anyerror, e)) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.NotDir => return self.sendError(header, -20, response_buf),
@@ -1015,7 +1023,7 @@ pub const VirtioFsDevice = struct {
 
         if (self.validateAccess(new_path, .create)) |errno| return self.sendError(header, errno, response_buf);
 
-        fs.linkPath(old_node.path, new_path) catch |e| switch (e) {
+        fs.linkPath(old_node.path, new_path) catch |e| switch (@as(anyerror, e)) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
@@ -1088,6 +1096,7 @@ pub const VirtioFsDevice = struct {
 
         // Apply mode change (chmod)
         if (valid & FATTR_MODE != 0) {
+            if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
             const mode: std.posix.mode_t = @truncate(setattr_in.mode & 0o7777);
             fs.chmodAt(fs.cwd().fd, node.path, mode, 0) catch {
                 return self.sendError(header, -13, response_buf); // EACCES
@@ -1095,6 +1104,7 @@ pub const VirtioFsDevice = struct {
         }
 
         if (valid & (FATTR_UID | FATTR_GID) != 0) {
+            if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
             const stat_before = statPath(node.path, true) catch {
                 return self.sendError(header, -2, response_buf);
             };
@@ -1201,7 +1211,7 @@ pub const VirtioFsDevice = struct {
             }
         }
 
-        const file_mode: fs.File.OpenMode = if (accmode == O_WRONLY) .write_only else if (accmode == O_RDWR) .read_write else .read_only;
+        const file_mode = openModeForFuseFlags(accmode);
         const file = fs.cwd().openFile(node.path, .{ .mode = file_mode }) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
@@ -1340,6 +1350,9 @@ pub const VirtioFsDevice = struct {
         };
 
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
+        if (!fuseOpenFlagsAllowRead(handle.open_flags)) {
+            return self.sendError(header, -13, response_buf);
+        }
         if (self.validateAccess(handle.node.path, .read)) |errno| {
             return self.sendError(header, errno, response_buf);
         }
@@ -1381,6 +1394,9 @@ pub const VirtioFsDevice = struct {
         };
 
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
+        if (!fuseOpenFlagsAllowWrite(handle.open_flags)) {
+            return self.sendError(header, -13, response_buf);
+        }
         if (self.validateAccess(handle.node.path, .write)) |errno| {
             return self.sendError(header, errno, response_buf);
         }
@@ -1518,7 +1534,7 @@ pub const VirtioFsDevice = struct {
         if ((create_in.flags & O_TRUNC) != 0 and accmode == O_RDONLY) {
             return self.sendError(header, -13, response_buf);
         }
-        const file_mode: fs.File.OpenMode = if (accmode == O_WRONLY) .write_only else if (accmode == O_RDWR) .read_write else .read_only;
+        const file_mode = openModeForFuseFlags(accmode);
         const file = fs.cwd().createFile(full_path, .{ .read = read_enabled, .truncate = false }) catch |e| switch (e) {
             error.PathAlreadyExists => fs.cwd().openFile(full_path, .{ .mode = file_mode }) catch |open_err| switch (open_err) {
                 error.AccessDenied => return self.sendError(header, -13, response_buf),
@@ -1978,11 +1994,19 @@ pub const VirtioFsDevice = struct {
             if (!mount.allow_exec) return self.sendError(header, -13, response_buf);
         }
 
-        fs.accessAt(std.posix.AT.FDCWD, node.path, access_in.mask, 0) catch |e| switch (e) {
-            error.FileNotFound => return self.sendError(header, -2, response_buf),
-            error.AccessDenied => return self.sendError(header, -13, response_buf),
-            else => return self.sendError(header, -5, response_buf),
-        };
+        if (builtin.os.tag == .windows) {
+            _ = fs.cwd().statFile(node.path) catch |e| switch (e) {
+                error.FileNotFound => return self.sendError(header, -2, response_buf),
+                error.AccessDenied => return self.sendError(header, -13, response_buf),
+                else => return self.sendError(header, -5, response_buf),
+            };
+        } else {
+            fs.accessAt(std.posix.AT.FDCWD, node.path, access_in.mask, 0) catch |e| switch (e) {
+                error.FileNotFound => return self.sendError(header, -2, response_buf),
+                error.AccessDenied => return self.sendError(header, -13, response_buf),
+                else => return self.sendError(header, -5, response_buf),
+            };
+        }
 
         return self.sendError(header, 0, response_buf);
     }
@@ -2219,6 +2243,7 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
         return self.handleSetlkWithCmd(header, payload, response_buf, c.F_SETLK);
     }
 
@@ -2228,6 +2253,7 @@ pub const VirtioFsDevice = struct {
         payload: []const u8,
         response_buf: []u8,
     ) VirtioFsError!usize {
+        if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
         return self.handleSetlkWithCmd(header, payload, response_buf, c.F_SETLKW);
     }
 
@@ -2320,7 +2346,7 @@ pub const VirtioFsDevice = struct {
             @memcpy(io_buf[0..in_size], payload[data_start .. data_start + in_size]);
         }
 
-        const rc = c.ioctl(file.handle, ioctl_in.cmd, io_buf.ptr);
+        const rc = c.ioctl(file.handle, ioctlRequest(ioctl_in.cmd), io_buf.ptr);
         if (rc == -1) {
             return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
         }
@@ -2500,13 +2526,13 @@ pub const VirtioFsDevice = struct {
         }
 
         if (builtin.os.tag == .linux) {
-            const rc = c.fallocate(
+            const rc = std.os.linux.fallocate(
                 file.handle,
                 @intCast(fallocate_in.mode),
                 @intCast(fallocate_in.offset),
                 @intCast(fallocate_in.length),
             );
-            if (rc != 0) {
+            if (std.os.linux.errno(rc) != .SUCCESS) {
                 return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
             }
             return self.sendError(header, 0, response_buf);
@@ -2849,7 +2875,7 @@ pub const VirtioFsDevice = struct {
         const mount = self.mount_manager.getMountByTag(self.tag) orelse return -2;
         if (!path_util.isWithinRoot(path, mount.host_path)) return -13;
         const rel = if (path.len > mount.host_path.len) path[mount.host_path.len..] else "";
-        const rel_trim = std.mem.trimStart(u8, rel, "/");
+        const rel_trim = std.mem.trimStart(u8, rel, "/\\");
         self.mount_manager.validateFileOperation(mount.tag, rel_trim, op) catch |err| {
             return switch (err) {
                 mounts.MountError.PathTraversal => -1,
@@ -2979,6 +3005,20 @@ fn parseOpenFlags(flags: u32) OpenFlagState {
     };
 }
 
+fn openModeForFuseFlags(accmode: u32) fs.File.OpenMode {
+    if (accmode == O_RDONLY) return .read_only;
+    if (builtin.os.tag == .windows) return .read_write;
+    return if (accmode == O_WRONLY) .write_only else .read_write;
+}
+
+fn fuseOpenFlagsAllowRead(open_flags: u32) bool {
+    return (open_flags & O_ACCMODE) != O_WRONLY;
+}
+
+fn fuseOpenFlagsAllowWrite(open_flags: u32) bool {
+    return (open_flags & O_ACCMODE) != O_RDONLY;
+}
+
 fn syncFile(file: *fs.File, mode: SyncMode) !void {
     switch (mode) {
         .none => return,
@@ -3074,6 +3114,14 @@ fn flockToLock(flock: c.struct_flock) FuseFileLock {
     };
 }
 
+fn statxTimestampNs(timestamp: std.os.linux.statx_timestamp) i128 {
+    return @as(i128, timestamp.sec) * std.time.ns_per_s + timestamp.nsec;
+}
+
+fn linuxDeviceId(major: u32, minor: u32) u32 {
+    return ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & 0xfffff00) << 12);
+}
+
 fn statPath(path: []const u8, follow: bool) !StatView {
     if (builtin.os.tag == .windows) {
         const stat = try fs.cwd().statFile(path);
@@ -3084,7 +3132,7 @@ fn statPath(path: []const u8, follow: bool) !StatView {
         return .{
             .size = stat.size,
             .blocks = (stat.size + 511) / 512,
-            .atime_ns = stat.atime,
+            .atime_ns = stat.atime orelse stat.mtime,
             .mtime_ns = stat.mtime,
             .ctime_ns = stat.ctime,
             .mode = mode,
@@ -3098,6 +3146,25 @@ fn statPath(path: []const u8, follow: bool) !StatView {
     }
 
     const flags: u32 = if (follow) 0 else @as(u32, std.posix.AT.SYMLINK_NOFOLLOW);
+    if (comptime builtin.os.tag == .linux) {
+        const st = try fs.statxAt(std.posix.AT.FDCWD, path, flags);
+        const mode: std.posix.mode_t = @intCast(st.mode);
+        return .{
+            .size = st.size,
+            .blocks = st.blocks,
+            .atime_ns = statxTimestampNs(st.atime),
+            .mtime_ns = statxTimestampNs(st.mtime),
+            .ctime_ns = statxTimestampNs(st.ctime),
+            .mode = @intCast(st.mode),
+            .nlink = @intCast(st.nlink),
+            .uid = @intCast(st.uid),
+            .gid = @intCast(st.gid),
+            .rdev = linuxDeviceId(st.rdev_major, st.rdev_minor),
+            .blksize = @intCast(@max(@as(u32, 1), st.blksize)),
+            .kind = fs.kindFromMode(mode),
+        };
+    }
+
     const st = try fs.statPosixAt(std.posix.AT.FDCWD, path, flags);
     const atime = st.atime();
     const mtime = st.mtime();
@@ -3832,6 +3899,7 @@ test "virtio_fs: handleFallocate keep size" {
         .offset = 0,
         .length = 4096,
         .mode = FALLOC_FL_KEEP_SIZE,
+        .padding = 0,
     };
 
     var resp: [128]u8 = undefined;
@@ -4063,7 +4131,7 @@ test "virtio_fs: handleWrite rejects short payload" {
     try std.testing.expectEqual(@as(i32, -22), out.@"error");
 }
 
-test "virtio_fs: handleRead maps io error on write-only file" {
+test "virtio_fs: handleRead rejects write-only file handle" {
     const allocator = std.testing.allocator;
 
     var tmp = fs.testingTmpDir(.{});
@@ -4128,12 +4196,12 @@ test "virtio_fs: handleRead maps io error on write-only file" {
     const resp_len = try device.handleRequest(&read_req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
     const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
-    try std.testing.expectEqual(@as(i32, -5), out.@"error");
+    try std.testing.expectEqual(@as(i32, -13), out.@"error");
 
     _ = device.handles.fetchRemove(fh);
 }
 
-test "virtio_fs: handleWrite maps io error on read-only file" {
+test "virtio_fs: handleWrite rejects read-only file handle" {
     const allocator = std.testing.allocator;
 
     var tmp = fs.testingTmpDir(.{});
@@ -4205,7 +4273,7 @@ test "virtio_fs: handleWrite maps io error on read-only file" {
     const resp_len = try device.handleRequest(write_req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
     const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
-    try std.testing.expectEqual(@as(i32, -5), out.@"error");
+    try std.testing.expectEqual(@as(i32, -13), out.@"error");
 
     _ = device.handles.fetchRemove(fh);
 }

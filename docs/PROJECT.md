@@ -1,6 +1,6 @@
 # m80 Project Guide
 
-Last reviewed: 2026-05-31
+Last reviewed: 2026-06-02
 
 This is the canonical project document for m80. Keep active status, roadmap, QA notes, architecture notes, and operational runbooks here. Avoid adding new phase plans, TODO files, or dated session logs unless they replace a section in this file.
 
@@ -9,7 +9,7 @@ This is the canonical project document for m80. Keep active status, roadmap, QA 
 m80 is a Zig microVM runtime with a small CLI and platform-specific hypervisor backends:
 
 - macOS: Hypervisor Framework (HVF), currently the most complete path.
-- Windows: Windows Hypervisor Platform (WHP), implemented with dynamic loading and backend tests, but still needs real-host validation.
+- Windows: Windows Hypervisor Platform (WHP), implemented with dynamic loading, virtio-vsock wiring, named-pipe daemon transport, and shared daemon egress handlers, but still needs real-host validation.
 - Linux and other POSIX-like hosts: KVM-oriented backend path exists, but real KVM lifecycle validation remains a priority.
 
 The project is still pre-production. The useful target is a small, scriptable runtime for Linux microVMs with explicit storage, filesystem sharing, guest-local control-plane services, and jailer hardening. It is not trying to become a general-purpose desktop VM manager.
@@ -85,7 +85,8 @@ Important behavior:
 - `network_allowed_domains` and IPv4/IPv6 `network_allowed_ips` apply when `network_mode=allowlist`.
 - For `allowlist` and gated `open` modes on HVF, TCP/UDP use the guest SOCKS endpoint and ICMP echo uses the m80 TUN/vsock path.
 - Legacy keys `services`, `metadata_file`, `allowed_domains`, and `allowed_ips` are rejected with migration guidance.
-- `network_*` guest networking is currently implemented on macOS HVF only; non-HVF backends fail fast when it is enabled.
+- WHP uses Windows named pipes for daemon control, VM registration, and guest-session sockets and uses the shared host socket path for external DNS/TCP/UDP/ICMP egress; real Windows validation is still required before claiming parity.
+- Linux/POSIX KVM still fails fast when `network_*` guest networking is enabled.
 - `mounts` currently supports one virtio-fs mount in the start path.
 - `ephemeral` is parsed and written, but disposable overlay lifecycle semantics are not implemented yet.
 
@@ -98,7 +99,7 @@ Implemented or partially implemented device paths:
 - Virtio-console and serial console plumbing.
 - Virtio-rng.
 - Virtio-fs with FUSE request handling and read-only/read-write checks.
-- Virtio-vsock control-plane transport on HVF, including guest CID assignment and per-VM guest session sockets.
+- Virtio-vsock control-plane transport on HVF, plus compile-ready WHP wiring that bridges per-VM guest sessions to Windows named pipes.
 - ARM PSCI is exposed on HVF through DTB `method=smc`; guest `SYSTEM_OFF`/`SYSTEM_RESET` stops the vCPU so `m80 run` can exit cleanly.
 
 Snapshot commands operate on configured filesystem images. They copy disk slots (`disk_path`, `seed_path`, `data_disk_path`) into a directory with a `manifest.txt`, then restore those images later. Full memory/vCPU snapshot code exists in `src/vm/snapshot.zig` and HVF paths, but it is not wired into the regular CLI snapshot contract.
@@ -107,14 +108,14 @@ The m80 initramfs runs `e2fsck -p` before mounting ext roots. If automatic repai
 
 ### Control-Plane Services
 
-The runtime uses a guest-local control plane over virtio-vsock. The host daemon owns guest CID allocation and exposes separate owner-only sockets under `{data_dir}/daemon/`: `control.sock` for CLI/admin control, `register.sock` for VM lifecycle registration, and `guests/<cid>.sock` for the CID-bound guest session.
+The runtime uses a guest-local control plane over virtio-vsock. The host daemon owns guest CID allocation and exposes separate owner-only local endpoints under `{data_dir}/daemon/`: `control.sock` for CLI/admin control, `register.sock` for VM lifecycle registration, and `guests/<cid>.sock` for the CID-bound guest session. These endpoints are Unix sockets on POSIX hosts and stable Windows named pipes derived from the same logical paths on WHP.
 
 - `network_services=dns` enables guest-local DNS for `*.m80.internal` and blocks disallowed external names with synthetic NXDOMAIN.
 - `network_services=metadata` enables guest-local metadata discovery through the per-VM guest session socket.
 - `network_mode=allowlist` and gated `network_mode=open` enable the m80 initramfs proxy path, including `m80tun0`, direct guest TCP/UDP/ICMP forwarding, and a guest-local SOCKS5 listener at `127.0.0.1:1080`.
 - Guest frames do not carry VM identity; daemon ACLs bind authorization to the registered CID/session socket.
 - Host-only methods are not reachable from guest sockets.
-- Daemon-side DNS, TCP, UDP, and ICMP echo handlers enforce policy before host socket use.
+- Daemon-side DNS, TCP, UDP, and ICMP echo handlers enforce policy before host socket use on POSIX/HVF hosts and on the compile-ready WHP path.
 - Guest shutdown requests are exposed to the guest agent through CID-bound heartbeat responses; guests cannot request or spoof VM lifecycle methods.
 - `src/net/dns.zig` provides the DNS wire-codec and synthetic internal-name responses used by the daemon path.
 
@@ -147,19 +148,29 @@ zig build test
 
 Tests are aggregated through `src/all_tests.zig` and run with `src/test_runner.zig`.
 
-Current local QA snapshot from 2026-05-31:
+Current local QA snapshot from 2026-06-02:
 
 ```text
 zig build test
-339 tests loaded
-318 passed
-21 skipped
+354 tests loaded
+330 passed
+24 skipped
 0 failed
 0 leaks
 ```
 
+Windows cross-target compile check from 2026-06-02:
+
+```text
+zig build -Dtarget=x86_64-windows
+passed
+
+zig build test -Dtarget=x86_64-windows
+compiled test.exe; host execution failed as expected on macOS
+```
+
 The skipped tests are expected on hosts that do not provide the relevant OS, hypervisor, entitlement, or integration environment variables.
-Platform integration tests are enabled with `M80_TEST_INTEGRATION=<selector>`, where selectors include `hvf-reliability`, `jailer`, `whp`, and `all`.
+Platform integration tests are enabled with `M80_TEST_INTEGRATION=<selector>`, where selectors include `hvf-reliability`, `jailer`, `kvm`, `whp`, and `all`.
 
 ## Integration Tests
 
@@ -234,7 +245,7 @@ zig build test -- --test-filter "hvf: stop returns VcpuStopTimeout when forced v
 
 ## macOS Code Signing
 
-The HVF build now uses the hypervisor entitlement only. The build reads optional signing config from `codesign.conf` or `M80_CODESIGN_CONFIG`:
+The HVF build uses the checked-in hypervisor entitlement only. `entitlements/hvf-entitlements.xml` and `entitlements/hvf-entitlements-test.xml` contain no signing keys or private metadata; they only grant `com.apple.security.hypervisor`. If those files are absent in a downstream checkout, the build skips local codesign. The build reads optional signing config from `codesign.conf` or `M80_CODESIGN_CONFIG`:
 
 ```text
 identity=<codesign identity or SHA>
@@ -309,9 +320,10 @@ Use this list instead of resurrecting old phase files.
    - Document backend support per snapshot type before exposing full VM-state snapshots.
 
 3. Control-plane service validation
-   - Boot a guest with `network_services=dns,metadata` and validate daemon registration.
+   - Boot a guest with `network_services=dns,metadata` and validate daemon registration on HVF and WHP.
    - Prove guest-local DNS resolution for `metadata.m80.internal`.
    - Prove metadata fetches succeed through the per-VM vsock session and reconnect after restore.
+   - Validate Windows named-pipe daemon transport, WHP virtio-vsock sessions, and shared host egress handlers on a real Windows host.
    - Finish transparent TUN routing before claiming full direct-connect outbound networking parity.
 
 4. Jailer strict-mode validation

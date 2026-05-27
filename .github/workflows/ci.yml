@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workflow-lint:
+    name: Workflow Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Lint workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+  guardrails:
+    name: Zig Guardrails
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: zig fmt --check
+        run: |
+          find src -name '*.zig' -print0 | xargs -0 zig fmt --check build.zig
+
+      - name: zig build
+        run: zig build
+
+      - name: zig build windows target
+        run: zig build -Dtarget=x86_64-windows
+
+      - name: zig build test
+        run: zig build test
+
+  cross-platform:
+    name: Cross-Platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow_failure }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            allow_failure: false
+          - os: macos-latest
+            allow_failure: true
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Disable repo-local macOS codesign config in CI
+        if: runner.os == 'macOS'
+        run: |
+          echo "M80_CODESIGN_CONFIG=${RUNNER_TEMP}/m80-codesign.conf" >> "$GITHUB_ENV"
+
+      - name: zig fmt --check
+        run: |
+          find src -name '*.zig' -print0 | xargs -0 zig fmt --check build.zig
+
+      - name: zig build
+        run: zig build
+
+      - name: zig build test
+        run: zig build test

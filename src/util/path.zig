@@ -25,7 +25,6 @@
 const std = @import("std");
 const fs = @import("fs.zig");
 const builtin = @import("builtin");
-const windows = std.os.windows;
 
 pub const PathError = error{
     PathTraversal,
@@ -42,6 +41,38 @@ pub const ValidateOptions = struct {
     min_depth: u8 = 2,
     follow_symlinks: bool = false,
 };
+
+fn isPathSeparator(ch: u8) bool {
+    return ch == '/' or ch == '\\';
+}
+
+fn preferredPathSeparator(path: []const u8) u8 {
+    if (std.mem.indexOfScalar(u8, path, '/')) |_| return '/';
+    if (std.mem.indexOfScalar(u8, path, '\\')) |_| return '\\';
+    return fs.path.sep;
+}
+
+fn rootPrefixLen(path: []const u8) usize {
+    if (path.len >= 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and isPathSeparator(path[2])) {
+        return 3;
+    }
+    if (path.len >= 2 and isPathSeparator(path[0]) and isPathSeparator(path[1])) {
+        return 2;
+    }
+    if (path.len >= 1 and isPathSeparator(path[0])) {
+        return 1;
+    }
+    return 0;
+}
+
+fn trimTrailingSeparators(path: []const u8) []const u8 {
+    const min_len = rootPrefixLen(path);
+    var end = path.len;
+    while (end > min_len and isPathSeparator(path[end - 1])) {
+        end -= 1;
+    }
+    return path[0..end];
+}
 
 /// Validates that a path is safe for operations like deletion.
 /// - Canonicalizes the path (resolves . and ..)
@@ -69,8 +100,8 @@ pub fn validateSafePath(
     };
     errdefer allocator.free(canonical_path);
 
-    // Check if path starts with the canonical root
-    if (!std.mem.startsWith(u8, canonical_path, canonical_root)) {
+    // Check if path is inside the canonical root on a path-component boundary.
+    if (!isWithinRoot(canonical_path, canonical_root)) {
         return PathError.PathNotWithinRoot;
     }
 
@@ -135,16 +166,26 @@ fn normalizePathComponents(allocator: std.mem.Allocator, path: []const u8) ![]u8
     var components: std.ArrayList([]const u8) = .empty;
     defer components.deinit(allocator);
 
-    const is_absolute = fs.path.isAbsolute(path);
+    const prefix_len = rootPrefixLen(path);
+    const prefix = path[0..prefix_len];
+    const is_absolute = prefix_len > 0;
+    const sep = preferredPathSeparator(path);
 
-    var it = std.mem.splitScalar(u8, path, fs.path.sep);
-    while (it.next()) |component| {
+    var idx: usize = prefix_len;
+    while (idx < path.len) {
+        while (idx < path.len and isPathSeparator(path[idx])) : (idx += 1) {}
+        const start = idx;
+        while (idx < path.len and !isPathSeparator(path[idx])) : (idx += 1) {}
+        if (start == idx) continue;
+        const component = path[start..idx];
         if (component.len == 0 or std.mem.eql(u8, component, ".")) {
             continue;
         }
         if (std.mem.eql(u8, component, "..")) {
             if (components.items.len > 0) {
                 _ = components.pop();
+            } else if (!is_absolute) {
+                try components.append(allocator, component);
             }
             continue;
         }
@@ -153,33 +194,29 @@ fn normalizePathComponents(allocator: std.mem.Allocator, path: []const u8) ![]u8
 
     if (components.items.len == 0) {
         if (is_absolute) {
-            return try allocator.dupe(u8, "/");
+            return try allocator.dupe(u8, prefix);
         }
         return try allocator.dupe(u8, ".");
     }
 
     // Calculate total length
-    var total_len: usize = 0;
+    var total_len: usize = prefix.len;
     for (components.items) |c| {
-        total_len += c.len + 1; // +1 for separator
+        total_len += c.len;
     }
-    if (is_absolute) {
-        total_len += 0; // leading slash is already counted
-    } else {
-        total_len -= 1; // no leading separator for relative paths
-    }
+    total_len += components.items.len - 1;
 
     var result = try allocator.alloc(u8, total_len);
     var pos: usize = 0;
 
     if (is_absolute) {
-        result[pos] = fs.path.sep;
-        pos += 1;
+        @memcpy(result[pos..][0..prefix.len], prefix);
+        pos += prefix.len;
     }
 
     for (components.items, 0..) |c, i| {
         if (i > 0) {
-            result[pos] = fs.path.sep;
+            result[pos] = sep;
             pos += 1;
         }
         @memcpy(result[pos..][0..c.len], c);
@@ -194,8 +231,13 @@ fn countPathDepth(relative_path: []const u8) u8 {
     if (relative_path.len == 0) return 0;
 
     var depth: u8 = 0;
-    var it = std.mem.splitScalar(u8, relative_path, fs.path.sep);
-    while (it.next()) |component| {
+    var idx: usize = 0;
+    while (idx < relative_path.len) {
+        while (idx < relative_path.len and isPathSeparator(relative_path[idx])) : (idx += 1) {}
+        const start = idx;
+        while (idx < relative_path.len and !isPathSeparator(relative_path[idx])) : (idx += 1) {}
+        if (start == idx) continue;
+        const component = relative_path[start..idx];
         if (component.len > 0 and !std.mem.eql(u8, component, ".")) {
             depth += 1;
         }
@@ -212,9 +254,15 @@ fn checkSymlinkEscape(
     var components: std.ArrayList([]const u8) = .empty;
     defer components.deinit(allocator);
 
-    var it = std.mem.splitScalar(u8, path, fs.path.sep);
-    while (it.next()) |component| {
-        if (component.len == 0) continue;
+    const prefix_len = rootPrefixLen(path);
+    const sep = preferredPathSeparator(path);
+    var idx: usize = prefix_len;
+    while (idx < path.len) {
+        while (idx < path.len and isPathSeparator(path[idx])) : (idx += 1) {}
+        const start = idx;
+        while (idx < path.len and !isPathSeparator(path[idx])) : (idx += 1) {}
+        if (start == idx) continue;
+        const component = path[start..idx];
         try components.append(allocator, component);
     }
 
@@ -222,28 +270,20 @@ fn checkSymlinkEscape(
     var current_path: std.ArrayList(u8) = .empty;
     defer current_path.deinit(allocator);
 
-    // Start with root separator if absolute
-    if (fs.path.isAbsolute(path)) {
-        try current_path.append(allocator, fs.path.sep);
+    // Start with the root prefix if absolute.
+    if (prefix_len > 0) {
+        try current_path.appendSlice(allocator, path[0..prefix_len]);
     }
 
     for (components.items) |component| {
-        if (current_path.items.len > 1 or (current_path.items.len == 1 and current_path.items[0] != fs.path.sep)) {
-            try current_path.append(allocator, fs.path.sep);
+        if (current_path.items.len > 0 and !isPathSeparator(current_path.items[current_path.items.len - 1])) {
+            try current_path.append(allocator, sep);
         }
         try current_path.appendSlice(allocator, component);
 
         // Check if this is a symlink without following it where possible.
         const stat = if (builtin.os.tag == .windows) blk: {
-            const path_w = windows.sliceToPrefixedFileW(null, current_path.items) catch return true;
-            const attrs = windows.kernel32.GetFileAttributesW(path_w.span().ptr);
-            if (attrs == windows.INVALID_FILE_ATTRIBUTES) {
-                break :blk fs.cwd().statFile(current_path.items) catch continue;
-            }
-            if ((attrs & windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-                return true;
-            }
-            break :blk fs.cwd().statFile(current_path.items) catch continue;
+            break :blk fs.cwd().statFileNoFollow(current_path.items) catch continue;
         } else blk: {
             const posix_stat = fs.statAt(
                 std.posix.AT.FDCWD,
@@ -262,7 +302,7 @@ fn checkSymlinkEscape(
                 resolved = try allocator.dupe(u8, target);
             } else {
                 // Relative symlink - resolve from parent directory
-                const parent = fs.path.dirname(current_path.items) orelse "/";
+                const parent = fs.path.dirname(current_path.items) orelse path[0..prefix_len];
                 resolved = try fs.path.join(allocator, &[_][]const u8{ parent, target });
             }
             defer allocator.free(resolved);
@@ -270,7 +310,7 @@ fn checkSymlinkEscape(
             const canonical = canonicalizePath(allocator, resolved) catch continue;
             defer allocator.free(canonical);
 
-            if (!std.mem.startsWith(u8, canonical, allowed_root)) {
+            if (!isWithinRoot(canonical, allowed_root)) {
                 return true;
             }
         }
@@ -320,18 +360,12 @@ pub fn safeDeleteTree(
 
 /// Checks if a path contains any path traversal patterns
 pub fn containsTraversal(path: []const u8) bool {
-    // Reject ".." sequences for both native and Windows separators.
-    var it = std.mem.splitScalar(u8, path, fs.path.sep);
-    while (it.next()) |component| {
-        if (std.mem.eql(u8, component, "..")) return true;
-    }
-
-    // Also check for Windows-style separators
-    if (builtin.os.tag != .windows) {
-        var win_it = std.mem.splitScalar(u8, path, '\\');
-        while (win_it.next()) |component| {
-            if (std.mem.eql(u8, component, "..")) return true;
-        }
+    var idx: usize = 0;
+    while (idx < path.len) {
+        while (idx < path.len and isPathSeparator(path[idx])) : (idx += 1) {}
+        const start = idx;
+        while (idx < path.len and !isPathSeparator(path[idx])) : (idx += 1) {}
+        if (std.mem.eql(u8, path[start..idx], "..")) return true;
     }
 
     return false;
@@ -340,11 +374,21 @@ pub fn containsTraversal(path: []const u8) bool {
 /// Validates that a path is within a given root without filesystem access
 /// Useful for quick pre-validation before more expensive checks
 pub fn isWithinRoot(path: []const u8, root: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, root)) return false;
+    const normalized_root = trimTrailingSeparators(root);
+    if (normalized_root.len == 0) return false;
+    if (path.len < normalized_root.len) return false;
+
+    const prefix = path[0..normalized_root.len];
+    const matches = if (builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(prefix, normalized_root)
+    else
+        std.mem.eql(u8, prefix, normalized_root);
+    if (!matches) return false;
 
     // Must have a separator after root (or be exactly the root)
-    if (path.len == root.len) return true;
-    if (path.len > root.len and path[root.len] == fs.path.sep) return true;
+    if (path.len == normalized_root.len) return true;
+    if (isPathSeparator(normalized_root[normalized_root.len - 1])) return true;
+    if (isPathSeparator(path[normalized_root.len])) return true;
 
     return false;
 }

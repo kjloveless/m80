@@ -67,6 +67,10 @@ fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
 }
 
 pub fn runConsole(allocator: std.mem.Allocator, name: []const u8) !void {
+    if (builtin.os.tag == .windows) {
+        return error.NotSupported;
+    }
+
     var cwd = fs.cwd();
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);

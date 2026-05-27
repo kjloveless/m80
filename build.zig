@@ -8,9 +8,10 @@
 //! - `zig build test` - Run all tests via custom runner
 //!
 //! ## Platform-Specific Setup
+//! - POSIX hosts: Links libc for host filesystem, process, and socket helpers
 //! - macOS: Links the Hypervisor.framework for HVF backend
 //! - Windows: Uses WHP (no extra linking required)
-//! - Linux: Uses KVM (no extra linking required)
+//! - Linux: Uses KVM
 //!
 //! ## Test Infrastructure
 //! Tests use a custom runner (src/test_runner.zig) that:
@@ -44,6 +45,16 @@ fn readBuildRootFileAlloc(b: *std.Build, path: []const u8, max_bytes: usize) ![]
         );
     }
     return b.build_root.handle.readFileAlloc(b.allocator, path, max_bytes);
+}
+
+fn buildRootFileExists(b: *std.Build, path: []const u8) bool {
+    const graph_type = @TypeOf(b.graph.*);
+    if (comptime @hasField(graph_type, "io")) {
+        b.build_root.handle.access(b.graph.io, path, .{}) catch return false;
+        return true;
+    }
+    b.build_root.handle.access(path, .{}) catch return false;
+    return true;
 }
 
 fn readCodesignConfig(b: *std.Build, path: []const u8) !CodesignConfig {
@@ -106,9 +117,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const needs_libc = target.result.os.tag != .windows;
+    exe.root_module.link_libc = needs_libc;
+
     if (target.result.os.tag == .macos) {
         exe.root_module.linkFramework("Hypervisor", .{});
-        exe.root_module.link_libc = true;
     }
 
     const install_exe = b.addInstallArtifact(exe, .{});
@@ -137,9 +150,9 @@ pub fn build(b: *std.Build) void {
         }),
         .test_runner = test_runner,
     });
+    unit_tests.root_module.link_libc = needs_libc;
     if (target.result.os.tag == .macos) {
         unit_tests.root_module.linkFramework("Hypervisor", .{});
-        unit_tests.root_module.link_libc = true;
     }
     unit_tests.root_module.addAnonymousImport("build_script", .{
         .root_source_file = b.path("build.zig"),
@@ -156,6 +169,11 @@ pub fn build(b: *std.Build) void {
 
         const entitlements_main_name: []const u8 = "entitlements/hvf-entitlements.xml";
         const entitlements_test_name: []const u8 = "entitlements/hvf-entitlements-test.xml";
+        const have_entitlements =
+            buildRootFileExists(b, entitlements_main_name) and
+            buildRootFileExists(b, entitlements_test_name);
+        if (!have_entitlements) return;
+
         var codesign_identity: []const u8 = cfg.identity orelse "-";
         if (buildEnv(b, "M80_CODESIGN_IDENTITY")) |value| {
             if (value.len != 0) {
@@ -181,7 +199,10 @@ pub fn build(b: *std.Build) void {
         }
         sign_exe.addArg("--entitlements");
         sign_exe.addFileArg(entitlements);
-        sign_exe.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
+        sign_exe.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime" });
+        if (!std.mem.eql(u8, codesign_identity, "-")) {
+            sign_exe.addArg("--timestamp");
+        }
         sign_exe.addFileArg(exe.getEmittedBin());
         sign_exe.step.dependOn(&exe.step);
         run_cmd.step.dependOn(&sign_exe.step);
@@ -196,7 +217,10 @@ pub fn build(b: *std.Build) void {
         }
         sign_installed.addArg("--entitlements");
         sign_installed.addFileArg(entitlements);
-        sign_installed.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
+        sign_installed.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime" });
+        if (!std.mem.eql(u8, codesign_identity, "-")) {
+            sign_installed.addArg("--timestamp");
+        }
         sign_installed.addArg(b.getInstallPath(.bin, exe.name));
         sign_installed.step.dependOn(&install_exe.step);
         b.getInstallStep().dependOn(&sign_installed.step);
@@ -211,7 +235,10 @@ pub fn build(b: *std.Build) void {
         }
         sign_tests.addArg("--entitlements");
         sign_tests.addFileArg(entitlements_test);
-        sign_tests.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime", "--timestamp" });
+        sign_tests.addArgs(&[_][]const u8{ "--deep", "--force", "--options", "runtime" });
+        if (!std.mem.eql(u8, codesign_identity, "-")) {
+            sign_tests.addArg("--timestamp");
+        }
         sign_tests.addFileArg(unit_tests.getEmittedBin());
         sign_tests.step.dependOn(&unit_tests.step);
         run_unit_tests.step.dependOn(&sign_tests.step);

@@ -1,6 +1,7 @@
 //! Virtio device models shared by the m80 HVF backend.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const net = @import("../util/net.zig");
 const sync = @import("../util/sync.zig");
 const fs = @import("../util/fs.zig");
@@ -18,6 +19,10 @@ var guest_io: ?GuestIo = null;
 
 pub fn initGuestIo(io: GuestIo) void {
     guest_io = io;
+}
+
+pub fn clearGuestIo() void {
+    guest_io = null;
 }
 
 fn ensureGuestIo() !GuestIo {
@@ -1592,30 +1597,36 @@ fn virtioVsockHostReadLoop(index: usize) void {
     var buf: [virtio_vsock_max_rx_payload_len]u8 = undefined;
 
     while (true) {
-        var fd: std.posix.fd_t = -1;
+        var stream: ?net.Stream = null;
         var request: ?VirtioVsockHdr = null;
 
         virtio_vsock_connection_mutex.lock();
         if (index < virtio_vsock_connections.len) {
             const conn = &virtio_vsock_connections[index];
             if (conn.active and conn.reader_running.load(.seq_cst)) {
-                if (conn.stream) |stream| {
-                    fd = stream.handle;
+                if (conn.stream) |active_stream| {
+                    stream = active_stream;
                     request = buildVsockDeviceHeaderLocked(index, virtio_vsock_op_rw, 0, 0);
                 }
             }
         }
         virtio_vsock_connection_mutex.unlock();
-        if (fd < 0 or request == null) break;
+        const active_stream = stream orelse break;
+        if (request == null) break;
 
-        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(fds[0..], 100) catch break;
-        if (ready == 0) continue;
-        if ((fds[0].revents & std.posix.POLL.IN) == 0) break;
+        const n = if (builtin.os.tag == .windows) blk: {
+            break :blk active_stream.read(&buf) catch break;
+        } else blk: {
+            const fd = active_stream.handle;
+            var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(fds[0..], 100) catch break;
+            if (ready == 0) continue;
+            if ((fds[0].revents & std.posix.POLL.IN) == 0) break;
 
-        const n = fs.readFd(fd, &buf) catch |e| switch (e) {
-            error.WouldBlock => continue,
-            else => break,
+            break :blk fs.readFd(fd, &buf) catch |e| switch (e) {
+                error.WouldBlock => continue,
+                else => break,
+            };
         };
         if (n <= 0) break;
 
