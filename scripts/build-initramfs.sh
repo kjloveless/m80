@@ -11,12 +11,13 @@ kernel_ver="6.1.0-42-cloud-arm64"
 kernel_deb="${repo_root}/images/debian-kernels/linux-image-6.1.0-42-cloud-arm64_6.1.159-1_arm64.deb"
 kernel_data="${repo_root}/images/debian-kernels/data.tar.xz"
 e2fsck_deb="${M80_E2FSCK_DEB:-${repo_root}/images/debian-tools/e2fsck-static_1.47.0-2+b2_arm64.deb}"
+zig_bin="${ZIG:-zig}"
 
 work_dir="${TMPDIR:-/tmp}/m80-initramfs"
 rm -rf "${work_dir}"
 mkdir -p "${work_dir}"
 
-zig cc -target aarch64-linux-musl -Os -static -s \
+"${zig_bin}" cc -target aarch64-linux-musl -Os -static -s \
   "${init_src}" -o "${work_dir}/init"
 
 mkdir -p "${work_dir}/proc" "${work_dir}/sys" "${work_dir}/dev"
@@ -34,9 +35,10 @@ if [[ -f "${kernel_deb}" ]]; then
       "${mod_base}/kernel/drivers/block/virtio_blk.ko"
       "${mod_base}/kernel/drivers/char/virtio_console.ko"
       "${mod_base}/kernel/drivers/char/hw_random/virtio-rng.ko"
-      "${mod_base}/kernel/net/core/failover.ko"
-      "${mod_base}/kernel/drivers/net/net_failover.ko"
-      "${mod_base}/kernel/drivers/net/virtio_net.ko"
+      "${mod_base}/kernel/drivers/net/tun.ko"
+      "${mod_base}/kernel/net/vmw_vsock/vsock.ko"
+      "${mod_base}/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko"
+      "${mod_base}/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko"
       "${mod_base}/kernel/fs/fuse/fuse.ko"
       "${mod_base}/kernel/fs/fuse/virtiofs.ko"
     )

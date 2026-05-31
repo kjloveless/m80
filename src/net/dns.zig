@@ -1,36 +1,23 @@
-//! Pure Zig DNS Resolver
-//!
-//! This module implements DNS resolution without using libc, giving full
-//! control over DNS queries and allowing policy enforcement at the DNS level.
-//!
-//! ## DNS Protocol Overview
-//! DNS uses a simple request/response protocol over UDP (port 53):
-//! 1. Client builds a query with header + question section
-//! 2. Server responds with header + question + answer sections
-//! 3. Answers contain resource records (A, AAAA, CNAME, etc.)
+//! DNS wire-codec helpers and synthetic m80 internal responses.
 //!
 //! ## Wire Format
 //! - `DnsHeader`: 12-byte fixed header with ID, flags, and section counts
 //! - QNAME: Domain name as length-prefixed labels (e.g., \x07example\x03com\x00)
 //! - Compression: Names can use pointers (0xC0xx) to avoid repetition
 //!
-//! ## Policy Integration
-//! The resolver integrates with NetworkPolicy to:
-//! - Block DNS queries for disallowed domains (before any network traffic)
-//! - Cache resolved IPs into the policy for subsequent connection checks
-//!
 //! ## Limitations
 //! This is a minimal implementation:
-//! - Only A records (IPv4) are parsed
+//! - Only A records are parsed into `DnsRecord`
 //! - No EDNS support (512-byte limit)
 //! - No TCP fallback for truncated responses
 
 const std = @import("std");
+const sync = @import("../util/sync.zig");
+const fs = @import("../util/fs.zig");
+const net = @import("../util/net.zig");
 const builtin = @import("builtin");
-const policy = @import("policy.zig");
 
 pub const DnsError = error{
-    DomainNotAllowed,
     ResolutionFailed,
     InvalidResponse,
     NetworkError,
@@ -94,7 +81,7 @@ pub const DnsRecord = struct {
 
 pub const DnsResolver = struct {
     allocator: std.mem.Allocator,
-    servers: std.ArrayList(std.net.Address),
+    servers: std.ArrayList(net.Address),
     timeout_ms: u32,
     max_retries: u8,
 
@@ -113,11 +100,11 @@ pub const DnsResolver = struct {
     }
 
     pub fn addServer(self: *DnsResolver, ip: [4]u8) !void {
-        try self.servers.append(self.allocator, std.net.Address.initIp4(ip, 53));
+        try self.servers.append(self.allocator, net.Address.initIp4(ip, 53));
     }
 
     pub fn addServerWithPort(self: *DnsResolver, ip: [4]u8, port: u16) !void {
-        try self.servers.append(self.allocator, std.net.Address.initIp4(ip, port));
+        try self.servers.append(self.allocator, net.Address.initIp4(ip, port));
     }
 
     pub fn addDefaultServers(self: *DnsResolver) !void {
@@ -129,16 +116,7 @@ pub const DnsResolver = struct {
     pub fn resolve(
         self: *DnsResolver,
         domain: []const u8,
-        net_policy: ?*const policy.NetworkPolicy,
     ) DnsError![]DnsRecord {
-        // Policy is enforced before any network traffic. This keeps DNS resolution
-        // aligned with the allowlist semantics used for outbound connections.
-        if (net_policy) |p| {
-            if (!p.isDomainAllowed(domain)) {
-                return DnsError.DomainNotAllowed;
-            }
-        }
-
         if (self.servers.items.len == 0) {
             return DnsError.NoServers;
         }
@@ -148,7 +126,7 @@ pub const DnsResolver = struct {
         const query_len = buildQuery(
             &query_buf,
             domain,
-            @truncate(@as(u64, @bitCast(std.time.milliTimestamp()))),
+            @truncate(@as(u64, @bitCast(sync.milliTimestamp()))),
         ) catch return DnsError.OutOfMemory;
 
         var response_buf: [512]u8 = undefined;
@@ -167,20 +145,21 @@ pub const DnsResolver = struct {
         return DnsError.ResolutionFailed;
     }
 
-    fn sendQuery(self: *DnsResolver, server: std.net.Address, query: []const u8, response: []u8) !usize {
+    fn sendQuery(self: *DnsResolver, server: net.Address, query: []const u8, response: []u8) !usize {
         _ = self;
 
         // UDP query/response without explicit timeouts; caller retries per server.
-        const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return error.NetworkError;
-        defer std.posix.close(sock);
+        const bind_addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+        var sock = std.Io.net.IpAddress.bind(&bind_addr, fs.io(), .{
+            .mode = .dgram,
+            .protocol = .udp,
+        }) catch return error.NetworkError;
+        defer sock.close(fs.io());
 
-        _ = std.posix.sendto(sock, query, 0, &server.any, server.getOsSockLen()) catch return error.NetworkError;
-
-        var from_addr: std.posix.sockaddr.storage = undefined;
-        var from_len: std.posix.socklen_t = @sizeOf(@TypeOf(from_addr));
-
-        const n = std.posix.recvfrom(sock, response, 0, @ptrCast(&from_addr), &from_len) catch return error.NetworkError;
-        return n;
+        const dest = server.toIpAddress();
+        sock.send(fs.io(), &dest, query) catch return error.NetworkError;
+        const message = sock.receive(fs.io(), response) catch return error.NetworkError;
+        return message.data.len;
     }
 };
 
@@ -362,26 +341,92 @@ fn decodeName(buf: []const u8, start: usize, out: []u8) ![]u8 {
 }
 
 pub fn matchesDomainWildcard(pattern: []const u8, domain: []const u8) bool {
-    return policy.matchDomainPattern(pattern, domain);
+    if (std.mem.eql(u8, pattern, domain)) return true;
+    if (!std.mem.startsWith(u8, pattern, "*.")) return false;
+    const suffix = pattern[1..];
+    return std.mem.endsWith(u8, domain, suffix) and domain.len > suffix.len;
 }
 
-pub fn resolveWithPolicy(
-    allocator: std.mem.Allocator,
-    resolver: *DnsResolver,
-    domain: []const u8,
-    net_policy: *policy.NetworkPolicy,
-) DnsError!void {
-    if (!net_policy.isDomainAllowed(domain)) {
-        return DnsError.DomainNotAllowed;
+pub const internal_metadata_name = "metadata.m80.internal";
+pub const synthetic_ttl_secs: u32 = 60;
+
+fn writeIntBig(writer: anytype, comptime T: type, value: T) !void {
+    const be = std.mem.nativeToBig(T, value);
+    try writer.writeAll(std.mem.asBytes(&be));
+}
+
+fn encodeHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const chars = "0123456789abcdef";
+    const out = try allocator.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, i| {
+        out[i * 2] = chars[byte >> 4];
+        out[i * 2 + 1] = chars[byte & 0x0f];
+    }
+    return out;
+}
+
+fn parseQuestionType(message: []const u8) !u16 {
+    const question_start = @sizeOf(DnsHeader);
+    const question_end = try skipQuestion(message, question_start);
+    const qtype_pos = question_end - 4;
+    return std.mem.readInt(u16, message[qtype_pos..][0..2], .big);
+}
+
+fn buildInternalResponse(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
+    if (query.len < @sizeOf(DnsHeader)) return error.InvalidResponse;
+
+    var domain_buf: [256]u8 = undefined;
+    const domain = try parseQueryDomain(query, &domain_buf);
+    const qtype = try parseQuestionType(query);
+    const question_end = try skipQuestion(query, @sizeOf(DnsHeader));
+
+    const name_matches = std.mem.eql(u8, domain, internal_metadata_name);
+    const answer_matches = name_matches and (qtype == @intFromEnum(DnsRecordType.A) or qtype == @intFromEnum(DnsRecordType.AAAA));
+    const flags: u16 = if (name_matches) 0x8180 else 0x8183;
+    const answer_count: u16 = if (answer_matches) 1 else 0;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    const header_id = std.mem.readInt(u16, query[0..2], .big);
+    try writeIntBig(&out.writer, u16, header_id);
+    try writeIntBig(&out.writer, u16, flags);
+    try writeIntBig(&out.writer, u16, 1);
+    try writeIntBig(&out.writer, u16, answer_count);
+    try writeIntBig(&out.writer, u16, 0);
+    try writeIntBig(&out.writer, u16, 0);
+    try out.writer.writeAll(query[@sizeOf(DnsHeader)..question_end]);
+
+    if (answer_matches) {
+        try writeIntBig(&out.writer, u16, 0xC00C);
+        try writeIntBig(&out.writer, u16, qtype);
+        try writeIntBig(&out.writer, u16, @intFromEnum(DnsClass.IN));
+        try writeIntBig(&out.writer, u32, synthetic_ttl_secs);
+
+        switch (qtype) {
+            @intFromEnum(DnsRecordType.A) => {
+                try writeIntBig(&out.writer, u16, 4);
+                try out.writer.writeAll(&[_]u8{ 127, 0, 0, 1 });
+            },
+            @intFromEnum(DnsRecordType.AAAA) => {
+                try writeIntBig(&out.writer, u16, 16);
+                try out.writer.writeAll(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+            },
+            else => unreachable,
+        }
     }
 
-    // Cache successful A records into the policy for allowlist checks.
-    const records = try resolver.resolve(domain, net_policy);
-    defer allocator.free(records);
+    return out.toOwnedSlice();
+}
 
-    for (records) |record| {
-        net_policy.addResolvedIp(domain, record.ip, record.ttl) catch continue;
-    }
+pub fn buildInternalResponseHex(allocator: std.mem.Allocator, request_hex: []const u8) ![]u8 {
+    const query = try allocator.alloc(u8, request_hex.len / 2);
+    defer allocator.free(query);
+    const decoded = try std.fmt.hexToBytes(query, request_hex);
+
+    const response = try buildInternalResponse(allocator, decoded);
+    defer allocator.free(response);
+    return try encodeHexAlloc(allocator, response);
 }
 
 // =============================================================================
@@ -638,6 +683,81 @@ test "dns: parseResponse ignores non-A records" {
     try std.testing.expectEqual([4]u8{ 5, 6, 7, 8 }, records[0].ip);
 }
 
+test "dns: buildInternalResponseHex resolves metadata.m80.internal to loopback" {
+    var query_buf: [512]u8 = undefined;
+    const qlen = try buildQuery(&query_buf, internal_metadata_name, 0xCAFE);
+    const query_hex = try encodeHexAlloc(std.testing.allocator, query_buf[0..qlen]);
+    defer std.testing.allocator.free(query_hex);
+
+    const response_hex = try buildInternalResponseHex(std.testing.allocator, query_hex);
+    defer std.testing.allocator.free(response_hex);
+
+    var response_buf: [512]u8 = undefined;
+    const response = try std.fmt.hexToBytes(&response_buf, response_hex);
+    const records = try parseResponse(std.testing.allocator, response);
+    defer std.testing.allocator.free(records);
+
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, records[0].ip);
+}
+
+test "dns: buildInternalResponseHex returns NXDOMAIN for non-internal names" {
+    var query_buf: [512]u8 = undefined;
+    const qlen = try buildQuery(&query_buf, "example.com", 0xFACE);
+    const query_hex = try encodeHexAlloc(std.testing.allocator, query_buf[0..qlen]);
+    defer std.testing.allocator.free(query_hex);
+
+    const response_hex = try buildInternalResponseHex(std.testing.allocator, query_hex);
+    defer std.testing.allocator.free(response_hex);
+
+    var response_buf: [512]u8 = undefined;
+    const response = try std.fmt.hexToBytes(&response_buf, response_hex);
+    try std.testing.expectEqual(@as(u16, 0x8183), std.mem.readInt(u16, response[2..][0..2], .big));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, response[6..][0..2], .big));
+}
+
+test "dns: buildInternalResponseHex returns NXDOMAIN for blocked PTR queries" {
+    var query_buf: [512]u8 = undefined;
+    const qlen = blk: {
+        const base = try buildQuery(&query_buf, "110.210.251.142.in-addr.arpa", 0xF00D);
+        const qtype = std.mem.nativeToBig(u16, 12);
+        @memcpy(query_buf[base - 4 ..][0..2], std.mem.asBytes(&qtype));
+        break :blk base;
+    };
+    const query_hex = try encodeHexAlloc(std.testing.allocator, query_buf[0..qlen]);
+    defer std.testing.allocator.free(query_hex);
+
+    const response_hex = try buildInternalResponseHex(std.testing.allocator, query_hex);
+    defer std.testing.allocator.free(response_hex);
+
+    var response_buf: [512]u8 = undefined;
+    const response = try std.fmt.hexToBytes(&response_buf, response_hex);
+    try std.testing.expectEqual(@as(u16, 0x8183), std.mem.readInt(u16, response[2..][0..2], .big));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, response[6..][0..2], .big));
+}
+
+test "dns: buildInternalResponseHex emits AAAA answer for metadata service" {
+    var query_buf: [512]u8 = undefined;
+    const qlen = blk: {
+        const base = try buildQuery(&query_buf, internal_metadata_name, 0xC001);
+        const qtype = std.mem.nativeToBig(u16, @intFromEnum(DnsRecordType.AAAA));
+        @memcpy(query_buf[base - 4 ..][0..2], std.mem.asBytes(&qtype));
+        break :blk base;
+    };
+    const query_hex = try encodeHexAlloc(std.testing.allocator, query_buf[0..qlen]);
+    defer std.testing.allocator.free(query_hex);
+
+    const response_hex = try buildInternalResponseHex(std.testing.allocator, query_hex);
+    defer std.testing.allocator.free(response_hex);
+
+    var response_buf: [512]u8 = undefined;
+    const response = try std.fmt.hexToBytes(&response_buf, response_hex);
+    const question_end = try skipQuestion(response, @sizeOf(DnsHeader));
+    const rdlength_pos = question_end + 2 + 2 + 2 + 4;
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, response[6..][0..2], .big));
+    try std.testing.expectEqual(@as(u16, 16), std.mem.readInt(u16, response[rdlength_pos..][0..2], .big));
+}
+
 test "dns: skipName rejects truncated label" {
     const data = [_]u8{ 3, 'w', 'w' };
     try std.testing.expectError(error.InvalidResponse, skipName(&data, 0));
@@ -660,38 +780,30 @@ test "dns: resolve returns NoServers when empty" {
     var resolver = DnsResolver.init(allocator);
     defer resolver.deinit();
 
-    try std.testing.expectError(DnsError.NoServers, resolver.resolve("example.com", null));
+    try std.testing.expectError(DnsError.NoServers, resolver.resolve("example.com"));
 }
 
 test "dns: resolve uses udp responder" {
     const allocator = std.testing.allocator;
 
-    const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-    defer std.posix.close(sock);
-
-    const bind_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 0);
-    try std.posix.bind(sock, &bind_addr.any, bind_addr.getOsSockLen());
-
-    var bound_storage: std.posix.sockaddr.storage = undefined;
-    var bound_len: std.posix.socklen_t = @sizeOf(@TypeOf(bound_storage));
-    try std.posix.getsockname(sock, @ptrCast(&bound_storage), &bound_len);
-    const bound_addr = std.net.Address.initPosix(@ptrCast(@alignCast(&bound_storage)));
-    const port = bound_addr.getPort();
+    const bind_addr = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    const sock = try bind_addr.bind(fs.io(), .{ .mode = .dgram });
+    defer sock.close(fs.io());
+    const port = sock.address.getPort();
 
     const ResponderCtx = struct {
-        sock: std.posix.socket_t,
+        sock: std.Io.net.Socket,
     };
 
     const responder = struct {
         fn run(ctx: *ResponderCtx) void {
             var buf: [512]u8 = undefined;
-            var from_addr: std.posix.sockaddr.storage = undefined;
-            var from_len: std.posix.socklen_t = @sizeOf(@TypeOf(from_addr));
-            const n = std.posix.recvfrom(ctx.sock, &buf, 0, @ptrCast(&from_addr), &from_len) catch return;
+            const msg = ctx.sock.receive(fs.io(), &buf) catch return;
+            const n = msg.data.len;
             if (n < @sizeOf(DnsHeader)) return;
 
             var response: [512]u8 = undefined;
-            @memcpy(response[0..@sizeOf(DnsHeader)], buf[0..@sizeOf(DnsHeader)]);
+            @memcpy(response[0..@sizeOf(DnsHeader)], msg.data[0..@sizeOf(DnsHeader)]);
             std.mem.writeInt(u16, response[2..][0..2], 0x8000, .big); // response
             std.mem.writeInt(u16, response[4..][0..2], 1, .big); // qd
             std.mem.writeInt(u16, response[6..][0..2], 1, .big); // an
@@ -701,7 +813,7 @@ test "dns: resolve uses udp responder" {
             const question_len = n - @sizeOf(DnsHeader);
             @memcpy(
                 response[@sizeOf(DnsHeader)..][0..question_len],
-                buf[@sizeOf(DnsHeader)..][0..question_len],
+                msg.data[@sizeOf(DnsHeader)..][0..question_len],
             );
 
             var pos: usize = @sizeOf(DnsHeader) + question_len;
@@ -730,7 +842,7 @@ test "dns: resolve uses udp responder" {
             response[pos + 3] = 6;
             pos += 4;
 
-            _ = std.posix.sendto(ctx.sock, response[0..pos], 0, @ptrCast(&from_addr), from_len) catch return;
+            ctx.sock.send(fs.io(), &msg.from, response[0..pos]) catch return;
         }
     };
 
@@ -743,102 +855,11 @@ test "dns: resolve uses udp responder" {
     resolver.max_retries = 1;
     try resolver.addServerWithPort([4]u8{ 127, 0, 0, 1 }, port);
 
-    const records = try resolver.resolve("example.com", null);
+    const records = try resolver.resolve("example.com");
     defer allocator.free(records);
 
     try std.testing.expectEqual(@as(usize, 1), records.len);
     try std.testing.expectEqual([4]u8{ 9, 8, 7, 6 }, records[0].ip);
-}
-
-test "dns: resolveWithPolicy caches resolved ip" {
-    const allocator = std.testing.allocator;
-
-    const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-    defer std.posix.close(sock);
-
-    const bind_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 0);
-    try std.posix.bind(sock, &bind_addr.any, bind_addr.getOsSockLen());
-
-    var bound_storage: std.posix.sockaddr.storage = undefined;
-    var bound_len: std.posix.socklen_t = @sizeOf(@TypeOf(bound_storage));
-    try std.posix.getsockname(sock, @ptrCast(&bound_storage), &bound_len);
-    const bound_addr = std.net.Address.initPosix(@ptrCast(@alignCast(&bound_storage)));
-    const port = bound_addr.getPort();
-
-    const ResponderCtx = struct {
-        sock: std.posix.socket_t,
-    };
-
-    const responder = struct {
-        fn run(ctx: *ResponderCtx) void {
-            var buf: [512]u8 = undefined;
-            var from_addr: std.posix.sockaddr.storage = undefined;
-            var from_len: std.posix.socklen_t = @sizeOf(@TypeOf(from_addr));
-            const n = std.posix.recvfrom(ctx.sock, &buf, 0, @ptrCast(&from_addr), &from_len) catch return;
-            if (n < @sizeOf(DnsHeader)) return;
-
-            var response: [512]u8 = undefined;
-            @memcpy(response[0..@sizeOf(DnsHeader)], buf[0..@sizeOf(DnsHeader)]);
-            std.mem.writeInt(u16, response[2..][0..2], 0x8000, .big); // response
-            std.mem.writeInt(u16, response[4..][0..2], 1, .big); // qd
-            std.mem.writeInt(u16, response[6..][0..2], 1, .big); // an
-            std.mem.writeInt(u16, response[8..][0..2], 0, .big); // ns
-            std.mem.writeInt(u16, response[10..][0..2], 0, .big); // ar
-
-            const question_len = n - @sizeOf(DnsHeader);
-            @memcpy(
-                response[@sizeOf(DnsHeader)..][0..question_len],
-                buf[@sizeOf(DnsHeader)..][0..question_len],
-            );
-
-            var pos: usize = @sizeOf(DnsHeader) + question_len;
-            response[pos] = 0xC0;
-            response[pos + 1] = 0x0C;
-            pos += 2;
-
-            const rtype = std.mem.nativeToBig(u16, @intFromEnum(DnsRecordType.A));
-            const rclass = std.mem.nativeToBig(u16, @intFromEnum(DnsClass.IN));
-            @memcpy(response[pos..][0..2], std.mem.asBytes(&rtype));
-            pos += 2;
-            @memcpy(response[pos..][0..2], std.mem.asBytes(&rclass));
-            pos += 2;
-
-            const ttl = std.mem.nativeToBig(u32, 60);
-            @memcpy(response[pos..][0..4], std.mem.asBytes(&ttl));
-            pos += 4;
-
-            const rdlen = std.mem.nativeToBig(u16, 4);
-            @memcpy(response[pos..][0..2], std.mem.asBytes(&rdlen));
-            pos += 2;
-
-            response[pos] = 1;
-            response[pos + 1] = 2;
-            response[pos + 2] = 3;
-            response[pos + 3] = 4;
-            pos += 4;
-
-            _ = std.posix.sendto(ctx.sock, response[0..pos], 0, @ptrCast(&from_addr), from_len) catch return;
-        }
-    };
-
-    var ctx = ResponderCtx{ .sock = sock };
-    const thread = try std.Thread.spawn(.{}, responder.run, .{&ctx});
-    defer thread.join();
-
-    var net_policy = policy.NetworkPolicy.init(allocator);
-    defer net_policy.deinit();
-    net_policy.mode = .allowlist;
-    try net_policy.addDomainRule("example.com");
-
-    var resolver = DnsResolver.init(allocator);
-    defer resolver.deinit();
-    resolver.max_retries = 1;
-    try resolver.addServerWithPort([4]u8{ 127, 0, 0, 1 }, port);
-
-    try resolveWithPolicy(allocator, &resolver, "example.com", &net_policy);
-
-    try std.testing.expectEqual(@as(usize, 1), net_policy.resolved_ips.items.len);
-    try std.testing.expect(net_policy.isIpAllowed([4]u8{ 1, 2, 3, 4 }));
 }
 
 test "dns: parseQueryDomain parses query name" {
@@ -847,22 +868,4 @@ test "dns: parseQueryDomain parses query name" {
     var out: [256]u8 = undefined;
     const name = try parseQueryDomain(buf[0..len], &out);
     try std.testing.expectEqualStrings("example.com", name);
-}
-
-test "dns: resolveWithPolicy rejects disallowed domain" {
-    const allocator = std.testing.allocator;
-
-    var net_policy = policy.NetworkPolicy.init(allocator);
-    defer net_policy.deinit();
-    net_policy.mode = .allowlist;
-    try net_policy.addDomainRule("allowed.example.com");
-
-    var resolver = DnsResolver.init(allocator);
-    defer resolver.deinit();
-    try resolver.addServer([4]u8{ 8, 8, 8, 8 });
-
-    try std.testing.expectError(
-        DnsError.DomainNotAllowed,
-        resolveWithPolicy(allocator, &resolver, "blocked.example.com", &net_policy),
-    );
 }

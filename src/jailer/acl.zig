@@ -21,6 +21,7 @@
 //! - Recursive traversal hardens all contents
 
 const std = @import("std");
+const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const windows = std.os.windows;
 
@@ -51,7 +52,7 @@ pub fn hardenVmDirectory(allocator: std.mem.Allocator, path: []const u8) AclErro
 /// POSIX implementation of directory hardening
 fn hardenVmDirectoryPosix(allocator: std.mem.Allocator, path: []const u8) AclError!void {
     // Open the directory
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |e| switch (e) {
+    var dir = fs.cwd().openDir(path, .{ .iterate = true }) catch |e| switch (e) {
         error.AccessDenied => return AclError.PermissionDenied,
         error.FileNotFound => return AclError.InvalidPath,
         else => return AclError.SystemError,
@@ -68,13 +69,13 @@ fn hardenVmDirectoryPosix(allocator: std.mem.Allocator, path: []const u8) AclErr
 /// Recursively hardens directory contents
 fn hardenDirectoryContentsRecursive(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: fs.Dir,
     base_path: []const u8,
 ) AclError!void {
     // Walk the directory tree and clamp permissions to owner-only.
     var iterator = dir.iterate();
     while (iterator.next() catch return AclError.SystemError) |entry| {
-        const entry_path = std.fs.path.join(allocator, &[_][]const u8{ base_path, entry.name }) catch return AclError.OutOfMemory;
+        const entry_path = fs.path.join(allocator, &[_][]const u8{ base_path, entry.name }) catch return AclError.OutOfMemory;
         defer allocator.free(entry_path);
 
         switch (entry.kind) {
@@ -107,13 +108,13 @@ fn hardenDirectoryContentsRecursive(
 /// Sets directory permissions to 0700
 fn setDirPermissions(path: []const u8) !void {
     if (builtin.os.tag == .windows) return;
-    std.posix.fchmodat(std.fs.cwd().fd, path, PosixMode.dir_mode, 0) catch return error.SystemError;
+    fs.chmodAt(fs.cwd().fd, path, PosixMode.dir_mode, 0) catch return error.SystemError;
 }
 
 fn setDirPermissionsWithMode(path: []const u8, mode: ?std.posix.mode_t) !void {
     if (mode) |m| {
         if (builtin.os.tag == .windows) return;
-        std.posix.fchmodat(std.fs.cwd().fd, path, m, 0) catch return error.SystemError;
+        fs.chmodAt(fs.cwd().fd, path, m, 0) catch return error.SystemError;
         return;
     }
     return setDirPermissions(path);
@@ -123,13 +124,13 @@ fn setDirPermissionsWithMode(path: []const u8, mode: ?std.posix.mode_t) !void {
 fn setFilePermissions(path: []const u8) !void {
     if (builtin.os.tag == .windows) return;
 
-    std.posix.fchmodat(std.fs.cwd().fd, path, PosixMode.file_mode, 0) catch return error.SystemError;
+    fs.chmodAt(fs.cwd().fd, path, PosixMode.file_mode, 0) catch return error.SystemError;
 }
 
 fn setFilePermissionsWithMode(path: []const u8, mode: ?std.posix.mode_t) !void {
     if (mode) |m| {
         if (builtin.os.tag == .windows) return;
-        std.posix.fchmodat(std.fs.cwd().fd, path, m, 0) catch return error.SystemError;
+        fs.chmodAt(fs.cwd().fd, path, m, 0) catch return error.SystemError;
         return;
     }
     return setFilePermissions(path);
@@ -156,7 +157,7 @@ pub fn verifyHardenedPermissions(path: []const u8) AclError!bool {
 }
 
 fn verifyHardenedPermissionsPosix(path: []const u8) AclError!bool {
-    const stat = std.fs.cwd().statFile(path) catch |e| switch (e) {
+    const stat = fs.cwd().statFile(path) catch |e| switch (e) {
         error.AccessDenied => return AclError.PermissionDenied,
         error.FileNotFound => return AclError.InvalidPath,
         else => return AclError.SystemError,
@@ -166,7 +167,7 @@ fn verifyHardenedPermissionsPosix(path: []const u8) AclError!bool {
     const is_dir = stat.kind == .directory;
 
     // Check that group and other have no permissions
-    const group_other_mask: std.fs.File.Mode = 0o077;
+    const group_other_mask: fs.File.Mode = 0o077;
     if (mode & group_other_mask != 0) {
         return false;
     }
@@ -256,7 +257,7 @@ fn hardenVmDirectoryPosixWithConfig(
     path: []const u8,
     config: HardenConfig,
 ) AclError!void {
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |e| switch (e) {
+    var dir = fs.cwd().openDir(path, .{ .iterate = true }) catch |e| switch (e) {
         error.AccessDenied => return AclError.PermissionDenied,
         error.FileNotFound => return AclError.InvalidPath,
         else => return AclError.SystemError,
@@ -272,13 +273,13 @@ fn hardenVmDirectoryPosixWithConfig(
 
 fn hardenDirectoryContentsRecursiveWithConfig(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: fs.Dir,
     base_path: []const u8,
     config: HardenConfig,
 ) AclError!void {
     var iterator = dir.iterate();
     while (iterator.next() catch return AclError.SystemError) |entry| {
-        const entry_path = std.fs.path.join(allocator, &[_][]const u8{ base_path, entry.name }) catch return AclError.OutOfMemory;
+        const entry_path = fs.path.join(allocator, &[_][]const u8{ base_path, entry.name }) catch return AclError.OutOfMemory;
         defer allocator.free(entry_path);
 
         switch (entry.kind) {
@@ -519,7 +520,7 @@ fn hardenVmDirectoryWindowsWithConfig(
 ) AclError!void {
     if (builtin.os.tag != .windows) return;
 
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |e| switch (e) {
+    var dir = fs.cwd().openDir(path, .{ .iterate = true }) catch |e| switch (e) {
         error.AccessDenied => return AclError.PermissionDenied,
         error.FileNotFound => return AclError.InvalidPath,
         else => return AclError.SystemError,
@@ -535,13 +536,13 @@ fn hardenVmDirectoryWindowsWithConfig(
 
 fn hardenDirectoryContentsRecursiveWindows(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: fs.Dir,
     base_path: []const u8,
     config: HardenConfig,
 ) AclError!void {
     var iterator = dir.iterate();
     while (iterator.next() catch return AclError.SystemError) |entry| {
-        const entry_path = std.fs.path.join(allocator, &[_][]const u8{ base_path, entry.name }) catch return AclError.OutOfMemory;
+        const entry_path = fs.path.join(allocator, &[_][]const u8{ base_path, entry.name }) catch return AclError.OutOfMemory;
         defer allocator.free(entry_path);
 
         switch (entry.kind) {
@@ -585,7 +586,7 @@ test "acl: verifyHardenedPermissionsPosix" {
     const allocator = std.testing.allocator;
     _ = allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     // Create a test file
@@ -599,7 +600,7 @@ test "acl: verifyHardenedPermissionsPosix" {
     defer std.testing.allocator.free(path);
 
     // Set restrictive permissions
-    std.posix.fchmodat(tmp.dir.fd, "test.txt", PosixMode.file_mode, 0) catch return error.SkipZigTest;
+    fs.chmodAt(tmp.dir.fd, "test.txt", PosixMode.file_mode, 0) catch return error.SkipZigTest;
 
     const is_hardened = try verifyHardenedPermissionsPosix(path);
     try std.testing.expect(is_hardened);
@@ -610,7 +611,7 @@ test "acl: hardenVmDirectory windows owner-only" {
 
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("vm");
@@ -634,7 +635,7 @@ test "acl: hardenVmDirectory creates restrictive permissions" {
 
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     // Create directory structure
@@ -663,7 +664,7 @@ test "acl: hardenVmDirectory creates restrictive permissions" {
 test "acl: verifyHardenedPermissionsPosix rejects loose perms" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -673,7 +674,7 @@ test "acl: verifyHardenedPermissionsPosix rejects loose perms" {
     }
 
     // Make it group/world-readable.
-    std.posix.fchmodat(tmp.dir.fd, "loose.txt", 0o644, 0) catch return error.SkipZigTest;
+    fs.chmodAt(tmp.dir.fd, "loose.txt", 0o644, 0) catch return error.SkipZigTest;
 
     const path = try tmp.dir.realpathAlloc(std.testing.allocator, "loose.txt");
     defer std.testing.allocator.free(path);
@@ -687,7 +688,7 @@ test "acl: hardenVmDirectory does not follow symlinks" {
 
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("vm");
@@ -699,7 +700,7 @@ test "acl: hardenVmDirectory does not follow symlinks" {
     }
 
     // Make target world-readable to detect unintended chmod.
-    std.posix.fchmodat(tmp.dir.fd, "outside/target.txt", 0o644, 0) catch return error.SkipZigTest;
+    fs.chmodAt(tmp.dir.fd, "outside/target.txt", 0o644, 0) catch return error.SkipZigTest;
 
     try tmp.dir.symLink("../outside/target.txt", "vm/link", .{});
 
@@ -711,7 +712,7 @@ test "acl: hardenVmDirectory does not follow symlinks" {
     const target_path = try tmp.dir.realpathAlloc(allocator, "outside/target.txt");
     defer allocator.free(target_path);
 
-    const stat = try std.fs.cwd().statFile(target_path);
+    const stat = try fs.cwd().statFile(target_path);
     try std.testing.expect((stat.mode & 0o777) == 0o644);
 }
 
@@ -720,7 +721,7 @@ test "acl: hardenVmDirectoryWithConfig applies custom modes" {
 
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("vm");
@@ -741,8 +742,8 @@ test "acl: hardenVmDirectoryWithConfig applies custom modes" {
     const file_path = try tmp.dir.realpathAlloc(allocator, "vm/file.txt");
     defer allocator.free(file_path);
 
-    const dir_stat = try std.fs.cwd().statFile(vm_path);
-    const file_stat = try std.fs.cwd().statFile(file_path);
+    const dir_stat = try fs.cwd().statFile(vm_path);
+    const file_stat = try fs.cwd().statFile(file_path);
 
     try std.testing.expect((dir_stat.mode & 0o777) == 0o750);
     try std.testing.expect((file_stat.mode & 0o777) == 0o640);
@@ -753,7 +754,7 @@ test "acl: hardenVmDirectoryWithConfig respects follow_symlinks" {
 
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("vm");
@@ -764,7 +765,7 @@ test "acl: hardenVmDirectoryWithConfig respects follow_symlinks" {
         try f.writeAll("x");
     }
 
-    std.posix.fchmodat(tmp.dir.fd, "outside/target.txt", 0o644, 0) catch return error.SkipZigTest;
+    fs.chmodAt(tmp.dir.fd, "outside/target.txt", 0o644, 0) catch return error.SkipZigTest;
     try tmp.dir.symLink("../outside/target.txt", "vm/link", .{});
 
     const vm_path = try tmp.dir.realpathAlloc(allocator, "vm");
@@ -778,7 +779,7 @@ test "acl: hardenVmDirectoryWithConfig respects follow_symlinks" {
     const target_path = try tmp.dir.realpathAlloc(allocator, "outside/target.txt");
     defer allocator.free(target_path);
 
-    const stat = try std.fs.cwd().statFile(target_path);
+    const stat = try fs.cwd().statFile(target_path);
     try std.testing.expect((stat.mode & 0o777) == 0o600);
 }
 
@@ -787,7 +788,7 @@ test "acl: hardenVmDirectoryWithConfig fail_fast false continues" {
 
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("vm/a");
@@ -797,8 +798,8 @@ test "acl: hardenVmDirectoryWithConfig fail_fast false continues" {
     defer allocator.free(vm_path);
 
     // Make vm/a inaccessible to force a permission error.
-    std.posix.fchmodat(tmp.dir.fd, "vm/a", 0o000, 0) catch return error.SkipZigTest;
-    defer std.posix.fchmodat(tmp.dir.fd, "vm/a", 0o700, 0) catch {};
+    fs.chmodAt(tmp.dir.fd, "vm/a", 0o000, 0) catch return error.SkipZigTest;
+    defer fs.chmodAt(tmp.dir.fd, "vm/a", 0o700, 0) catch {};
 
     try hardenVmDirectoryWithConfig(allocator, vm_path, .{
         .fail_fast = false,
@@ -807,6 +808,6 @@ test "acl: hardenVmDirectoryWithConfig fail_fast false continues" {
     const b_path = try tmp.dir.realpathAlloc(allocator, "vm/b");
     defer allocator.free(b_path);
 
-    const b_stat = try std.fs.cwd().statFile(b_path);
+    const b_stat = try fs.cwd().statFile(b_path);
     try std.testing.expect((b_stat.mode & 0o700) == PosixMode.dir_mode);
 }

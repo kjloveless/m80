@@ -23,6 +23,7 @@
 //! - Symlinks in intermediate directories are resolved
 
 const std = @import("std");
+const fs = @import("fs.zig");
 const builtin = @import("builtin");
 const windows = std.os.windows;
 
@@ -99,10 +100,10 @@ fn canonicalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len == 0) return error.InvalidPath;
 
     // If path is absolute, get realpath without following final symlink
-    if (std.fs.path.isAbsolute(path)) {
+    if (fs.path.isAbsolute(path)) {
         // Try to get the real path from the filesystem
         // This handles symlinks in intermediate directories
-        const real = std.fs.cwd().realpathAlloc(allocator, path) catch |e| switch (e) {
+        const real = fs.cwd().realpathAlloc(allocator, path) catch |e| switch (e) {
             error.FileNotFound => {
                 // Path doesn't exist yet - normalize it manually
                 return normalizePathComponents(allocator, path);
@@ -113,13 +114,13 @@ fn canonicalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     }
 
     // Relative path - join with cwd first
-    const cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const cwd_path = try fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd_path);
 
-    const joined = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, path });
+    const joined = try fs.path.join(allocator, &[_][]const u8{ cwd_path, path });
     defer allocator.free(joined);
 
-    const real = std.fs.cwd().realpathAlloc(allocator, joined) catch |e| switch (e) {
+    const real = fs.cwd().realpathAlloc(allocator, joined) catch |e| switch (e) {
         error.FileNotFound => {
             return normalizePathComponents(allocator, joined);
         },
@@ -134,9 +135,9 @@ fn normalizePathComponents(allocator: std.mem.Allocator, path: []const u8) ![]u8
     var components: std.ArrayList([]const u8) = .empty;
     defer components.deinit(allocator);
 
-    const is_absolute = std.fs.path.isAbsolute(path);
+    const is_absolute = fs.path.isAbsolute(path);
 
-    var it = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    var it = std.mem.splitScalar(u8, path, fs.path.sep);
     while (it.next()) |component| {
         if (component.len == 0 or std.mem.eql(u8, component, ".")) {
             continue;
@@ -172,13 +173,13 @@ fn normalizePathComponents(allocator: std.mem.Allocator, path: []const u8) ![]u8
     var pos: usize = 0;
 
     if (is_absolute) {
-        result[pos] = std.fs.path.sep;
+        result[pos] = fs.path.sep;
         pos += 1;
     }
 
     for (components.items, 0..) |c, i| {
         if (i > 0) {
-            result[pos] = std.fs.path.sep;
+            result[pos] = fs.path.sep;
             pos += 1;
         }
         @memcpy(result[pos..][0..c.len], c);
@@ -193,7 +194,7 @@ fn countPathDepth(relative_path: []const u8) u8 {
     if (relative_path.len == 0) return 0;
 
     var depth: u8 = 0;
-    var it = std.mem.splitScalar(u8, relative_path, std.fs.path.sep);
+    var it = std.mem.splitScalar(u8, relative_path, fs.path.sep);
     while (it.next()) |component| {
         if (component.len > 0 and !std.mem.eql(u8, component, ".")) {
             depth += 1;
@@ -211,7 +212,7 @@ fn checkSymlinkEscape(
     var components: std.ArrayList([]const u8) = .empty;
     defer components.deinit(allocator);
 
-    var it = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    var it = std.mem.splitScalar(u8, path, fs.path.sep);
     while (it.next()) |component| {
         if (component.len == 0) continue;
         try components.append(allocator, component);
@@ -222,13 +223,13 @@ fn checkSymlinkEscape(
     defer current_path.deinit(allocator);
 
     // Start with root separator if absolute
-    if (std.fs.path.isAbsolute(path)) {
-        try current_path.append(allocator, std.fs.path.sep);
+    if (fs.path.isAbsolute(path)) {
+        try current_path.append(allocator, fs.path.sep);
     }
 
     for (components.items) |component| {
-        if (current_path.items.len > 1 or (current_path.items.len == 1 and current_path.items[0] != std.fs.path.sep)) {
-            try current_path.append(allocator, std.fs.path.sep);
+        if (current_path.items.len > 1 or (current_path.items.len == 1 and current_path.items[0] != fs.path.sep)) {
+            try current_path.append(allocator, fs.path.sep);
         }
         try current_path.appendSlice(allocator, component);
 
@@ -237,19 +238,19 @@ fn checkSymlinkEscape(
             const path_w = windows.sliceToPrefixedFileW(null, current_path.items) catch return true;
             const attrs = windows.kernel32.GetFileAttributesW(path_w.span().ptr);
             if (attrs == windows.INVALID_FILE_ATTRIBUTES) {
-                break :blk std.fs.cwd().statFile(current_path.items) catch continue;
+                break :blk fs.cwd().statFile(current_path.items) catch continue;
             }
             if ((attrs & windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
                 return true;
             }
-            break :blk std.fs.cwd().statFile(current_path.items) catch continue;
+            break :blk fs.cwd().statFile(current_path.items) catch continue;
         } else blk: {
-            const posix_stat = std.posix.fstatat(
+            const posix_stat = fs.statAt(
                 std.posix.AT.FDCWD,
                 current_path.items,
                 std.posix.AT.SYMLINK_NOFOLLOW,
             ) catch continue;
-            break :blk std.fs.File.Stat.fromPosix(posix_stat);
+            break :blk posix_stat;
         };
         if (stat.kind == .sym_link) {
             // Resolve the symlink and check if it escapes
@@ -257,12 +258,12 @@ fn checkSymlinkEscape(
             defer allocator.free(target);
 
             var resolved: []u8 = undefined;
-            if (std.fs.path.isAbsolute(target)) {
+            if (fs.path.isAbsolute(target)) {
                 resolved = try allocator.dupe(u8, target);
             } else {
                 // Relative symlink - resolve from parent directory
-                const parent = std.fs.path.dirname(current_path.items) orelse "/";
-                resolved = try std.fs.path.join(allocator, &[_][]const u8{ parent, target });
+                const parent = fs.path.dirname(current_path.items) orelse "/";
+                resolved = try fs.path.join(allocator, &[_][]const u8{ parent, target });
             }
             defer allocator.free(resolved);
 
@@ -283,7 +284,7 @@ fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     while (true) {
         const buf = try allocator.alloc(u8, buf_len);
         errdefer allocator.free(buf);
-        const res = std.fs.cwd().readLink(path, buf) catch |e| switch (e) {
+        const res = fs.cwd().readLink(path, buf) catch |e| switch (e) {
             error.NameTooLong => {
                 allocator.free(buf);
                 buf_len *= 2;
@@ -291,7 +292,7 @@ fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
             },
             else => return e,
         };
-        const out = try allocator.dupe(u8, res);
+        const out = try allocator.dupe(u8, buf[0..res]);
         allocator.free(buf);
         return out;
     }
@@ -311,7 +312,7 @@ pub fn safeDeleteTree(
     });
     defer allocator.free(validated);
 
-    std.fs.cwd().deleteTree(validated) catch |e| switch (e) {
+    fs.cwd().deleteTree(validated) catch |e| switch (e) {
         error.AccessDenied => return PathError.AccessDenied,
         else => return PathError.InvalidPath,
     };
@@ -320,7 +321,7 @@ pub fn safeDeleteTree(
 /// Checks if a path contains any path traversal patterns
 pub fn containsTraversal(path: []const u8) bool {
     // Reject ".." sequences for both native and Windows separators.
-    var it = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    var it = std.mem.splitScalar(u8, path, fs.path.sep);
     while (it.next()) |component| {
         if (std.mem.eql(u8, component, "..")) return true;
     }
@@ -343,7 +344,7 @@ pub fn isWithinRoot(path: []const u8, root: []const u8) bool {
 
     // Must have a separator after root (or be exactly the root)
     if (path.len == root.len) return true;
-    if (path.len > root.len and path[root.len] == std.fs.path.sep) return true;
+    if (path.len > root.len and path[root.len] == fs.path.sep) return true;
 
     return false;
 }
@@ -356,7 +357,7 @@ test "path: validateSafePath rejects traversal" {
     const allocator = std.testing.allocator;
 
     // Create a temporary directory structure for testing
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     const root = try tmp.dir.realpathAlloc(allocator, ".");
@@ -365,7 +366,7 @@ test "path: validateSafePath rejects traversal" {
     // Create nested structure
     try tmp.dir.makePath("level1/level2/level3");
 
-    const valid_path = try std.fs.path.join(allocator, &[_][]const u8{ root, "level1", "level2" });
+    const valid_path = try fs.path.join(allocator, &[_][]const u8{ root, "level1", "level2" });
     defer allocator.free(valid_path);
 
     const result = try validateSafePath(allocator, valid_path, .{
@@ -380,7 +381,7 @@ test "path: validateSafePath rejects traversal" {
 test "path: validateSafePath rejects shallow paths" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     const root = try tmp.dir.realpathAlloc(allocator, ".");
@@ -388,7 +389,7 @@ test "path: validateSafePath rejects shallow paths" {
 
     try tmp.dir.makePath("level1");
 
-    const shallow_path = try std.fs.path.join(allocator, &[_][]const u8{ root, "level1" });
+    const shallow_path = try fs.path.join(allocator, &[_][]const u8{ root, "level1" });
     defer allocator.free(shallow_path);
 
     try std.testing.expectError(PathError.PathTooShallow, validateSafePath(allocator, shallow_path, .{
@@ -400,7 +401,7 @@ test "path: validateSafePath rejects shallow paths" {
 test "path: validateSafePath rejects paths outside root" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     const root = try tmp.dir.realpathAlloc(allocator, ".");
@@ -481,7 +482,7 @@ test "path: validateSafePath rejects symlink escape" {
 
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root/child");
@@ -491,7 +492,7 @@ test "path: validateSafePath rejects symlink escape" {
     const root = try tmp.dir.realpathAlloc(allocator, "root");
     defer allocator.free(root);
 
-    const target = try std.fs.path.join(allocator, &[_][]const u8{ root, "link" });
+    const target = try fs.path.join(allocator, &[_][]const u8{ root, "link" });
     defer allocator.free(target);
 
     const result = validateSafePath(allocator, target, .{
@@ -511,14 +512,14 @@ test "path: validateSafePath rejects symlink escape" {
 test "path: safeDeleteTree rejects shallow paths" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root/child");
     const root = try tmp.dir.realpathAlloc(allocator, "root");
     defer allocator.free(root);
 
-    const target = try std.fs.path.join(allocator, &[_][]const u8{ root, "child" });
+    const target = try fs.path.join(allocator, &[_][]const u8{ root, "child" });
     defer allocator.free(target);
 
     try std.testing.expectError(PathError.PathTooShallow, safeDeleteTree(allocator, target, root));
@@ -527,7 +528,7 @@ test "path: safeDeleteTree rejects shallow paths" {
 test "path: safeDeleteTree deletes deep tree" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root/a/b");
@@ -540,10 +541,10 @@ test "path: safeDeleteTree deletes deep tree" {
     const root = try tmp.dir.realpathAlloc(allocator, "root");
     defer allocator.free(root);
 
-    const target = try std.fs.path.join(allocator, &[_][]const u8{ root, "a", "b" });
+    const target = try fs.path.join(allocator, &[_][]const u8{ root, "a", "b" });
     defer allocator.free(target);
 
     try safeDeleteTree(allocator, target, root);
 
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().openDir(target, .{}));
+    try std.testing.expectError(error.FileNotFound, fs.cwd().openDir(target, .{}));
 }

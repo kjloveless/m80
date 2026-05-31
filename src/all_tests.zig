@@ -19,6 +19,7 @@ test "import: all modules" {
     _ = @import("cli/help.zig");
     _ = @import("cli/runtime.zig");
     _ = @import("cli/commands/console.zig");
+    _ = @import("cli/commands/daemon.zig");
     _ = @import("cli/commands/lifecycle.zig");
     _ = @import("cli/commands/snapshot_restore.zig");
     _ = @import("cli/commands/vm_admin.zig");
@@ -35,7 +36,8 @@ test "import: all modules" {
     _ = @import("jailer/seccomp.zig");
     _ = @import("main.zig");
     _ = @import("net/dns.zig");
-    _ = @import("net/policy.zig");
+    _ = @import("daemon/protocol.zig");
+    _ = @import("daemon/server.zig");
     _ = @import("util/env.zig");
     _ = @import("util/log.zig");
     _ = @import("util/path.zig");

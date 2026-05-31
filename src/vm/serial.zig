@@ -21,17 +21,20 @@
 //! This is useful for testing automated interactions.
 
 const std = @import("std");
+const sync = @import("../util/sync.zig");
+const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
+const env = @import("../util/env.zig");
 
 const console_backlog_limit: usize = 64 * 1024;
 var console_fd: ?std.posix.fd_t = null;
-var console_mutex: std.Thread.Mutex = .{};
-var console_backlog: std.ArrayListUnmanaged(u8) = .{};
+var console_mutex: sync.Mutex = .{};
+var console_backlog: std.ArrayListUnmanaged(u8) = .empty;
 
 fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        const written = try std.posix.write(fd, bytes[offset..]);
+        const written = try fs.writeFd(fd, bytes[offset..]);
         if (written == 0) return error.BrokenPipe;
         offset += written;
     }
@@ -53,7 +56,7 @@ pub fn clearConsoleBacklog() void {
     console_mutex.lock();
     defer console_mutex.unlock();
     console_backlog.deinit(std.heap.page_allocator);
-    console_backlog = .{};
+    console_backlog = .empty;
 }
 
 fn appendConsoleBacklog(bytes: []const u8) void {
@@ -141,16 +144,16 @@ pub fn writeConsoleBytes(bytes: []const u8) void {
 /// Handles reads/writes to COM1 ports (0x3F8-0x3FF).
 pub const SerialIo = struct {
     /// Input buffer (bytes to feed to guest on reads from 0x3F8)
-    buf: std.ArrayListUnmanaged(u8) = .{},
+    buf: std.ArrayListUnmanaged(u8) = .empty,
     /// Current position in input buffer
     offset: usize = 0,
-    mutex: std.Thread.Mutex = .{},
+    mutex: sync.Mutex = .{},
 
     /// Loads input data from M80_SERIAL_IN environment variable.
     /// This allows providing scripted input to the guest for testing.
     pub fn setFromEnv(self: *SerialIo, allocator: std.mem.Allocator) void {
-        const env = std.process.getEnvVarOwned(allocator, "M80_SERIAL_IN") catch null;
-        if (env) |v| {
+        const value = env.getVarOwned(allocator, "M80_SERIAL_IN") catch null;
+        if (value) |v| {
             self.clear(allocator);
             self.append(allocator, v);
             allocator.free(v);
@@ -163,7 +166,7 @@ pub const SerialIo = struct {
         defer self.mutex.unlock();
         _ = allocator;
         self.buf.deinit(std.heap.page_allocator);
-        self.buf = .{};
+        self.buf = .empty;
         self.offset = 0;
     }
 
@@ -222,7 +225,7 @@ pub const SerialIo = struct {
         const wrote_console = writeToConsole(size, rax);
         var buf: [256]u8 = undefined;
         if (!wrote_console) {
-            var fw = std.fs.File.stdout().writer(&buf);
+            var fw = fs.File.stdout().writer(&buf);
             const w = &fw.interface;
             writeFromRax(w, size, rax) catch return;
             w.flush() catch {};
@@ -276,7 +279,7 @@ pub const SerialIo = struct {
 };
 
 var capture_path: ?[]u8 = null;
-var capture_file: ?std.fs.File = null;
+var capture_file: ?fs.File = null;
 var capture_mem: ?std.ArrayList(u8) = null;
 const capture_limit: usize = 1024 * 1024;
 
@@ -295,7 +298,7 @@ pub fn setCapturePath(allocator: std.mem.Allocator, path: []const u8) !void {
     closeCaptureSink(allocator);
     const owned_path = try allocator.dupe(u8, path);
     errdefer allocator.free(owned_path);
-    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     errdefer file.close();
     file.seekFromEnd(0) catch {};
     capture_path = owned_path;
@@ -348,8 +351,8 @@ pub const IoExit = struct {
 
 test "serial: writeFromRax writes low bytes" {
     var buf: [8]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try SerialIo.writeFromRax(stream.writer(), 4, 0x64636261);
+    var writer: std.Io.Writer = .fixed(&buf);
+    try SerialIo.writeFromRax(&writer, 4, 0x64636261);
     try std.testing.expectEqualStrings("abcd", buf[0..4]);
 }
 
@@ -382,10 +385,10 @@ test "serial: readPort reflects data ready" {
 
 test "serial: writeToStdout prefers console fd" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const fds = try std.posix.pipe();
+    const fds = try fs.pipe();
     defer {
-        std.posix.close(fds[0]);
-        std.posix.close(fds[1]);
+        fs.closeFd(fds[0]);
+        fs.closeFd(fds[1]);
         clearConsoleFd();
     }
 
@@ -393,7 +396,7 @@ test "serial: writeToStdout prefers console fd" {
     SerialIo.writeToStdout(3, 0x00636261); // "abc"
 
     var buf: [8]u8 = undefined;
-    const n = try std.posix.read(fds[0], &buf);
+    const n = try fs.readFd(fds[0], &buf);
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqualStrings("abc", buf[0..3]);
 }

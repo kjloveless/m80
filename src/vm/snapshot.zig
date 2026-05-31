@@ -17,6 +17,7 @@
 //! - Snapshot restore: <25ms/GB
 
 const std = @import("std");
+const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const log = @import("../util/log.zig");
 
@@ -364,6 +365,7 @@ pub const DeviceType = enum(u8) {
     virtio_fs = 5,
     pl011_uart = 6,
     gic_state = 7,
+    virtio_vsock = 8,
 };
 
 /// PL011 UART snapshot state (arm64 console)
@@ -439,13 +441,9 @@ pub const VirtioBlkSnapshotState = extern struct {
     queue: VirtioQueueState = .{},
 };
 
-/// VirtIO-net device snapshot state
-pub const VirtioNetSnapshotState = extern struct {
-    /// MAC address
-    mac: [6]u8 = [_]u8{0} ** 6,
-    /// Padding
-    _pad: [2]u8 = [_]u8{0} ** 2,
-    /// Common VirtIO state
+/// VirtIO-vsock device snapshot state
+pub const VirtioVsockSnapshotState = extern struct {
+    guest_cid: u64 = 0,
     status: u32 = 0,
     device_features_sel: u32 = 0,
     driver_features_sel: u32 = 0,
@@ -453,10 +451,9 @@ pub const VirtioNetSnapshotState = extern struct {
     interrupt_status: u32 = 0,
     queue_sel: u16 = 0,
     _padding: u16 = 0,
-    /// RX queue state
     rx_queue: VirtioQueueState = .{},
-    /// TX queue state
     tx_queue: VirtioQueueState = .{},
+    event_queue: VirtioQueueState = .{},
 };
 
 /// VirtIO-console device snapshot state
@@ -575,7 +572,7 @@ const HeaderRead = struct {
     bytes: [@sizeOf(SnapshotHeader)]u8,
 };
 
-fn readHeader(file: *std.fs.File) !HeaderRead {
+fn readHeader(file: *fs.File) !HeaderRead {
     var header_bytes: [@sizeOf(SnapshotHeader)]u8 = undefined;
     const header_read = try file.readAll(&header_bytes);
     if (header_read != header_bytes.len) return error.CorruptedSnapshot;
@@ -618,7 +615,7 @@ pub fn saveMemory(
     memory: []const u8,
     path: []const u8,
 ) !void {
-    var file = try std.fs.cwd().createFile(path, .{});
+    var file = try fs.cwd().createFile(path, .{});
     defer file.close();
 
     const total_pages = memory.len / page_size;
@@ -695,7 +692,7 @@ pub fn loadMemory(
     path: []const u8,
     memory: []u8,
 ) !void {
-    var file = try std.fs.cwd().openFile(path, .{});
+    var file = try fs.cwd().openFile(path, .{});
     defer file.close();
 
     // Read and validate header
@@ -731,7 +728,7 @@ pub fn loadMemory(
 
 /// Validates a snapshot file without loading it.
 pub fn validateSnapshot(path: []const u8) !SnapshotHeader {
-    var file = try std.fs.cwd().openFile(path, .{});
+    var file = try fs.cwd().openFile(path, .{});
     defer file.close();
 
     const header_read = try readHeader(&file);
@@ -759,7 +756,7 @@ fn isLegacyVcpuStateVersion(version: u32) bool {
 
 fn loadVcpuStatesFromFile(
     allocator: std.mem.Allocator,
-    file: *std.fs.File,
+    file: *fs.File,
     header: *const SnapshotHeader,
     vcpu_states: []VcpuState,
 ) !void {
@@ -999,7 +996,7 @@ fn loadVcpuStatesFromFile(
 }
 
 fn loadDeviceStateHeadersFromFile(
-    file: *std.fs.File,
+    file: *fs.File,
     header: *const SnapshotHeader,
     device_states: []DeviceState,
 ) !void {
@@ -1041,7 +1038,7 @@ pub const Snapshot = struct {
 
     /// Saves the complete snapshot to a file.
     pub fn save(self: *Snapshot, memory: []const u8, path: []const u8) !void {
-        var file = try std.fs.cwd().createFile(path, .{});
+        var file = try fs.cwd().createFile(path, .{});
         defer file.close();
 
         self.header.memory_size = memory.len;
@@ -1130,7 +1127,7 @@ pub const Snapshot = struct {
 
     /// Loads a complete snapshot from a file.
     pub fn load(allocator: std.mem.Allocator, path: []const u8, memory: []u8) !Snapshot {
-        var file = try std.fs.cwd().openFile(path, .{});
+        var file = try fs.cwd().openFile(path, .{});
         defer file.close();
 
         // Read and validate header
@@ -1181,7 +1178,7 @@ pub const Snapshot = struct {
 
     /// Loads snapshot header, vCPU state, and device state without touching memory.
     pub fn loadState(allocator: std.mem.Allocator, path: []const u8, expected_memory_size: usize) !Snapshot {
-        var file = try std.fs.cwd().openFile(path, .{});
+        var file = try fs.cwd().openFile(path, .{});
         defer file.close();
 
         const header_read = try readHeader(&file);
@@ -1206,7 +1203,7 @@ pub const Snapshot = struct {
 
 /// Loads device state entries (header + data) from a snapshot file.
 pub fn loadDeviceStateEntries(allocator: std.mem.Allocator, path: []const u8) ![]DeviceStateEntry {
-    var file = try std.fs.cwd().openFile(path, .{});
+    var file = try fs.cwd().openFile(path, .{});
     defer file.close();
 
     const header_read = try readHeader(&file);
@@ -1261,7 +1258,7 @@ pub fn saveStreaming(
     path: []const u8,
     compress: bool,
 ) !void {
-    var file = try std.fs.cwd().createFile(path, .{});
+    var file = try fs.cwd().createFile(path, .{});
     defer file.close();
 
     const total_pages = memory.len / page_size;
@@ -1356,7 +1353,7 @@ pub fn saveStreaming(
 /// Pages are loaded from the snapshot file on first access.
 pub const LazyLoader = struct {
     /// Snapshot file handle
-    file: std.fs.File,
+    file: fs.File,
     /// Snapshot header
     header: SnapshotHeader,
     /// Page table (sorted by page number for binary search)
@@ -1420,7 +1417,7 @@ pub fn initLazyLoader(
     path: []const u8,
     memory_base: usize,
 ) !LazyLoader {
-    var file = try std.fs.cwd().openFile(path, .{});
+    var file = try fs.cwd().openFile(path, .{});
     errdefer file.close();
 
     // Read and validate header
@@ -1524,12 +1521,12 @@ test "snapshot: save and load memory" {
     memory[page_size * 2 + 1] = 0xCC;
 
     // Save snapshot
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
-    const snap_path = try std.fs.path.join(allocator, &[_][]const u8{ tmp_path, "test.snap" });
+    const snap_path = try fs.path.join(allocator, &[_][]const u8{ tmp_path, "test.snap" });
     defer allocator.free(snap_path);
 
     try saveMemory(allocator, memory, snap_path);
@@ -1548,15 +1545,15 @@ test "snapshot: save and load memory" {
 }
 
 test "snapshot: streaming save and load state" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
-    const path = try std.fs.path.join(allocator, &[_][]const u8{ tmp_path, "snapshot_streaming.bin" });
+    const path = try fs.path.join(allocator, &[_][]const u8{ tmp_path, "snapshot_streaming.bin" });
     defer allocator.free(path);
 
     // Build memory with a couple non-zero pages.
@@ -1615,7 +1612,7 @@ test "snapshot: streaming save and load state" {
 
 test "snapshot: validate detects invalid magic" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     // Create invalid snapshot

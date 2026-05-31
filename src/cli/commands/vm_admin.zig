@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs = @import("../../util/fs.zig");
 const core = @import("../../core.zig");
 const state = core.state;
 const errors = core.errors;
@@ -48,7 +49,7 @@ pub fn runInspect(allocator: std.mem.Allocator, name: []const u8) !void {
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);
 
-    var cwd = std.fs.cwd();
+    var cwd = fs.cwd();
     var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
     defer vm_dir.close();
 
@@ -66,7 +67,7 @@ pub fn runInspect(allocator: std.mem.Allocator, name: []const u8) !void {
 pub fn runClone(allocator: std.mem.Allocator, name: []const u8, new_name: []const u8) !void {
     const src_dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(src_dir_path);
-    var cwd = std.fs.cwd();
+    var cwd = fs.cwd();
     var src_dir = cwd.openDir(src_dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
     defer src_dir.close();
 

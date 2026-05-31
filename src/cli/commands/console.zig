@@ -1,4 +1,6 @@
 const std = @import("std");
+const net = @import("../../util/net.zig");
+const fs = @import("../../util/fs.zig");
 const builtin = @import("builtin");
 const core = @import("../../core.zig");
 const errors = core.errors;
@@ -19,8 +21,8 @@ const RawTty = struct {
 
 fn enableRawStdin() ?RawTty {
     if (builtin.os.tag == .windows) return null;
-    const fd = std.fs.File.stdin().handle;
-    if (!std.posix.isatty(fd)) return null;
+    const fd = fs.File.stdin().handle;
+    if (!fs.isTty(fd)) return null;
     const prev = std.posix.tcgetattr(fd) catch return null;
     var raw = prev;
     raw.iflag.IGNBRK = false;
@@ -58,14 +60,14 @@ fn restoreRawStdin(raw: RawTty) void {
 fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        const written = try std.posix.write(fd, bytes[offset..]);
+        const written = try fs.writeFd(fd, bytes[offset..]);
         if (written == 0) return error.BrokenPipe;
         offset += written;
     }
 }
 
 pub fn runConsole(allocator: std.mem.Allocator, name: []const u8) !void {
-    var cwd = std.fs.cwd();
+    var cwd = fs.cwd();
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);
     var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
@@ -87,14 +89,14 @@ pub fn runConsole(allocator: std.mem.Allocator, name: []const u8) !void {
     const raw = enableRawStdin();
     defer if (raw) |tty_state| restoreRawStdin(tty_state);
 
-    var stream = std.net.connectUnixSocket(socket_path) catch |e| {
+    var stream = net.connectUnixSocket(socket_path) catch |e| {
         errors.die("console connect failed: {s}\ncheck that the VM is running and console.sock exists", .{@errorName(e)});
     };
     defer stream.close();
 
     const socket_fd = stream.handle;
-    const stdin_fd = std.fs.File.stdin().handle;
-    const stdout_fd = std.fs.File.stdout().handle;
+    const stdin_fd = fs.File.stdin().handle;
+    const stdout_fd = fs.File.stdout().handle;
     var buf: [1024]u8 = undefined;
     var detached = false;
     while (true) {
@@ -105,7 +107,7 @@ pub fn runConsole(allocator: std.mem.Allocator, name: []const u8) !void {
         const ready = std.posix.poll(fds[0..], -1) catch break;
         if (ready <= 0) continue;
         if ((fds[0].revents & std.posix.POLL.IN) != 0) {
-            const n = std.posix.read(stdin_fd, &buf) catch break;
+            const n = fs.readFd(stdin_fd, &buf) catch break;
             if (n <= 0) break;
             const chunk = buf[0..@intCast(n)];
             if (std.mem.indexOfScalar(u8, chunk, 0x04)) |eof_index| {
@@ -118,7 +120,7 @@ pub fn runConsole(allocator: std.mem.Allocator, name: []const u8) !void {
             writeAllFd(socket_fd, chunk) catch break;
         }
         if ((fds[1].revents & std.posix.POLL.IN) != 0) {
-            const n = std.posix.read(socket_fd, &buf) catch break;
+            const n = fs.readFd(socket_fd, &buf) catch break;
             if (n <= 0) break;
             writeAllFd(stdout_fd, buf[0..@intCast(n)]) catch break;
         }

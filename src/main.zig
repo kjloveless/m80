@@ -7,20 +7,22 @@ const log = @import("util/log.zig");
 
 const cli_dispatch = @import("cli/dispatch.zig");
 const cli_help = @import("cli/help.zig");
+const daemon_cmd = @import("cli/commands/daemon.zig");
 const lifecycle = @import("cli/commands/lifecycle.zig");
 const console_cmd = @import("cli/commands/console.zig");
 const snapshot_restore = @import("cli/commands/snapshot_restore.zig");
 const vm_admin = @import("cli/commands/vm_admin.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     log.initFromEnv(allocator);
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_arena = std.heap.ArenaAllocator.init(allocator);
+    defer args_arena.deinit();
+    const args = try init.minimal.args.toSlice(args_arena.allocator());
 
     const command = cli_dispatch.parseArgs(args) catch |e| switch (e) {
         error.MissingName => errors.die("missing <name>", .{}),
@@ -31,6 +33,7 @@ pub fn main() !void {
             errors.die("usage: m80 restore <name> <path>", .{});
         },
         error.MissingCloneName => errors.die("usage: m80 clone <name> <new-name>", .{}),
+        error.MissingDaemonCommand => errors.die("usage: m80 daemon <run|start|stop|status>", .{}),
         error.InvalidVmName => {
             if (args.len >= 3) {
                 errors.die("invalid vm name: {s}", .{args[2]});
@@ -49,11 +52,18 @@ pub fn main() !void {
             }
             errors.die("unknown command", .{});
         },
+        error.UnknownDaemonCommand => {
+            if (args.len >= 3) {
+                errors.die("unknown daemon command: {s}", .{args[2]});
+            }
+            errors.die("unknown daemon command", .{});
+        },
     };
 
     switch (command) {
         .help => cli_help.printHelp(),
         .ps => try vm_admin.runPs(allocator),
+        .daemon => |cmd| try daemon_cmd.run(allocator, cmd),
         .init => |name| try vm_admin.runInit(allocator, name),
         .delete => |name| try vm_admin.runDelete(allocator, name),
         .start => |name| try lifecycle.runStart(allocator, name),

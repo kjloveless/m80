@@ -22,6 +22,7 @@
 //! Example: `shared:/home/user/data:/mnt/data:ro:virtiofs`
 
 const std = @import("std");
+const fs = @import("../util/fs.zig");
 const path_util = @import("../util/path.zig");
 
 /// Access level for mounted filesystems
@@ -290,7 +291,7 @@ pub const MountManager = struct {
         if (relative_path.len == 0) {
             try self.validateMountPath(mount, mount.host_path);
         } else {
-            const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ mount.host_path, relative_path });
+            const full_path = try fs.path.join(self.allocator, &[_][]const u8{ mount.host_path, relative_path });
             defer self.allocator.free(full_path);
             try self.validateMountPath(mount, full_path);
         }
@@ -431,7 +432,7 @@ test "mounts: strict_validation rejects symlink escape" {
 
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root");
@@ -440,7 +441,7 @@ test "mounts: strict_validation rejects symlink escape" {
 
     const root_path = try tmp.dir.realpathAlloc(allocator, "root");
     defer allocator.free(root_path);
-    const host_path = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "link" });
+    const host_path = try fs.path.join(allocator, &[_][]const u8{ root_path, "link" });
     defer allocator.free(host_path);
 
     var manager = MountManager.init(allocator);
@@ -486,7 +487,7 @@ test "mounts: validateFileOperation rejects symlink escape" {
 
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root");
@@ -531,7 +532,7 @@ test "mounts: getMountByGuestPath finds entry" {
 test "mounts: MountManager basic operations" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root/data");
@@ -564,7 +565,7 @@ test "mounts: MountManager basic operations" {
 test "mounts: MountManager rejects paths outside allowed roots" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root");
@@ -591,7 +592,7 @@ test "mounts: MountManager rejects paths outside allowed roots" {
 test "mounts: MountManager rejects path traversal" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root");
@@ -600,7 +601,7 @@ test "mounts: MountManager rejects path traversal" {
     const root_path = try tmp.dir.realpathAlloc(allocator, "root");
     defer allocator.free(root_path);
 
-    const traversed_path = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "..", "outside" });
+    const traversed_path = try fs.path.join(allocator, &[_][]const u8{ root_path, "..", "outside" });
     defer allocator.free(traversed_path);
 
     var manager = MountManager.init(allocator);
@@ -619,7 +620,7 @@ test "mounts: MountManager rejects path traversal" {
 test "mounts: MountManager rejects duplicate tags" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root/data1");
@@ -654,7 +655,7 @@ test "mounts: MountManager rejects duplicate tags" {
 test "mounts: validateFileOperation write to read-only" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root/readonly");
@@ -699,7 +700,7 @@ test "mounts: FileOperation isWrite" {
 test "mounts: isPathAccessAllowed returns false for unknown path" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root/data");
@@ -710,7 +711,7 @@ test "mounts: isPathAccessAllowed returns false for unknown path" {
     const data_path = try tmp.dir.realpathAlloc(allocator, "root/data");
     defer allocator.free(data_path);
 
-    const unknown_path = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "other", "file.txt" });
+    const unknown_path = try fs.path.join(allocator, &[_][]const u8{ root_path, "other", "file.txt" });
     defer allocator.free(unknown_path);
 
     var manager = MountManager.init(allocator);
@@ -730,7 +731,7 @@ test "mounts: isPathAccessAllowed returns false for unknown path" {
 test "mounts: isPathAccessAllowed rejects write on read-only mount" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root/data");
@@ -739,7 +740,7 @@ test "mounts: isPathAccessAllowed rejects write on read-only mount" {
     defer allocator.free(root_path);
     const data_path = try tmp.dir.realpathAlloc(allocator, "root/data");
     defer allocator.free(data_path);
-    const file_path = try std.fs.path.join(allocator, &[_][]const u8{ data_path, "file.txt" });
+    const file_path = try fs.path.join(allocator, &[_][]const u8{ data_path, "file.txt" });
     defer allocator.free(file_path);
 
     var manager = MountManager.init(allocator);
@@ -764,7 +765,7 @@ test "mounts: isPathAccessAllowed rejects symlink escape" {
 
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("root");
@@ -783,7 +784,7 @@ test "mounts: isPathAccessAllowed rejects symlink escape" {
         .guest_path = "/mnt/data",
     });
 
-    const escaped = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "link", "secret.txt" });
+    const escaped = try fs.path.join(allocator, &[_][]const u8{ root_path, "link", "secret.txt" });
     defer allocator.free(escaped);
 
     try std.testing.expectError(

@@ -86,17 +86,76 @@ pub fn buildMountSpecString(allocator: std.mem.Allocator, cfg: config.VmConfig) 
     return result;
 }
 
+fn networkEnabled(cfg: config.VmConfig) bool {
+    return cfg.network_services.len > 0 or cfg.network_mode != .locked_down;
+}
+
+fn buildNetworkServicesSpecString(allocator: std.mem.Allocator, cfg: config.VmConfig) !?[]const u8 {
+    if (cfg.network_services.len == 0) return null;
+
+    var total_len: usize = "m80.network_services=".len;
+    for (cfg.network_services, 0..) |service, i| {
+        if (i > 0) total_len += 1;
+        total_len += service.toString().len;
+    }
+
+    var result = try allocator.alloc(u8, total_len);
+    var pos: usize = 0;
+
+    @memcpy(result[pos..][0.."m80.network_services=".len], "m80.network_services=");
+    pos += "m80.network_services=".len;
+
+    for (cfg.network_services, 0..) |service, i| {
+        if (i > 0) {
+            result[pos] = ',';
+            pos += 1;
+        }
+        const name = service.toString();
+        @memcpy(result[pos..][0..name.len], name);
+        pos += name.len;
+    }
+
+    return result;
+}
+
 pub fn buildCmdlineWithMounts(allocator: std.mem.Allocator, cfg: config.VmConfig, arch: std.Target.Cpu.Arch) ![]const u8 {
     const base_cmdline = if (cfg.kernel_cmdline) |value| value else defaultCmdlineForConfig(cfg, arch);
     const mount_spec = try buildMountSpecString(allocator, cfg);
+    const network_services_spec = try buildNetworkServicesSpecString(allocator, cfg);
+    const network_mode_spec = if (networkEnabled(cfg))
+        try std.fmt.allocPrint(allocator, "m80.network_mode={s}", .{cfg.network_mode.toString()})
+    else
+        null;
+    const guest_cid_spec = if (cfg.assigned_guest_cid) |cid|
+        try std.fmt.allocPrint(allocator, "m80.guest_cid={d}", .{cid})
+    else
+        null;
 
-    if (mount_spec == null) return try allocator.dupe(u8, base_cmdline);
+    defer if (mount_spec) |spec| allocator.free(spec);
+    defer if (network_services_spec) |spec| allocator.free(spec);
+    defer if (network_mode_spec) |spec| allocator.free(spec);
+    defer if (guest_cid_spec) |spec| allocator.free(spec);
 
-    const result = try allocator.alloc(u8, base_cmdline.len + 1 + mount_spec.?.len);
+    var extra_len: usize = 0;
+    if (mount_spec) |spec| extra_len += 1 + spec.len;
+    if (network_services_spec) |spec| extra_len += 1 + spec.len;
+    if (network_mode_spec) |spec| extra_len += 1 + spec.len;
+    if (guest_cid_spec) |spec| extra_len += 1 + spec.len;
+    if (extra_len == 0) return try allocator.dupe(u8, base_cmdline);
+
+    const result = try allocator.alloc(u8, base_cmdline.len + extra_len);
+    var pos: usize = 0;
     @memcpy(result[0..base_cmdline.len], base_cmdline);
-    result[base_cmdline.len] = ' ';
-    @memcpy(result[base_cmdline.len + 1 ..][0..mount_spec.?.len], mount_spec.?);
-    allocator.free(mount_spec.?);
+    pos = base_cmdline.len;
+
+    inline for (.{ mount_spec, network_services_spec, network_mode_spec, guest_cid_spec }) |maybe_spec| {
+        if (maybe_spec) |spec| {
+            result[pos] = ' ';
+            pos += 1;
+            @memcpy(result[pos..][0..spec.len], spec);
+            pos += spec.len;
+        }
+    }
     return result;
 }
 

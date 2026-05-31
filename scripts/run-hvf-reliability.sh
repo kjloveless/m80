@@ -8,6 +8,7 @@ cycles="${3:-${M80_TEST_HVF_RELIABILITY_CYCLES:-20}}"
 serial_expect="${4:-${M80_TEST_SERIAL_EXPECT:-m80 initramfs: boot ok}}"
 artifacts_dir="${ARTIFACTS_DIR:-${repo_root}/artifacts}"
 log_path="${artifacts_dir}/hvf-reliability.log"
+zig_bin="${ZIG:-zig}"
 
 if [[ ! -f "${kernel_path}" || ! -f "${initrd_path}" ]]; then
   echo "missing HVF reliability inputs: kernel=${kernel_path} initrd=${initrd_path}" >&2
@@ -26,7 +27,7 @@ M80_TEST_HVF_RELIABILITY_CYCLES="${cycles}" \
 M80_TEST_KERNEL="${kernel_path}" \
 M80_TEST_INITRD="${initrd_path}" \
 M80_TEST_SERIAL_EXPECT="${serial_expect}" \
-zig build test -- --test-filter "smoke: hvf arm64 repeated start-stop reliability" \
+"${zig_bin}" build test -- --test-filter "smoke: hvf arm64 repeated start-stop reliability" \
   2>&1 | tee -a "${log_path}"
 test_rc=${PIPESTATUS[0]}
 set -e

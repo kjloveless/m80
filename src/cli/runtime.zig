@@ -1,4 +1,6 @@
 const std = @import("std");
+const sync = @import("../util/sync.zig");
+const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const core = @import("../core.zig");
 
@@ -7,6 +9,7 @@ pub const snapshot_result_file = "snapshot.result";
 pub const restore_request_file = "restore.request";
 pub const restore_result_file = "restore.result";
 pub const stop_request_file = "stop.request";
+pub const guest_cid_file = "guest.cid";
 pub const vm_action_max_attempts: usize = 600;
 pub const vm_action_poll_ms: u64 = 200;
 pub const request_file_max_bytes: usize = 4096;
@@ -21,10 +24,10 @@ pub const VmActionWaitResult = union(enum) {
 pub fn vmConsoleSocketPath(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);
-    return try std.fs.path.join(allocator, &[_][]const u8{ dir_path, "console.sock" });
+    return try fs.path.join(allocator, &[_][]const u8{ dir_path, "console.sock" });
 }
 
-pub fn readVmPid(vm_dir: std.fs.Dir) ?i32 {
+pub fn readVmPid(vm_dir: fs.Dir) ?i32 {
     var file = vm_dir.openFile("pid", .{}) catch return null;
     defer file.close();
     var buf: [32]u8 = undefined;
@@ -34,7 +37,7 @@ pub fn readVmPid(vm_dir: std.fs.Dir) ?i32 {
     return std.fmt.parseInt(i32, trimmed, 10) catch null;
 }
 
-pub fn writeVmPid(vm_dir: std.fs.Dir, pid: i32) !void {
+pub fn writeVmPid(vm_dir: fs.Dir, pid: i32) !void {
     var file = try vm_dir.createFile("pid", .{ .truncate = true });
     defer file.close();
     var buf: [32]u8 = undefined;
@@ -42,15 +45,37 @@ pub fn writeVmPid(vm_dir: std.fs.Dir, pid: i32) !void {
     try file.writeAll(pid_str);
 }
 
-pub fn clearVmPid(vm_dir: std.fs.Dir) void {
+pub fn clearVmPid(vm_dir: fs.Dir) void {
     vm_dir.deleteFile("pid") catch {};
+}
+
+pub fn readGuestCid(vm_dir: fs.Dir) ?u32 {
+    var file = vm_dir.openFile(guest_cid_file, .{}) catch return null;
+    defer file.close();
+    var buf: [32]u8 = undefined;
+    const n = file.readAll(&buf) catch return null;
+    const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(u32, trimmed, 10) catch null;
+}
+
+pub fn writeGuestCid(vm_dir: fs.Dir, guest_cid: u32) !void {
+    var file = try vm_dir.createFile(guest_cid_file, .{ .truncate = true });
+    defer file.close();
+    var buf: [32]u8 = undefined;
+    const value = try std.fmt.bufPrint(&buf, "{d}\n", .{guest_cid});
+    try file.writeAll(value);
+}
+
+pub fn clearGuestCid(vm_dir: fs.Dir) void {
+    vm_dir.deleteFile(guest_cid_file) catch {};
 }
 
 pub fn waitForPidExit(pid: i32, sleep_ms: u64, max_attempts: usize) bool {
     var attempts: usize = 0;
     while (attempts < max_attempts) : (attempts += 1) {
         if (!isPidAlive(pid)) return true;
-        std.Thread.sleep(sleep_ms * std.time.ns_per_ms);
+        sync.sleep(sleep_ms * std.time.ns_per_ms);
     }
     return !isPidAlive(pid);
 }
@@ -58,20 +83,20 @@ pub fn waitForPidExit(pid: i32, sleep_ms: u64, max_attempts: usize) bool {
 pub fn isPidAlive(pid: i32) bool {
     if (builtin.os.tag == .windows) return false;
     if (pid <= 0) return false;
-    std.posix.kill(pid, 0) catch |e| switch (e) {
-        error.ProcessNotFound => return false,
-        else => return true,
+    return switch (std.posix.errno(std.posix.system.kill(pid, @enumFromInt(0)))) {
+        .SUCCESS => true,
+        .SRCH => false,
+        else => true,
     };
-    return true;
 }
 
-pub fn writeStopRequest(vm_dir: std.fs.Dir) !void {
+pub fn writeStopRequest(vm_dir: fs.Dir) !void {
     var req = try vm_dir.createFile(stop_request_file, .{ .truncate = true });
     defer req.close();
     try req.writeAll("1\n");
 }
 
-pub fn hasStopRequest(vm_dir: std.fs.Dir) !bool {
+pub fn hasStopRequest(vm_dir: fs.Dir) !bool {
     var file = vm_dir.openFile(stop_request_file, .{}) catch |e| switch (e) {
         error.FileNotFound => return false,
         else => return e,
@@ -82,7 +107,7 @@ pub fn hasStopRequest(vm_dir: std.fs.Dir) !bool {
 
 fn readOptionalTrimmedFile(
     allocator: std.mem.Allocator,
-    vm_dir: std.fs.Dir,
+    vm_dir: fs.Dir,
     file_name: []const u8,
     max_bytes: usize,
 ) !?[]u8 {
@@ -102,19 +127,19 @@ fn readOptionalTrimmedFile(
 
 pub fn readPathRequest(
     allocator: std.mem.Allocator,
-    vm_dir: std.fs.Dir,
+    vm_dir: fs.Dir,
     request_file: []const u8,
 ) !?[]u8 {
     return readOptionalTrimmedFile(allocator, vm_dir, request_file, request_file_max_bytes);
 }
 
-pub fn writePathRequest(vm_dir: std.fs.Dir, request_file: []const u8, path: []const u8) !void {
+pub fn writePathRequest(vm_dir: fs.Dir, request_file: []const u8, path: []const u8) !void {
     var req = try vm_dir.createFile(request_file, .{ .truncate = true });
     defer req.close();
     try req.writeAll(path);
 }
 
-pub fn writeResultFile(vm_dir: std.fs.Dir, result_file: []const u8, msg: []const u8) void {
+pub fn writeResultFile(vm_dir: fs.Dir, result_file: []const u8, msg: []const u8) void {
     var file = vm_dir.createFile(result_file, .{ .truncate = true }) catch return;
     defer file.close();
     _ = file.writeAll(msg) catch {};
@@ -122,7 +147,7 @@ pub fn writeResultFile(vm_dir: std.fs.Dir, result_file: []const u8, msg: []const
 
 pub fn waitForVmActionResult(
     allocator: std.mem.Allocator,
-    vm_dir: std.fs.Dir,
+    vm_dir: fs.Dir,
     result_file: []const u8,
 ) !VmActionWaitResult {
     var attempts: usize = 0;
@@ -136,13 +161,13 @@ pub fn waitForVmActionResult(
             }
             return .{ .failed = msg };
         }
-        std.Thread.sleep(vm_action_poll_ms * std.time.ns_per_ms);
+        sync.sleep(vm_action_poll_ms * std.time.ns_per_ms);
     }
     return .timeout;
 }
 
 test "cli runtime: stop request helpers round-trip" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try std.testing.expect(!(try hasStopRequest(tmp.dir)));

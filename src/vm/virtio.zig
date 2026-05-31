@@ -1,12 +1,14 @@
 //! Virtio device models shared by the m80 HVF backend.
 
 const std = @import("std");
+const net = @import("../util/net.zig");
+const sync = @import("../util/sync.zig");
+const fs = @import("../util/fs.zig");
 const config = @import("../core/config.zig");
-const dns = @import("../net/dns.zig");
-const net_policy = @import("../net/policy.zig");
 const virtio_fs = @import("../fs/virtio_fs.zig");
 const mounts = @import("../fs/mounts.zig");
 const log = @import("../util/log.zig");
+const env = @import("../util/env.zig");
 const serial = @import("serial.zig");
 const guest_mem = @import("guest_mem.zig");
 
@@ -83,9 +85,9 @@ pub const virtio_console_queue_max: u16 = 128;
 pub const virtio_rng_mmio_base: u64 = 0x0a003000;
 pub const virtio_rng_mmio_size: u64 = 0x1000;
 pub const virtio_rng_queue_max: u16 = 128;
-pub const virtio_net_mmio_base: u64 = 0x0a006000;
-pub const virtio_net_mmio_size: u64 = 0x1000;
-pub const virtio_net_queue_max: u16 = 256;
+pub const virtio_vsock_mmio_base: u64 = 0x0a006000;
+pub const virtio_vsock_mmio_size: u64 = 0x1000;
+pub const virtio_vsock_queue_max: u16 = 256;
 pub const virtio_fs_mmio_base: u64 = 0x0a005000;
 pub const virtio_fs_mmio_size: u64 = 0x1000;
 pub const virtio_fs_queue_max: u16 = 256;
@@ -101,17 +103,19 @@ pub fn virtioBlkIndexForAddr(addr: u64) ?usize {
     return null;
 }
 pub const VirtioConsoleInput = struct {
-    buf: std.ArrayListUnmanaged(u8) = .{},
-    mutex: std.Thread.Mutex = .{},
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    mutex: sync.Mutex = .{},
 };
 
 pub var virtio_console_input = VirtioConsoleInput{};
 pub var gic_virtio_blk_intid: [virtio_blk_device_count]?u32 = .{ null, null, null };
 pub var gic_virtio_console_intid: ?u32 = null;
 pub var gic_virtio_rng_intid: ?u32 = null;
+pub var gic_virtio_vsock_intid: ?u32 = null;
 pub var virtio_blk_irq_level: [virtio_blk_device_count]bool = .{ false, false, false };
 pub var virtio_console_irq_level = false;
 pub var virtio_rng_irq_level = false;
+pub var virtio_vsock_irq_level = false;
 pub var virtio_console_rx_logged = std.atomic.Value(bool).init(false);
 
 pub const VirtioBlkQueue = struct {
@@ -128,7 +132,7 @@ pub const VirtioBlkDevice = struct {
     enabled: bool = false,
     readonly: bool = false,
     capacity_sectors: u64 = 0,
-    file: ?std.fs.File = null,
+    file: ?fs.File = null,
     status: u32 = 0,
     status_last: u32 = 0,
     device_features_sel: u32 = 0,
@@ -191,7 +195,7 @@ pub const VirtioRngState = struct {
 
 pub var virtio_rng_state = VirtioRngState{};
 pub var virtio_rng_seen = std.atomic.Value(bool).init(false);
-pub const VirtioNetQueue = struct {
+pub const VirtioVsockQueue = struct {
     num: u16 = 0,
     ready: bool = false,
     desc_addr: u64 = 0,
@@ -201,7 +205,7 @@ pub const VirtioNetQueue = struct {
     used_idx: u16 = 0,
 };
 
-pub const VirtioNetState = struct {
+pub const VirtioVsockState = struct {
     enabled: bool = false,
     status: u32 = 0,
     status_last: u32 = 0,
@@ -210,97 +214,39 @@ pub const VirtioNetState = struct {
     driver_features: [2]u32 = .{ 0, 0 },
     interrupt_status: u32 = 0,
     queue_sel: u16 = 0,
-    queues: [2]VirtioNetQueue = .{ .{}, .{} },
-    mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
+    queues: [3]VirtioVsockQueue = .{ .{}, .{}, .{} },
+    guest_cid: u64 = 0,
+    bridge_socket_path: ?[]const u8 = null,
 };
 
-pub var virtio_net_state = VirtioNetState{};
-pub var virtio_net_seen = std.atomic.Value(bool).init(false);
-pub var gic_virtio_net_intid: ?u32 = null;
-pub var virtio_net_irq_level = false;
-var virtio_net_rx_mutex = std.Thread.Mutex{};
-
-/// Pending blocked-DNS responses waiting for RX buffers.
-const PendingBlockedDnsQueue = struct {
-    const max_pending = 16;
-    const max_frame_len = 1500;
-    frames: [max_pending][max_frame_len]u8 = undefined,
+pub var virtio_vsock_state = VirtioVsockState{};
+pub var virtio_vsock_seen = std.atomic.Value(bool).init(false);
+var virtio_vsock_rx_mutex = sync.Mutex{};
+var virtio_vsock_connection_mutex = sync.Mutex{};
+const virtio_vsock_max_connections: usize = 64;
+const VirtioVsockConnection = struct {
+    active: bool = false,
+    stream: ?net.Stream = null,
+    reader_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    guest_port: u32 = 0,
+    host_port: u32 = 0,
+    guest_buf_alloc: u32 = virtio_vsock_default_buf_alloc,
+    guest_fwd_cnt: u32 = 0,
+    device_fwd_cnt: u32 = 0,
+    tx_cnt: u32 = 0,
+};
+var virtio_vsock_connections: [virtio_vsock_max_connections]VirtioVsockConnection = [_]VirtioVsockConnection{.{}} ** virtio_vsock_max_connections;
+const PendingVsockPacketQueue = struct {
+    const max_pending = 64;
+    headers: [max_pending]VirtioVsockHdr = [_]VirtioVsockHdr{.{}} ** max_pending,
+    payloads: [max_pending][virtio_vsock_max_payload_len]u8 = undefined,
     lengths: [max_pending]usize = .{0} ** max_pending,
     head: usize = 0,
     tail: usize = 0,
     count: usize = 0,
 };
-var pending_blocked_dns_queue = PendingBlockedDnsQueue{};
-var pending_blocked_dns_mutex = std.Thread.Mutex{};
-
-fn resetPendingBlockedDnsQueue() void {
-    pending_blocked_dns_mutex.lock();
-    defer pending_blocked_dns_mutex.unlock();
-    pending_blocked_dns_queue = .{};
-}
-
-fn queuePendingBlockedDns(frame: []const u8) bool {
-    if (pending_blocked_dns_queue.count >= PendingBlockedDnsQueue.max_pending) return false;
-    if (frame.len > PendingBlockedDnsQueue.max_frame_len) return false;
-
-    const idx = pending_blocked_dns_queue.tail;
-    @memcpy(pending_blocked_dns_queue.frames[idx][0..frame.len], frame);
-    pending_blocked_dns_queue.lengths[idx] = frame.len;
-    pending_blocked_dns_queue.tail = (pending_blocked_dns_queue.tail + 1) % PendingBlockedDnsQueue.max_pending;
-    pending_blocked_dns_queue.count += 1;
-    return true;
-}
-
-fn drainPendingBlockedDns() void {
-    pending_blocked_dns_mutex.lock();
-    defer pending_blocked_dns_mutex.unlock();
-
-    while (pending_blocked_dns_queue.count > 0) {
-        const idx = pending_blocked_dns_queue.head;
-        const len = pending_blocked_dns_queue.lengths[idx];
-        const frame = pending_blocked_dns_queue.frames[idx][0..len];
-
-        virtioNetRxPacket(frame) catch |e| {
-            // Still no buffers, leave remaining in queue
-            if (e == error.NoBuffersAvailable) return;
-            log.warn("virtio-net pending blocked DNS response send failed: {s}", .{@errorName(e)});
-            // Remove failed frame and continue
-            pending_blocked_dns_queue.head = (pending_blocked_dns_queue.head + 1) % PendingBlockedDnsQueue.max_pending;
-            pending_blocked_dns_queue.count -= 1;
-            continue;
-        };
-
-        pending_blocked_dns_queue.head = (pending_blocked_dns_queue.head + 1) % PendingBlockedDnsQueue.max_pending;
-        pending_blocked_dns_queue.count -= 1;
-        log.info("virtio-net dns blocked response sent (queued)", .{});
-    }
-}
-
-/// Callback for transmitting a network frame to the host.
-/// Called when guest sends a packet via virtio-net TX queue.
-pub const NetTxCallback = *const fn (frame: []const u8) void;
-pub var net_tx_callback: ?NetTxCallback = null;
-
-pub fn setNetTxCallback(cb: ?NetTxCallback) void {
-    net_tx_callback = cb;
-}
-
-pub var net_policy_state: ?net_policy.NetworkPolicy = null;
-pub var net_policy_mutex = std.Thread.Mutex{};
-
-fn deinitNetworkPolicyStateLocked() void {
-    if (net_policy_state) |*policy| {
-        policy.deinit();
-    }
-    net_policy_state = null;
-}
-
-pub fn resetNetworkPolicyState() void {
-    net_policy_mutex.lock();
-    defer net_policy_mutex.unlock();
-    deinitNetworkPolicyStateLocked();
-}
-
+var pending_vsock_packets = PendingVsockPacketQueue{};
+var pending_vsock_mutex = sync.Mutex{};
 pub const virtio_fs_tag_len: usize = 36;
 const virtio_fs_queue_limit: usize = 8;
 
@@ -367,12 +313,12 @@ pub fn updateVirtioRngInterrupt() void {
     triggerInterrupt(intid, level);
 }
 
-pub fn updateVirtioNetInterrupt() void {
-    const intid = gic_virtio_net_intid orelse return;
-    const level = virtio_net_state.interrupt_status != 0;
-    if (level != virtio_net_irq_level) {
-        virtio_net_irq_level = level;
-        log.debug("hvf virtio-net irq level={s} intid={d}", .{ if (level) "high" else "low", intid });
+pub fn updateVirtioVsockInterrupt() void {
+    const intid = gic_virtio_vsock_intid orelse return;
+    const level = virtio_vsock_state.interrupt_status != 0;
+    if (level != virtio_vsock_irq_level) {
+        virtio_vsock_irq_level = level;
+        log.debug("hvf virtio-vsock irq level={s} intid={d}", .{ if (level) "high" else "low", intid });
     }
     triggerInterrupt(intid, level);
 }
@@ -389,9 +335,9 @@ pub fn updateVirtioFsInterrupt() void {
 pub const virtio_mmio_magic: u32 = 0x74726976; // "virt"
 pub const virtio_mmio_version: u32 = 2;
 pub const virtio_mmio_device_id_blk: u32 = 2;
-pub const virtio_mmio_device_id_net: u32 = 1;
 pub const virtio_mmio_device_id_console: u32 = 3;
 pub const virtio_mmio_device_id_rng: u32 = 4;
+pub const virtio_mmio_device_id_vsock: u32 = 19;
 pub const virtio_mmio_device_id_fs: u32 = 26;
 pub const virtio_mmio_vendor_id: u32 = 0x4d3830; // "M80"
 pub const virtio_mmio_int_vring: u32 = 1 << 0;
@@ -423,7 +369,7 @@ pub const virtio_mmio_reg_config: u64 = 0x100;
 
 pub const virtio_blk_f_ro: u32 = 1 << 5;
 pub const virtio_f_version_1: u32 = 1 << 0;
-pub const virtio_net_f_mac: u32 = 1 << 5;
+pub const virtio_vsock_f_stream: u32 = 1 << 0;
 
 pub const virtio_console_f_size: u32 = 1 << 0;
 pub const virtio_console_f_multiport: u32 = 1 << 1;
@@ -436,6 +382,25 @@ pub const virtio_blk_t_flush: u32 = 4;
 pub const virtio_blk_s_ok: u8 = 0;
 pub const virtio_blk_s_ioerr: u8 = 1;
 pub const virtio_blk_s_unsupported: u8 = 2;
+pub const virtio_vsock_host_cid: u64 = 2;
+pub const virtio_vsock_service_port: u32 = 19000;
+pub const virtio_vsock_type_stream: u16 = 1;
+pub const virtio_vsock_op_invalid: u16 = 0;
+pub const virtio_vsock_op_request: u16 = 1;
+pub const virtio_vsock_op_response: u16 = 2;
+pub const virtio_vsock_op_rst: u16 = 3;
+pub const virtio_vsock_op_shutdown: u16 = 4;
+pub const virtio_vsock_op_rw: u16 = 5;
+pub const virtio_vsock_op_credit_update: u16 = 6;
+pub const virtio_vsock_op_credit_request: u16 = 7;
+pub const virtio_vsock_shutdown_f_receive: u32 = 1 << 0;
+pub const virtio_vsock_shutdown_f_send: u32 = 1 << 1;
+pub const virtio_vsock_default_buf_alloc: u32 = 256 * 1024;
+pub const virtio_vsock_hdr_len: usize = 44;
+pub const virtio_vsock_max_payload_len: usize = 4096;
+// Linux posts 3776-byte virtio-vsock RX buffers; host payloads must leave room for the 44-byte header.
+pub const virtio_vsock_guest_rx_buffer_len: usize = 3776;
+pub const virtio_vsock_max_rx_payload_len: usize = virtio_vsock_guest_rx_buffer_len - virtio_vsock_hdr_len;
 
 pub const VirtqDesc = packed struct {
     addr: u64,
@@ -453,6 +418,49 @@ pub const VirtioBlkReq = packed struct {
     reserved: u32,
     sector: u64,
 };
+
+pub const VirtioVsockHdr = struct {
+    src_cid: u64 = 0,
+    dst_cid: u64 = 0,
+    src_port: u32 = 0,
+    dst_port: u32 = 0,
+    len: u32 = 0,
+    type: u16 = 0,
+    op: u16 = 0,
+    flags: u32 = 0,
+    buf_alloc: u32 = 0,
+    fwd_cnt: u32 = 0,
+};
+
+fn encodeVsockHdr(header: VirtioVsockHdr) [virtio_vsock_hdr_len]u8 {
+    var bytes: [virtio_vsock_hdr_len]u8 = undefined;
+    std.mem.writeInt(u64, bytes[0..8], header.src_cid, .little);
+    std.mem.writeInt(u64, bytes[8..16], header.dst_cid, .little);
+    std.mem.writeInt(u32, bytes[16..20], header.src_port, .little);
+    std.mem.writeInt(u32, bytes[20..24], header.dst_port, .little);
+    std.mem.writeInt(u32, bytes[24..28], header.len, .little);
+    std.mem.writeInt(u16, bytes[28..30], header.type, .little);
+    std.mem.writeInt(u16, bytes[30..32], header.op, .little);
+    std.mem.writeInt(u32, bytes[32..36], header.flags, .little);
+    std.mem.writeInt(u32, bytes[36..40], header.buf_alloc, .little);
+    std.mem.writeInt(u32, bytes[40..44], header.fwd_cnt, .little);
+    return bytes;
+}
+
+fn decodeVsockHdr(bytes: *const [virtio_vsock_hdr_len]u8) VirtioVsockHdr {
+    return .{
+        .src_cid = std.mem.readInt(u64, bytes[0..8], .little),
+        .dst_cid = std.mem.readInt(u64, bytes[8..16], .little),
+        .src_port = std.mem.readInt(u32, bytes[16..20], .little),
+        .dst_port = std.mem.readInt(u32, bytes[20..24], .little),
+        .len = std.mem.readInt(u32, bytes[24..28], .little),
+        .type = std.mem.readInt(u16, bytes[28..30], .little),
+        .op = std.mem.readInt(u16, bytes[30..32], .little),
+        .flags = std.mem.readInt(u32, bytes[32..36], .little),
+        .buf_alloc = std.mem.readInt(u32, bytes[36..40], .little),
+        .fwd_cnt = std.mem.readInt(u32, bytes[40..44], .little),
+    };
+}
 
 pub fn virtioBlkDeviceFeatures(device: *const VirtioBlkDevice, sel: u32) u32 {
     if (sel == 0) {
@@ -482,14 +490,12 @@ pub fn virtioRngDeviceFeatures(sel: u32) u32 {
     }
 }
 
-pub fn virtioNetDeviceFeatures(sel: u32) u32 {
-    if (sel == 0) {
-        return virtio_net_f_mac;
+pub fn virtioVsockDeviceFeatures(sel: u32) u32 {
+    switch (sel) {
+        0 => return virtio_vsock_f_stream,
+        1 => return virtio_f_version_1,
+        else => return 0,
     }
-    if (sel == 1) {
-        return virtio_f_version_1;
-    }
-    return 0;
 }
 
 pub fn virtioFsDeviceFeatures(sel: u32) u32 {
@@ -553,14 +559,16 @@ pub fn resetVirtioRngState() void {
     virtio_rng_irq_level = false;
 }
 
-pub fn resetVirtioNetState() void {
-    virtio_net_state = .{};
-    gic_virtio_net_intid = null;
-    virtio_net_irq_level = false;
-    virtio_net_seen.store(false, .seq_cst);
-    net_tx_callback = null;
-    resetPendingBlockedDnsQueue();
-    resetNetworkPolicyState();
+pub fn resetVirtioVsockState() void {
+    stopAllVirtioVsockConnections();
+    resetPendingVsockPackets();
+    if (virtio_vsock_state.bridge_socket_path) |path| {
+        std.heap.page_allocator.free(path);
+    }
+    virtio_vsock_state = .{};
+    gic_virtio_vsock_intid = null;
+    virtio_vsock_irq_level = false;
+    virtio_vsock_seen.store(false, .seq_cst);
 }
 
 pub fn resetVirtioFsState() void {
@@ -697,34 +705,37 @@ pub fn restoreVirtioRngState(snap: snapshot.VirtioRngSnapshotState) void {
     virtio_rng_state.queue = snapshotToQueueState(VirtioRngQueue, snap.queue);
 }
 
-/// Captures virtio-net state for snapshot
-pub fn captureVirtioNetState() ?snapshot.VirtioNetSnapshotState {
-    if (!virtio_net_state.enabled) return null;
+/// Captures virtio-vsock state for snapshot
+pub fn captureVirtioVsockState() ?snapshot.VirtioVsockSnapshotState {
+    if (!virtio_vsock_state.enabled) return null;
 
     return .{
-        .mac = virtio_net_state.mac,
-        .status = virtio_net_state.status,
-        .device_features_sel = virtio_net_state.device_features_sel,
-        .driver_features_sel = virtio_net_state.driver_features_sel,
-        .driver_features = virtio_net_state.driver_features,
-        .interrupt_status = virtio_net_state.interrupt_status,
-        .queue_sel = virtio_net_state.queue_sel,
-        .rx_queue = queueToSnapshotState(virtio_net_state.queues[0]),
-        .tx_queue = queueToSnapshotState(virtio_net_state.queues[1]),
+        .guest_cid = virtio_vsock_state.guest_cid,
+        .status = virtio_vsock_state.status,
+        .device_features_sel = virtio_vsock_state.device_features_sel,
+        .driver_features_sel = virtio_vsock_state.driver_features_sel,
+        .driver_features = virtio_vsock_state.driver_features,
+        .interrupt_status = virtio_vsock_state.interrupt_status,
+        .queue_sel = virtio_vsock_state.queue_sel,
+        .rx_queue = queueToSnapshotState(virtio_vsock_state.queues[0]),
+        .tx_queue = queueToSnapshotState(virtio_vsock_state.queues[1]),
+        .event_queue = queueToSnapshotState(virtio_vsock_state.queues[2]),
     };
 }
 
-/// Restores virtio-net state from snapshot
-pub fn restoreVirtioNetState(snap: snapshot.VirtioNetSnapshotState) void {
-    virtio_net_state.mac = snap.mac;
-    virtio_net_state.status = snap.status;
-    virtio_net_state.device_features_sel = snap.device_features_sel;
-    virtio_net_state.driver_features_sel = snap.driver_features_sel;
-    virtio_net_state.driver_features = snap.driver_features;
-    virtio_net_state.interrupt_status = snap.interrupt_status;
-    virtio_net_state.queue_sel = snap.queue_sel;
-    virtio_net_state.queues[0] = snapshotToQueueState(VirtioNetQueue, snap.rx_queue);
-    virtio_net_state.queues[1] = snapshotToQueueState(VirtioNetQueue, snap.tx_queue);
+/// Restores virtio-vsock state from snapshot
+pub fn restoreVirtioVsockState(snap: snapshot.VirtioVsockSnapshotState) void {
+    virtio_vsock_state.enabled = true;
+    virtio_vsock_state.guest_cid = snap.guest_cid;
+    virtio_vsock_state.status = snap.status;
+    virtio_vsock_state.device_features_sel = snap.device_features_sel;
+    virtio_vsock_state.driver_features_sel = snap.driver_features_sel;
+    virtio_vsock_state.driver_features = snap.driver_features;
+    virtio_vsock_state.interrupt_status = snap.interrupt_status;
+    virtio_vsock_state.queue_sel = snap.queue_sel;
+    virtio_vsock_state.queues[0] = snapshotToQueueState(VirtioVsockQueue, snap.rx_queue);
+    virtio_vsock_state.queues[1] = snapshotToQueueState(VirtioVsockQueue, snap.tx_queue);
+    virtio_vsock_state.queues[2] = snapshotToQueueState(VirtioVsockQueue, snap.event_queue);
 }
 
 /// Captures virtio-fs state for snapshot
@@ -814,15 +825,15 @@ pub fn collectDeviceStates(allocator: std.mem.Allocator) ![]snapshot.DeviceState
         });
     }
 
-    // VirtIO-net
-    if (captureVirtioNetState()) |state| {
-        const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioNetSnapshotState));
+    // VirtIO-vsock
+    if (captureVirtioVsockState()) |state| {
+        const data = try allocator.alloc(u8, @sizeOf(snapshot.VirtioVsockSnapshotState));
         @memcpy(data, std.mem.asBytes(&state));
         try entries.append(allocator, .{
             .header = .{
-                .device_type = .virtio_net,
+                .device_type = .virtio_vsock,
                 .device_index = 0,
-                .state_size = @sizeOf(snapshot.VirtioNetSnapshotState),
+                .state_size = @sizeOf(snapshot.VirtioVsockSnapshotState),
             },
             .data = data,
         });
@@ -867,15 +878,17 @@ pub fn setupVirtioRng(enabled: bool) void {
     log.info("hvf virtio-rng enabled", .{});
 }
 
-pub fn setupVirtioNet(enabled: bool, mac: [6]u8) void {
-    resetVirtioNetState();
+pub fn setupVirtioVsock(enabled: bool, guest_cid: u32, bridge_socket_path: ?[]const u8) !void {
+    resetVirtioVsockState();
     if (!enabled) return;
-    virtio_net_state.enabled = true;
-    virtio_net_state.mac = mac;
-    log.info(
-        "hvf virtio-net enabled mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}",
-        .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] },
-    );
+    virtio_vsock_state.enabled = true;
+    virtio_vsock_state.guest_cid = guest_cid;
+    if (bridge_socket_path) |path| {
+        virtio_vsock_state.bridge_socket_path = try std.heap.page_allocator.dupe(u8, path);
+        log.info("hvf virtio-vsock enabled guest_cid={d} session_socket={s}", .{ guest_cid, path });
+    } else {
+        log.info("hvf virtio-vsock enabled guest_cid={d}", .{guest_cid});
+    }
 }
 
 pub fn setupVirtioFs(allocator: std.mem.Allocator, cfg: config.VmConfig, dax: ?virtio_fs.DaxMapper) !void {
@@ -924,254 +937,6 @@ pub fn setupVirtioFs(allocator: std.mem.Allocator, cfg: config.VmConfig, dax: ?v
     log.info("hvf virtio-fs enabled tag={s}", .{mount_tag});
 }
 
-pub fn initNetworkPolicy(cfg: config.VmConfig) !void {
-    var policy = net_policy.NetworkPolicy.init(std.heap.page_allocator);
-    policy.mode = cfg.network_mode;
-    errdefer policy.deinit();
-
-    for (cfg.allowed_domains) |domain_spec| {
-        if (domain_spec.len == 0) continue;
-        const parsed = net_policy.parseDomainSpec(domain_spec) orelse {
-            log.err("hvf network allowlist invalid domain spec: {s}", .{domain_spec});
-            return error.InvalidNetworkConfig;
-        };
-        if (parsed.port_min == null and parsed.port_max == null) {
-            try policy.addDomainRule(parsed.domain);
-        } else {
-            try policy.addDomainRuleWithPorts(parsed.domain, parsed.port_min, parsed.port_max);
-        }
-    }
-    for (cfg.allowed_ips) |ip_str| {
-        if (ip_str.len == 0) continue;
-        const rule = net_policy.parseCidr(ip_str) orelse {
-            log.err("hvf network allowlist invalid IP/CIDR: {s}", .{ip_str});
-            return error.InvalidNetworkConfig;
-        };
-        try policy.addIpRule(rule.address, rule.prefix_len);
-    }
-    if (policy.mode == .allowlist and policy.allowed_domains.items.len == 0 and policy.allowed_ips.items.len == 0) {
-        log.warn("hvf network allowlist enabled with no rules; all outbound traffic will be blocked", .{});
-    }
-    net_policy_mutex.lock();
-    defer net_policy_mutex.unlock();
-    deinitNetworkPolicyStateLocked();
-    net_policy_state = policy;
-}
-
-pub const ether_type_ipv4: u16 = 0x0800;
-pub const ether_type_arp: u16 = 0x0806;
-pub const ip_proto_udp: u8 = 17;
-
-pub fn maybeCacheDnsResponse(frame: []const u8) void {
-    if (frame.len < 14) return;
-    const ethertype = std.mem.readInt(u16, frame[12..14], .big);
-    if (ethertype != ether_type_ipv4) return;
-    const ip_offset: usize = 14;
-    if (frame.len < ip_offset + 20) return;
-    const ihl = (frame[ip_offset] & 0x0F) * 4;
-    if (frame.len < ip_offset + ihl + 8) return;
-    const protocol = frame[ip_offset + 9];
-    if (protocol != ip_proto_udp) return;
-    const udp_offset = ip_offset + ihl;
-    const src_port = std.mem.readInt(u16, frame[udp_offset..][0..2], .big);
-    if (src_port != 53) return;
-    const payload_offset = udp_offset + 8;
-    if (payload_offset >= frame.len) return;
-    const payload = frame[payload_offset..];
-
-    net_policy_mutex.lock();
-    defer net_policy_mutex.unlock();
-    if (net_policy_state) |*policy| {
-        if (policy.mode != .allowlist) return;
-        var name_buf: [256]u8 = undefined;
-        const domain = dns.parseResponseDomain(payload, &name_buf) catch return;
-        const records = dns.parseResponse(std.heap.page_allocator, payload) catch return;
-        defer std.heap.page_allocator.free(records);
-        for (records) |record| {
-            policy.addResolvedIp(domain, record.ip, record.ttl) catch continue;
-        }
-    }
-}
-
-pub fn isDhcpPort(port: u16) bool {
-    return port == 67 or port == 68;
-}
-
-pub fn outboundFrameAllowed(frame: []const u8) bool {
-    net_policy_mutex.lock();
-    defer net_policy_mutex.unlock();
-    if (net_policy_state == null) return true;
-    const policy = &net_policy_state.?;
-    if (policy.mode == .open) return true;
-
-    if (frame.len < 14) return false;
-    const ethertype = std.mem.readInt(u16, frame[12..14], .big);
-    if (ethertype == ether_type_arp) return true;
-    if (ethertype != ether_type_ipv4) return false;
-
-    const ip_offset: usize = 14;
-    if (frame.len < ip_offset + 20) return false;
-    const ihl = (frame[ip_offset] & 0x0F) * 4;
-    if (frame.len < ip_offset + ihl + 8) return false;
-    const protocol = frame[ip_offset + 9];
-    const dst_ip: [4]u8 = frame[ip_offset + 16 .. ip_offset + 20].*;
-
-    if (protocol == ip_proto_udp) {
-        const udp_offset = ip_offset + ihl;
-        const src_port = std.mem.readInt(u16, frame[udp_offset..][0..2], .big);
-        const dst_port = std.mem.readInt(u16, frame[udp_offset + 2 ..][0..2], .big);
-        if (isDhcpPort(src_port) or isDhcpPort(dst_port)) return true;
-        if (dst_port == 53) {
-            const payload_offset = udp_offset + 8;
-            if (payload_offset >= frame.len) return false;
-            const payload = frame[payload_offset..];
-            var name_buf: [256]u8 = undefined;
-            const domain = dns.parseQueryDomain(payload, &name_buf) catch return false;
-            return policy.isDomainAllowedOnPort(domain, dst_port);
-        }
-        return policy.isIpAllowedOnPort(dst_ip, dst_port);
-    }
-
-    if (protocol == 6) { // TCP
-        const tcp_offset = ip_offset + ihl;
-        if (frame.len < tcp_offset + 4) return false;
-        const dst_port = std.mem.readInt(u16, frame[tcp_offset + 2 ..][0..2], .big);
-        return policy.isIpAllowedOnPort(dst_ip, dst_port);
-    }
-
-    return policy.isIpAllowed(dst_ip);
-}
-
-/// Check if frame is a blocked DNS query and send a synthetic NXDOMAIN response if so.
-/// Returns true when the original packet should be dropped.
-pub fn maybeSendDnsBlockedResponse(frame: []const u8) bool {
-    net_policy_mutex.lock();
-    defer net_policy_mutex.unlock();
-    if (net_policy_state == null) return false;
-    const policy = &net_policy_state.?;
-    if (policy.mode == .open) return false;
-
-    // Parse frame to check if it's a blocked DNS query
-    if (frame.len < 14) return false;
-    const ethertype = std.mem.readInt(u16, frame[12..14], .big);
-    if (ethertype != ether_type_ipv4) return false;
-
-    const ip_offset: usize = 14;
-    if (frame.len < ip_offset + 20) return false;
-    const ihl = (frame[ip_offset] & 0x0F) * 4;
-    if (frame.len < ip_offset + ihl + 8) return false;
-    const protocol = frame[ip_offset + 9];
-    if (protocol != ip_proto_udp) return false;
-
-    const udp_offset = ip_offset + ihl;
-    const dst_port = std.mem.readInt(u16, frame[udp_offset + 2 ..][0..2], .big);
-    if (dst_port != 53) return false;
-
-    const payload_offset = udp_offset + 8;
-    if (payload_offset >= frame.len) return false;
-    const payload = frame[payload_offset..];
-
-    // Check if domain is blocked
-    var name_buf: [256]u8 = undefined;
-    const domain = dns.parseQueryDomain(payload, &name_buf) catch return false;
-    if (policy.isDomainAllowedOnPort(domain, dst_port)) return false;
-
-    // Domain is blocked - return an immediate negative DNS answer.
-    const dst_ip: [4]u8 = frame[ip_offset + 16 ..][0..4].*;
-    log.info("virtio-net dns blocked: {s} (to {d}.{d}.{d}.{d})", .{ domain, dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3] });
-    sendDnsBlockedResponse(frame, ip_offset, ihl, udp_offset, payload_offset);
-    return true;
-}
-
-fn buildDnsBlockedResponse(
-    frame: []const u8,
-    ip_offset: usize,
-    ihl: u8,
-    udp_offset: usize,
-    payload_offset: usize,
-    response: *[PendingBlockedDnsQueue.max_frame_len]u8,
-) []const u8 {
-    const frame_len = @min(frame.len, response.len);
-    @memcpy(response[0..frame_len], frame[0..frame_len]);
-
-    // Swap Ethernet MAC addresses (dst <-> src)
-    const tmp_mac: [6]u8 = response[0..6].*;
-    @memcpy(response[0..6], response[6..12]);
-    @memcpy(response[6..12], &tmp_mac);
-
-    // Swap IP addresses (src <-> dst)
-    const tmp_ip: [4]u8 = response[ip_offset + 12 ..][0..4].*;
-    @memcpy(response[ip_offset + 12 ..][0..4], response[ip_offset + 16 ..][0..4]);
-    @memcpy(response[ip_offset + 16 ..][0..4], &tmp_ip);
-
-    // Recalculate IP header checksum
-    response[ip_offset + 10] = 0;
-    response[ip_offset + 11] = 0;
-    var ip_sum: u32 = 0;
-    var i: usize = 0;
-    while (i < ihl) : (i += 2) {
-        ip_sum += std.mem.readInt(u16, response[ip_offset + i ..][0..2], .big);
-    }
-    while (ip_sum > 0xFFFF) {
-        ip_sum = (ip_sum & 0xFFFF) + (ip_sum >> 16);
-    }
-    std.mem.writeInt(u16, response[ip_offset + 10 ..][0..2], @intCast(~@as(u16, @truncate(ip_sum))), .big);
-
-    // Swap UDP ports (src <-> dst)
-    const tmp_port: [2]u8 = response[udp_offset..][0..2].*;
-    @memcpy(response[udp_offset..][0..2], response[udp_offset + 2 ..][0..2]);
-    @memcpy(response[udp_offset + 2 ..][0..2], &tmp_port);
-
-    // Zero UDP checksum (optional for IPv4)
-    response[udp_offset + 6] = 0;
-    response[udp_offset + 7] = 0;
-
-    // Modify DNS header: set QR=1 (response) and RCODE=3 (NXDOMAIN).
-    // NXDOMAIN makes common resolvers fail the lookup immediately; REFUSED
-    // often triggers retries against every configured DNS server.
-    // DNS flags are at payload_offset + 2..4
-    // Original flags format: QR(1) OPCODE(4) AA(1) TC(1) RD(1) | RA(1) Z(3) RCODE(4)
-    const orig_flags = std.mem.readInt(u16, response[payload_offset + 2 ..][0..2], .big);
-    const opcode = (orig_flags >> 11) & 0xF;
-    const rd = (orig_flags >> 8) & 1;
-    // QR=1, OPCODE kept, AA=1, TC=0, RD kept, RA=1, Z=0, RCODE=3 (NXDOMAIN)
-    const new_flags: u16 = (1 << 15) | (opcode << 11) | (1 << 10) | (rd << 8) | (1 << 7) | 3;
-    std.mem.writeInt(u16, response[payload_offset + 2 ..][0..2], new_flags, .big);
-
-    // Keep the original question and make sure there are no answer/authority/additional records.
-    std.mem.writeInt(u16, response[payload_offset + 6 ..][0..2], 0, .big);
-    std.mem.writeInt(u16, response[payload_offset + 8 ..][0..2], 0, .big);
-    std.mem.writeInt(u16, response[payload_offset + 10 ..][0..2], 0, .big);
-
-    return response[0..frame_len];
-}
-
-fn queueDnsBlockedResponse(response: []const u8, reason: []const u8) void {
-    pending_blocked_dns_mutex.lock();
-    defer pending_blocked_dns_mutex.unlock();
-    if (queuePendingBlockedDns(response)) {
-        log.info("virtio-net dns blocked response queued ({s})", .{reason});
-    } else {
-        log.warn("virtio-net dns blocked response dropped (queue full)", .{});
-    }
-}
-
-fn sendDnsBlockedResponse(frame: []const u8, ip_offset: usize, ihl: u8, udp_offset: usize, payload_offset: usize) void {
-    var response_buf: [PendingBlockedDnsQueue.max_frame_len]u8 = undefined;
-    const response = buildDnsBlockedResponse(frame, ip_offset, ihl, udp_offset, payload_offset, &response_buf);
-
-    // Send response back to guest
-    virtioNetRxPacket(response) catch |e| {
-        switch (e) {
-            error.NoBuffersAvailable => queueDnsBlockedResponse(response, "no buffers"),
-            error.QueueNotReady => queueDnsBlockedResponse(response, "queue not ready"),
-            else => log.warn("virtio-net dns blocked response send failed: {s}", .{@errorName(e)}),
-        }
-        return;
-    };
-    log.info("virtio-net dns blocked response sent", .{});
-}
-
 pub fn virtioConsoleInputLen() usize {
     virtio_console_input.mutex.lock();
     defer virtio_console_input.mutex.unlock();
@@ -1205,9 +970,9 @@ pub fn takeVirtioConsoleInput(dst: []u8) usize {
 }
 
 pub fn setVirtioConsoleInputFromEnv(allocator: std.mem.Allocator) void {
-    const env = std.process.getEnvVarOwned(allocator, "M80_SERIAL_IN") catch return;
-    defer allocator.free(env);
-    appendVirtioConsoleInput(env);
+    const value = env.getVarOwned(allocator, "M80_SERIAL_IN") catch return;
+    defer allocator.free(value);
+    appendVirtioConsoleInput(value);
 }
 
 pub fn setupVirtioBlk(cfg: config.VmConfig) !void {
@@ -1227,9 +992,9 @@ pub fn setupVirtioBlkDevice(index: usize, path: []const u8, readonly: bool) !voi
     if (index >= virtio_blk_devices.len) return error.InvalidGuestLayout;
 
     const file = if (readonly)
-        try std.fs.cwd().openFile(path, .{ .mode = .read_only })
+        try fs.cwd().openFile(path, .{ .mode = .read_only })
     else
-        try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+        try fs.cwd().openFile(path, .{ .mode = .read_write });
     errdefer file.close();
 
     const stat = try file.stat();
@@ -1616,30 +1381,297 @@ pub fn processVirtioConsoleQueue(queue_index: u16) !void {
     updateVirtioConsoleInterrupt();
 }
 
-// Linux virtio-net driver uses 12-byte header (virtio_net_hdr_mrg_rxbuf)
-// even when VIRTIO_NET_F_MRG_RXBUF is not negotiated
-pub const virtio_net_hdr_len: usize = 12;
+fn resetPendingVsockPackets() void {
+    pending_vsock_mutex.lock();
+    defer pending_vsock_mutex.unlock();
+    pending_vsock_packets = .{};
+}
 
-pub fn virtioNetRxPacket(frame: []const u8) !void {
-    virtio_net_rx_mutex.lock();
-    defer virtio_net_rx_mutex.unlock();
+fn queuePendingVsockPacket(header: VirtioVsockHdr, payload: []const u8) bool {
+    if (payload.len > virtio_vsock_max_payload_len) return false;
+    pending_vsock_mutex.lock();
+    defer pending_vsock_mutex.unlock();
+    if (pending_vsock_packets.count >= PendingVsockPacketQueue.max_pending) return false;
 
-    if (!virtio_net_state.enabled) {
-        log.debug("hvf virtio-net rx: not enabled", .{});
-        return error.NotEnabled;
+    const idx = pending_vsock_packets.tail;
+    pending_vsock_packets.headers[idx] = header;
+    pending_vsock_packets.lengths[idx] = payload.len;
+    if (payload.len > 0) {
+        @memcpy(pending_vsock_packets.payloads[idx][0..payload.len], payload);
     }
-    const queue = &virtio_net_state.queues[0];
-    if (!queue.ready or queue.num == 0) {
-        log.debug("hvf virtio-net rx: queue not ready ready={} num={d}", .{ queue.ready, queue.num });
-        return error.QueueNotReady;
+    pending_vsock_packets.tail = (pending_vsock_packets.tail + 1) % PendingVsockPacketQueue.max_pending;
+    pending_vsock_packets.count += 1;
+    return true;
+}
+
+fn resetVirtioVsockConnectionSlotLocked(index: usize) void {
+    virtio_vsock_connections[index].active = false;
+    virtio_vsock_connections[index].stream = null;
+    virtio_vsock_connections[index].reader_running.store(false, .seq_cst);
+    virtio_vsock_connections[index].guest_port = 0;
+    virtio_vsock_connections[index].host_port = 0;
+    virtio_vsock_connections[index].guest_buf_alloc = virtio_vsock_default_buf_alloc;
+    virtio_vsock_connections[index].guest_fwd_cnt = 0;
+    virtio_vsock_connections[index].device_fwd_cnt = 0;
+    virtio_vsock_connections[index].tx_cnt = 0;
+}
+
+fn findVirtioVsockConnectionLocked(guest_port: u32, host_port: u32) ?usize {
+    for (&virtio_vsock_connections, 0..) |*conn, index| {
+        if (conn.active and conn.guest_port == guest_port and conn.host_port == host_port) {
+            return index;
+        }
     }
-    log.debug("hvf virtio-net rx: frame len={d}", .{frame.len});
+    return null;
+}
+
+fn findFreeVirtioVsockConnectionLocked() ?usize {
+    for (&virtio_vsock_connections, 0..) |*conn, index| {
+        if (!conn.active) return index;
+    }
+    return null;
+}
+
+fn vsockPeerFreeSpaceLocked(conn: *const VirtioVsockConnection) u32 {
+    const in_flight = conn.tx_cnt -% conn.guest_fwd_cnt;
+    if (in_flight >= conn.guest_buf_alloc) return 0;
+    return conn.guest_buf_alloc - in_flight;
+}
+
+fn applyVsockCreditLocked(header: *VirtioVsockHdr) void {
+    header.buf_alloc = virtio_vsock_default_buf_alloc;
+    header.fwd_cnt = 0;
+    if (findVirtioVsockConnectionLocked(header.dst_port, header.src_port)) |index| {
+        header.fwd_cnt = virtio_vsock_connections[index].device_fwd_cnt;
+    }
+}
+
+const VsockPacketCreditState = enum { send, wait, drop };
+
+fn vsockPacketCreditStateLocked(header: VirtioVsockHdr, payload_len: usize) VsockPacketCreditState {
+    if (header.op != virtio_vsock_op_rw or payload_len == 0) return .send;
+    const index = findVirtioVsockConnectionLocked(header.dst_port, header.src_port) orelse return .drop;
+    return if (vsockPeerFreeSpaceLocked(&virtio_vsock_connections[index]) >= payload_len) .send else .wait;
+}
+
+fn recordVsockTxDelivered(header: VirtioVsockHdr, payload_len: usize) void {
+    if (header.op != virtio_vsock_op_rw or payload_len == 0) return;
+    virtio_vsock_connection_mutex.lock();
+    if (findVirtioVsockConnectionLocked(header.dst_port, header.src_port)) |index| {
+        virtio_vsock_connections[index].tx_cnt +%= @as(u32, @intCast(payload_len));
+    }
+    virtio_vsock_connection_mutex.unlock();
+}
+
+fn updateVsockGuestCreditLocked(header: VirtioVsockHdr) void {
+    if (findVirtioVsockConnectionLocked(header.src_port, header.dst_port)) |index| {
+        virtio_vsock_connections[index].guest_buf_alloc = header.buf_alloc;
+        virtio_vsock_connections[index].guest_fwd_cnt = header.fwd_cnt;
+    }
+}
+
+fn stopVirtioVsockConnectionIndex(index: usize) void {
+    var maybe_stream: ?net.Stream = null;
+
+    virtio_vsock_connection_mutex.lock();
+    if (index < virtio_vsock_connections.len and virtio_vsock_connections[index].active) {
+        virtio_vsock_connections[index].reader_running.store(false, .seq_cst);
+        maybe_stream = virtio_vsock_connections[index].stream;
+        resetVirtioVsockConnectionSlotLocked(index);
+    }
+    virtio_vsock_connection_mutex.unlock();
+
+    if (maybe_stream) |stream| {
+        stream.close();
+    }
+}
+
+fn stopVirtioVsockConnectionByPorts(guest_port: u32, host_port: u32) void {
+    var maybe_stream: ?net.Stream = null;
+
+    virtio_vsock_connection_mutex.lock();
+    if (findVirtioVsockConnectionLocked(guest_port, host_port)) |index| {
+        virtio_vsock_connections[index].reader_running.store(false, .seq_cst);
+        maybe_stream = virtio_vsock_connections[index].stream;
+        resetVirtioVsockConnectionSlotLocked(index);
+    }
+    virtio_vsock_connection_mutex.unlock();
+
+    if (maybe_stream) |stream| {
+        stream.close();
+    }
+}
+
+fn stopAllVirtioVsockConnections() void {
+    var streams: [virtio_vsock_max_connections]?net.Stream = [_]?net.Stream{null} ** virtio_vsock_max_connections;
+
+    virtio_vsock_connection_mutex.lock();
+    for (&virtio_vsock_connections, 0..) |*conn, index| {
+        if (conn.active) {
+            conn.reader_running.store(false, .seq_cst);
+            streams[index] = conn.stream;
+        }
+        resetVirtioVsockConnectionSlotLocked(index);
+    }
+    virtio_vsock_connection_mutex.unlock();
+
+    for (streams) |maybe_stream| {
+        if (maybe_stream) |stream| stream.close();
+    }
+}
+
+fn activeVirtioVsockConnectionCount() usize {
+    var count: usize = 0;
+    virtio_vsock_connection_mutex.lock();
+    defer virtio_vsock_connection_mutex.unlock();
+    for (&virtio_vsock_connections) |*conn| {
+        if (conn.active) count += 1;
+    }
+    return count;
+}
+
+fn buildVsockDeviceHeaderLocked(index: usize, op: u16, len: u32, flags: u32) VirtioVsockHdr {
+    const conn = &virtio_vsock_connections[index];
+    return VirtioVsockHdr{
+        .src_cid = virtio_vsock_host_cid,
+        .dst_cid = virtio_vsock_state.guest_cid,
+        .src_port = conn.host_port,
+        .dst_port = conn.guest_port,
+        .len = len,
+        .type = virtio_vsock_type_stream,
+        .op = op,
+        .flags = flags,
+        .buf_alloc = virtio_vsock_default_buf_alloc,
+        .fwd_cnt = conn.device_fwd_cnt,
+    };
+}
+
+fn buildVsockDeviceHeader(index: usize, op: u16, len: u32, flags: u32) ?VirtioVsockHdr {
+    var header: ?VirtioVsockHdr = null;
+    virtio_vsock_connection_mutex.lock();
+    if (index < virtio_vsock_connections.len and virtio_vsock_connections[index].active) {
+        header = buildVsockDeviceHeaderLocked(index, op, len, flags);
+    }
+    virtio_vsock_connection_mutex.unlock();
+    return header;
+}
+
+fn activeVirtioVsockConnectionHeader(index: usize, op: u16, len: u32, flags: u32) ?VirtioVsockHdr {
+    var header: ?VirtioVsockHdr = null;
+    virtio_vsock_connection_mutex.lock();
+    if (index < virtio_vsock_connections.len and
+        virtio_vsock_connections[index].active and
+        virtio_vsock_connections[index].reader_running.load(.seq_cst))
+    {
+        header = buildVsockDeviceHeaderLocked(index, op, len, flags);
+    }
+    virtio_vsock_connection_mutex.unlock();
+    return header;
+}
+
+fn buildVsockReplyHeader(request: VirtioVsockHdr, op: u16, len: u32, flags: u32) VirtioVsockHdr {
+    var header = VirtioVsockHdr{
+        .src_cid = virtio_vsock_host_cid,
+        .dst_cid = request.src_cid,
+        .src_port = request.dst_port,
+        .dst_port = request.src_port,
+        .len = len,
+        .type = request.type,
+        .op = op,
+        .flags = flags,
+        .buf_alloc = virtio_vsock_default_buf_alloc,
+        .fwd_cnt = 0,
+    };
+    virtio_vsock_connection_mutex.lock();
+    defer virtio_vsock_connection_mutex.unlock();
+    applyVsockCreditLocked(&header);
+    return header;
+}
+
+fn virtioVsockHostReadLoop(index: usize) void {
+    var buf: [virtio_vsock_max_rx_payload_len]u8 = undefined;
+
+    while (true) {
+        var fd: std.posix.fd_t = -1;
+        var request: ?VirtioVsockHdr = null;
+
+        virtio_vsock_connection_mutex.lock();
+        if (index < virtio_vsock_connections.len) {
+            const conn = &virtio_vsock_connections[index];
+            if (conn.active and conn.reader_running.load(.seq_cst)) {
+                if (conn.stream) |stream| {
+                    fd = stream.handle;
+                    request = buildVsockDeviceHeaderLocked(index, virtio_vsock_op_rw, 0, 0);
+                }
+            }
+        }
+        virtio_vsock_connection_mutex.unlock();
+        if (fd < 0 or request == null) break;
+
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(fds[0..], 100) catch break;
+        if (ready == 0) continue;
+        if ((fds[0].revents & std.posix.POLL.IN) == 0) break;
+
+        const n = fs.readFd(fd, &buf) catch |e| switch (e) {
+            error.WouldBlock => continue,
+            else => break,
+        };
+        if (n <= 0) break;
+
+        var header = request.?;
+        header.len = @intCast(n);
+        sendOrQueueVsockPacket(header, buf[0..n]);
+    }
+
+    if (activeVirtioVsockConnectionHeader(index, virtio_vsock_op_rst, 0, 0)) |header| {
+        sendOrQueueVsockPacket(header, "");
+    }
+    stopVirtioVsockConnectionIndex(index);
+}
+
+fn startVirtioVsockBridge(guest_port: u32, host_port: u32) !void {
+    const bridge_path = virtio_vsock_state.bridge_socket_path orelse return error.NotConfigured;
+    const stream = try net.connectUnixSocket(bridge_path);
+    errdefer stream.close();
+
+    virtio_vsock_connection_mutex.lock();
+    if (findVirtioVsockConnectionLocked(guest_port, host_port) != null) {
+        virtio_vsock_connection_mutex.unlock();
+        return error.AlreadyConnected;
+    }
+    const index = findFreeVirtioVsockConnectionLocked() orelse {
+        virtio_vsock_connection_mutex.unlock();
+        return error.ConnectionLimit;
+    };
+    virtio_vsock_connections[index].active = true;
+    virtio_vsock_connections[index].stream = stream;
+    virtio_vsock_connections[index].reader_running.store(true, .seq_cst);
+    virtio_vsock_connections[index].guest_port = guest_port;
+    virtio_vsock_connections[index].host_port = host_port;
+    virtio_vsock_connections[index].guest_buf_alloc = virtio_vsock_default_buf_alloc;
+    virtio_vsock_connections[index].guest_fwd_cnt = 0;
+    virtio_vsock_connections[index].device_fwd_cnt = 0;
+    virtio_vsock_connections[index].tx_cnt = 0;
+    virtio_vsock_connection_mutex.unlock();
+
+    const thread = std.Thread.spawn(.{}, virtioVsockHostReadLoop, .{index}) catch |e| {
+        stopVirtioVsockConnectionIndex(index);
+        return e;
+    };
+    thread.detach();
+}
+
+fn virtioVsockRxPacket(header: VirtioVsockHdr, payload: []const u8) !void {
+    virtio_vsock_rx_mutex.lock();
+    defer virtio_vsock_rx_mutex.unlock();
+
+    if (!virtio_vsock_state.enabled) return error.NotEnabled;
+    const queue = &virtio_vsock_state.queues[0];
+    if (!queue.ready or queue.num == 0) return error.QueueNotReady;
 
     const avail_idx = try readGuestU16(queue.avail_addr + 2);
-    if (queue.last_avail_idx == avail_idx) {
-        log.debug("hvf virtio-net rx: no buffers available last={d} avail={d}", .{ queue.last_avail_idx, avail_idx });
-        return error.NoBuffersAvailable;
-    }
+    if (queue.last_avail_idx == avail_idx) return error.NoBuffersAvailable;
 
     const ring_index = queue.last_avail_idx % queue.num;
     const head = try readGuestU16(queue.avail_addr + 4 + @as(u64, ring_index) * 2);
@@ -1647,9 +1679,9 @@ pub fn virtioNetRxPacket(frame: []const u8) !void {
     var desc_seen: u16 = 0;
     var total_written: u32 = 0;
     var header_offset: usize = 0;
-    var frame_offset: usize = 0;
-    var header: [virtio_net_hdr_len]u8 = undefined;
-    @memset(&header, 0);
+    var payload_offset: usize = 0;
+    var total_capacity: usize = 0;
+    const header_bytes = encodeVsockHdr(header);
 
     while (true) {
         if (desc_seen > queue.num) return error.InvalidGuestLayout;
@@ -1658,32 +1690,36 @@ pub fn virtioNetRxPacket(frame: []const u8) !void {
         if (desc.flags & virtq_desc_flag_indirect != 0) return error.NotSupported;
         if ((desc.flags & virtq_desc_flag_write) == 0) return error.InvalidGuestLayout;
 
+        total_capacity += desc.len;
         var remaining: u64 = desc.len;
         var offset: u64 = 0;
-        while (remaining > 0 and header_offset < header.len) {
-            const chunk: usize = @intCast(@min(@as(u64, header.len - header_offset), remaining));
-            try writeGuestBytes(desc.addr + offset, header[header_offset .. header_offset + chunk]);
+        while (remaining > 0 and header_offset < header_bytes.len) {
+            const chunk: usize = @intCast(@min(@as(u64, header_bytes.len - header_offset), remaining));
+            try writeGuestBytes(desc.addr + offset, header_bytes[header_offset .. header_offset + chunk]);
             header_offset += chunk;
             remaining -= @as(u64, chunk);
             offset += @as(u64, chunk);
             total_written += @intCast(chunk);
         }
-        while (remaining > 0 and frame_offset < frame.len) {
-            const chunk: usize = @intCast(@min(@as(u64, frame.len - frame_offset), remaining));
-            try writeGuestBytes(desc.addr + offset, frame[frame_offset .. frame_offset + chunk]);
-            frame_offset += chunk;
+        while (remaining > 0 and payload_offset < payload.len) {
+            const chunk: usize = @intCast(@min(@as(u64, payload.len - payload_offset), remaining));
+            try writeGuestBytes(desc.addr + offset, payload[payload_offset .. payload_offset + chunk]);
+            payload_offset += chunk;
             remaining -= @as(u64, chunk);
             offset += @as(u64, chunk);
             total_written += @intCast(chunk);
         }
 
         desc_seen += 1;
-        if (header_offset >= header.len and frame_offset >= frame.len) break;
+        if (header_offset >= header_bytes.len and payload_offset >= payload.len) break;
         if (desc.flags & virtq_desc_flag_next == 0) break;
         desc_index = desc.next;
     }
 
-    if (header_offset < header.len or frame_offset < frame.len) return error.OutOfMemory;
+    if (header_offset < header_bytes.len or payload_offset < payload.len) {
+        log.warn("virtio-vsock rx packet too large op={d} payload={d} capacity={d} header_written={d}/{d} payload_written={d}/{d}", .{ header.op, payload.len, total_capacity, header_offset, header_bytes.len, payload_offset, payload.len });
+        return error.OutOfMemory;
+    }
 
     const used_slot = queue.used_idx % queue.num;
     try writeGuestU32(queue.used_addr + 4 + @as(u64, used_slot) * 8, head);
@@ -1692,94 +1728,422 @@ pub fn virtioNetRxPacket(frame: []const u8) !void {
     try writeGuestU16(queue.used_addr + 2, queue.used_idx);
     queue.last_avail_idx +%= 1;
 
-    virtio_net_state.interrupt_status |= virtio_mmio_int_vring;
-    updateVirtioNetInterrupt();
+    virtio_vsock_state.interrupt_status |= virtio_mmio_int_vring;
+    updateVirtioVsockInterrupt();
 }
 
-pub fn processVirtioNetTxQueue() !void {
-    if (!virtio_net_state.enabled) {
-        log.debug("hvf virtio-net tx queue: not enabled", .{});
+fn sendOrQueueVsockPacket(header_in: VirtioVsockHdr, payload: []const u8) void {
+    var header = header_in;
+    virtio_vsock_connection_mutex.lock();
+    applyVsockCreditLocked(&header);
+    const credit_state = vsockPacketCreditStateLocked(header, payload.len);
+    virtio_vsock_connection_mutex.unlock();
+
+    switch (credit_state) {
+        .send => {},
+        .wait => {
+            _ = queuePendingVsockPacket(header, payload);
+            return;
+        },
+        .drop => return,
+    }
+
+    virtioVsockRxPacket(header, payload) catch |e| {
+        switch (e) {
+            error.NoBuffersAvailable, error.QueueNotReady => {
+                _ = queuePendingVsockPacket(header, payload);
+            },
+            else => log.warn("virtio-vsock packet delivery failed: {s}", .{@errorName(e)}),
+        }
+        return;
+    };
+
+    recordVsockTxDelivered(header, payload.len);
+}
+
+fn drainPendingVsockPackets() void {
+    while (true) {
+        var header: VirtioVsockHdr = .{};
+        var payload_len: usize = 0;
+        var payload_buf: [virtio_vsock_max_payload_len]u8 = undefined;
+
+        pending_vsock_mutex.lock();
+        if (pending_vsock_packets.count == 0) {
+            pending_vsock_mutex.unlock();
+            return;
+        }
+        const idx = pending_vsock_packets.head;
+        header = pending_vsock_packets.headers[idx];
+        payload_len = pending_vsock_packets.lengths[idx];
+        if (payload_len > 0) {
+            @memcpy(payload_buf[0..payload_len], pending_vsock_packets.payloads[idx][0..payload_len]);
+        }
+        pending_vsock_mutex.unlock();
+
+        virtio_vsock_connection_mutex.lock();
+        const credit_state = vsockPacketCreditStateLocked(header, payload_len);
+        virtio_vsock_connection_mutex.unlock();
+        switch (credit_state) {
+            .send => {},
+            .wait => return,
+            .drop => {
+                pending_vsock_mutex.lock();
+                pending_vsock_packets.head = (pending_vsock_packets.head + 1) % PendingVsockPacketQueue.max_pending;
+                pending_vsock_packets.count -= 1;
+                pending_vsock_mutex.unlock();
+                continue;
+            },
+        }
+
+        virtioVsockRxPacket(header, payload_buf[0..payload_len]) catch |e| switch (e) {
+            error.NoBuffersAvailable, error.QueueNotReady => return,
+            else => {
+                pending_vsock_mutex.lock();
+                pending_vsock_packets.head = (pending_vsock_packets.head + 1) % PendingVsockPacketQueue.max_pending;
+                pending_vsock_packets.count -= 1;
+                pending_vsock_mutex.unlock();
+                continue;
+            },
+        };
+
+        recordVsockTxDelivered(header, payload_len);
+
+        pending_vsock_mutex.lock();
+        pending_vsock_packets.head = (pending_vsock_packets.head + 1) % PendingVsockPacketQueue.max_pending;
+        pending_vsock_packets.count -= 1;
+        pending_vsock_mutex.unlock();
+    }
+}
+
+fn readVsockPacketFromGuest(queue: *VirtioVsockQueue, head: u16, header_out: *VirtioVsockHdr, payload_buf: []u8) !u32 {
+    if (head >= queue.num) {
+        log.warn("virtio-vsock tx invalid head={d} queue_num={d}", .{ head, queue.num });
+        return error.InvalidGuestLayout;
+    }
+
+    var header_bytes: [virtio_vsock_hdr_len]u8 = undefined;
+    var header_offset: usize = 0;
+    var payload_offset: usize = 0;
+    var total_len: u32 = 0;
+    var desc_index = head;
+    var desc_seen: u16 = 0;
+    var payload_len: ?usize = null;
+
+    while (true) {
+        if (desc_seen > queue.num) return error.InvalidGuestLayout;
+        const desc_addr = queue.desc_addr + @as(u64, desc_index) * @sizeOf(VirtqDesc);
+        const desc = try readVirtqDesc(desc_addr);
+        if (desc.flags & virtq_desc_flag_indirect != 0) {
+            log.warn("virtio-vsock tx indirect descriptors not supported head={d}", .{head});
+            return error.NotSupported;
+        }
+        if ((desc.flags & virtq_desc_flag_write) != 0) {
+            log.warn("virtio-vsock tx unexpected writable descriptor head={d} desc_index={d} flags=0x{x}", .{ head, desc_index, desc.flags });
+            return error.InvalidGuestLayout;
+        }
+
+        var remaining: u64 = desc.len;
+        var offset: u64 = 0;
+        while (remaining > 0 and header_offset < virtio_vsock_hdr_len) {
+            const chunk: usize = @intCast(@min(@as(u64, virtio_vsock_hdr_len - header_offset), remaining));
+            try readGuestBytes(desc.addr + offset, header_bytes[header_offset .. header_offset + chunk]);
+            header_offset += chunk;
+            remaining -= @as(u64, chunk);
+            offset += @as(u64, chunk);
+            total_len += @intCast(chunk);
+            if (header_offset == virtio_vsock_hdr_len and payload_len == null) {
+                header_out.* = decodeVsockHdr(&header_bytes);
+                if (header_out.len > payload_buf.len) return error.MessageTooLarge;
+                payload_len = @intCast(header_out.len);
+            }
+        }
+        while (remaining > 0 and payload_len != null and payload_offset < payload_len.?) {
+            const chunk: usize = @intCast(@min(@as(u64, payload_len.? - payload_offset), remaining));
+            try readGuestBytes(desc.addr + offset, payload_buf[payload_offset .. payload_offset + chunk]);
+            payload_offset += chunk;
+            remaining -= @as(u64, chunk);
+            offset += @as(u64, chunk);
+            total_len += @intCast(chunk);
+        }
+
+        desc_seen += 1;
+        if (desc.flags & virtq_desc_flag_next == 0) break;
+        desc_index = desc.next;
+    }
+
+    if (header_offset < virtio_vsock_hdr_len) {
+        log.warn("virtio-vsock tx short header head={d} queue_num={d} header={d}/{d} payload={d} desc_seen={d}", .{ head, queue.num, header_offset, virtio_vsock_hdr_len, payload_offset, desc_seen });
+        return error.InvalidGuestLayout;
+    }
+    if (payload_len == null) {
+        header_out.* = decodeVsockHdr(&header_bytes);
+        if (header_out.len > payload_buf.len) return error.MessageTooLarge;
+        payload_len = @intCast(header_out.len);
+    }
+    if (payload_offset < payload_len.?) {
+        log.warn("virtio-vsock tx short payload head={d} queue_num={d} payload={d}/{d} desc_seen={d} op={d} src_port={d} dst_port={d}", .{ head, queue.num, payload_offset, payload_len.?, desc_seen, header_out.op, header_out.src_port, header_out.dst_port });
+        return error.InvalidGuestLayout;
+    }
+    return total_len;
+}
+
+fn sendVsockReset(request: VirtioVsockHdr) void {
+    const header = buildVsockReplyHeader(request, virtio_vsock_op_rst, 0, 0);
+    sendOrQueueVsockPacket(header, "");
+}
+
+fn handleVsockGuestPacket(header: VirtioVsockHdr, payload: []const u8) void {
+    if (header.type != virtio_vsock_type_stream or header.dst_cid != virtio_vsock_host_cid) {
+        sendVsockReset(header);
         return;
     }
-    const queue = &virtio_net_state.queues[1];
-    if (!queue.ready or queue.num == 0) {
-        log.debug("hvf virtio-net tx queue: not ready ready={} num={d}", .{ queue.ready, queue.num });
-        return;
+
+    virtio_vsock_connection_mutex.lock();
+    updateVsockGuestCreditLocked(header);
+    virtio_vsock_connection_mutex.unlock();
+
+    switch (header.op) {
+        virtio_vsock_op_request => {
+            if (header.dst_port != virtio_vsock_service_port) {
+                sendVsockReset(header);
+                return;
+            }
+            startVirtioVsockBridge(header.src_port, header.dst_port) catch {
+                sendVsockReset(header);
+                return;
+            };
+            sendOrQueueVsockPacket(buildVsockReplyHeader(header, virtio_vsock_op_response, 0, 0), "");
+        },
+        virtio_vsock_op_rw => {
+            var stream: ?net.Stream = null;
+            virtio_vsock_connection_mutex.lock();
+            if (findVirtioVsockConnectionLocked(header.src_port, header.dst_port)) |index| {
+                stream = virtio_vsock_connections[index].stream;
+            }
+            virtio_vsock_connection_mutex.unlock();
+            if (stream == null) {
+                sendVsockReset(header);
+                return;
+            }
+            stream.?.writeAll(payload) catch {
+                sendVsockReset(header);
+                stopVirtioVsockConnectionByPorts(header.src_port, header.dst_port);
+                return;
+            };
+            virtio_vsock_connection_mutex.lock();
+            if (findVirtioVsockConnectionLocked(header.src_port, header.dst_port)) |index| {
+                virtio_vsock_connections[index].device_fwd_cnt +%= @as(u32, @intCast(payload.len));
+            }
+            virtio_vsock_connection_mutex.unlock();
+        },
+        virtio_vsock_op_credit_request => {
+            sendOrQueueVsockPacket(buildVsockReplyHeader(header, virtio_vsock_op_credit_update, 0, 0), "");
+        },
+        virtio_vsock_op_credit_update => {
+            drainPendingVsockPackets();
+        },
+        virtio_vsock_op_shutdown => {
+            sendVsockReset(header);
+            stopVirtioVsockConnectionByPorts(header.src_port, header.dst_port);
+        },
+        virtio_vsock_op_rst => {
+            stopVirtioVsockConnectionByPorts(header.src_port, header.dst_port);
+        },
+        else => sendVsockReset(header),
     }
-    log.debug("hvf virtio-net tx queue: processing", .{});
+}
+
+pub fn processVirtioVsockTxQueue() !void {
+    if (!virtio_vsock_state.enabled) return;
+    const queue = &virtio_vsock_state.queues[1];
+    if (!queue.ready or queue.num == 0) return;
 
     const avail_idx = try readGuestU16(queue.avail_addr + 2);
     while (queue.last_avail_idx != avail_idx) {
         const ring_index = queue.last_avail_idx % queue.num;
         const head = try readGuestU16(queue.avail_addr + 4 + @as(u64, ring_index) * 2);
-        var desc_index = head;
-        var desc_seen: u16 = 0;
-        var total_len: u32 = 0;
-        var header_skip: usize = virtio_net_hdr_len;
-        var frame_buf: [4096]u8 = undefined;
-        var frame_len: usize = 0;
+        var header = VirtioVsockHdr{};
+        var payload_buf: [virtio_vsock_max_payload_len]u8 = undefined;
+        const used_len = readVsockPacketFromGuest(queue, head, &header, &payload_buf) catch |e| blk: {
+            log.warn("virtio-vsock tx packet read failed: {s}", .{@errorName(e)});
+            sendVsockReset(header);
+            break :blk 0;
+        };
 
-        while (true) {
-            if (desc_seen > queue.num) return error.InvalidGuestLayout;
-            const desc_addr = queue.desc_addr + @as(u64, desc_index) * @sizeOf(VirtqDesc);
-            const desc = try readVirtqDesc(desc_addr);
-            if (desc.flags & virtq_desc_flag_indirect != 0) return error.NotSupported;
-
-            if ((desc.flags & virtq_desc_flag_write) == 0 and desc.len > 0) {
-                var remaining: u64 = desc.len;
-                var offset: u64 = 0;
-                while (remaining > 0) {
-                    var chunk: usize = @intCast(@min(remaining, frame_buf.len));
-                    if (header_skip > 0) {
-                        const skip_now = @min(header_skip, chunk);
-                        header_skip -= skip_now;
-                        remaining -= @as(u64, skip_now);
-                        offset += @as(u64, skip_now);
-                        total_len += @intCast(skip_now);
-                        if (remaining == 0) break;
-                        chunk = @intCast(@min(remaining, frame_buf.len));
-                    }
-                    if (frame_len + chunk > frame_buf.len) {
-                        remaining = 0;
-                        break;
-                    }
-                    try readGuestBytes(desc.addr + offset, frame_buf[frame_len .. frame_len + chunk]);
-                    frame_len += chunk;
-                    remaining -= @as(u64, chunk);
-                    offset += @as(u64, chunk);
-                    total_len += @intCast(chunk);
-                }
-            }
-
-            desc_seen += 1;
-            if (desc.flags & virtq_desc_flag_next == 0) break;
-            desc_index = desc.next;
-        }
-
-        if (frame_len > 0) {
-            const allowed = outboundFrameAllowed(frame_buf[0..frame_len]);
-            log.debug("hvf virtio-net tx: frame len={d} allowed={}", .{ frame_len, allowed });
-            if (allowed) {
-                // Send frame to host via vmnet callback
-                if (net_tx_callback) |cb| {
-                    cb(frame_buf[0..frame_len]);
-                }
-            } else {
-                // If blocked DNS query, send an immediate negative response back to guest.
-                _ = maybeSendDnsBlockedResponse(frame_buf[0..frame_len]);
-            }
+        if (used_len > 0) {
+            handleVsockGuestPacket(header, payload_buf[0..header.len]);
         }
 
         const used_slot = queue.used_idx % queue.num;
         try writeGuestU32(queue.used_addr + 4 + @as(u64, used_slot) * 8, head);
-        try writeGuestU32(queue.used_addr + 4 + @as(u64, used_slot) * 8 + 4, total_len);
+        try writeGuestU32(queue.used_addr + 4 + @as(u64, used_slot) * 8 + 4, used_len);
         queue.used_idx +%= 1;
         try writeGuestU16(queue.used_addr + 2, queue.used_idx);
         queue.last_avail_idx +%= 1;
     }
 
-    virtio_net_state.interrupt_status |= virtio_mmio_int_vring;
-    updateVirtioNetInterrupt();
+    virtio_vsock_state.interrupt_status |= virtio_mmio_int_vring;
+    updateVirtioVsockInterrupt();
+}
+
+pub fn handleVirtioVsockMmio(offset: u64, is_write: bool, size: usize, value: u64) u64 {
+    if (!virtio_vsock_state.enabled) return 0;
+    if (!virtio_vsock_seen.swap(true, .seq_cst)) {
+        log.info("hvf virtio-vsock mmio first access offset=0x{x} write={s}", .{ offset, if (is_write) "yes" else "no" });
+    }
+
+    if (is_write) {
+        const v32: u32 = @intCast(value & 0xFFFF_FFFF);
+        switch (offset) {
+            virtio_mmio_reg_device_features_sel => virtio_vsock_state.device_features_sel = v32,
+            virtio_mmio_reg_driver_features_sel => virtio_vsock_state.driver_features_sel = v32,
+            virtio_mmio_reg_driver_features => {
+                const sel = virtio_vsock_state.driver_features_sel;
+                if (sel < virtio_vsock_state.driver_features.len) {
+                    virtio_vsock_state.driver_features[sel] = v32;
+                }
+            },
+            virtio_mmio_reg_queue_sel => virtio_vsock_state.queue_sel = @intCast(v32 & 0xFFFF),
+            virtio_mmio_reg_queue_num => {
+                const requested: u16 = @intCast(v32 & 0xFFFF);
+                if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len) {
+                    virtio_vsock_state.queues[virtio_vsock_state.queue_sel].num = @min(requested, virtio_vsock_queue_max);
+                }
+            },
+            virtio_mmio_reg_queue_ready => {
+                if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len) {
+                    virtio_vsock_state.queues[virtio_vsock_state.queue_sel].ready = (v32 & 0x1) == 1;
+                }
+            },
+            virtio_mmio_reg_queue_desc_low => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len) {
+                const q = &virtio_vsock_state.queues[virtio_vsock_state.queue_sel];
+                q.desc_addr = (q.desc_addr & 0xFFFF_FFFF_0000_0000) | v32;
+            },
+            virtio_mmio_reg_queue_desc_high => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len) {
+                const q = &virtio_vsock_state.queues[virtio_vsock_state.queue_sel];
+                q.desc_addr = (@as(u64, v32) << 32) | (q.desc_addr & 0xFFFF_FFFF);
+            },
+            virtio_mmio_reg_queue_driver_low => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len) {
+                const q = &virtio_vsock_state.queues[virtio_vsock_state.queue_sel];
+                q.avail_addr = (q.avail_addr & 0xFFFF_FFFF_0000_0000) | v32;
+            },
+            virtio_mmio_reg_queue_driver_high => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len) {
+                const q = &virtio_vsock_state.queues[virtio_vsock_state.queue_sel];
+                q.avail_addr = (@as(u64, v32) << 32) | (q.avail_addr & 0xFFFF_FFFF);
+            },
+            virtio_mmio_reg_queue_device_low => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len) {
+                const q = &virtio_vsock_state.queues[virtio_vsock_state.queue_sel];
+                q.used_addr = (q.used_addr & 0xFFFF_FFFF_0000_0000) | v32;
+            },
+            virtio_mmio_reg_queue_device_high => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len) {
+                const q = &virtio_vsock_state.queues[virtio_vsock_state.queue_sel];
+                q.used_addr = (@as(u64, v32) << 32) | (q.used_addr & 0xFFFF_FFFF);
+            },
+            virtio_mmio_reg_queue_notify => {
+                const queue_index: u16 = @intCast(v32 & 0xFFFF);
+                switch (queue_index) {
+                    0 => drainPendingVsockPackets(),
+                    1 => processVirtioVsockTxQueue() catch |e| {
+                        log.warn("hvf virtio-vsock tx notify failed: {s}", .{@errorName(e)});
+                    },
+                    else => {},
+                }
+            },
+            virtio_mmio_reg_interrupt_ack => {
+                virtio_vsock_state.interrupt_status &= ~v32;
+                updateVirtioVsockInterrupt();
+            },
+            virtio_mmio_reg_status => {
+                if (v32 == 0) {
+                    stopAllVirtioVsockConnections();
+                    resetPendingVsockPackets();
+                    virtio_vsock_state.status = 0;
+                    virtio_vsock_state.queues = .{ .{}, .{}, .{} };
+                } else {
+                    virtio_vsock_state.status = v32;
+                }
+                if (virtio_vsock_state.status != virtio_vsock_state.status_last) {
+                    log.info("hvf virtio-vsock status=0x{x}", .{virtio_vsock_state.status});
+                    virtio_vsock_state.status_last = virtio_vsock_state.status;
+                }
+            },
+            else => {},
+        }
+        return 0;
+    }
+
+    return switch (offset) {
+        virtio_mmio_reg_magic => virtio_mmio_magic,
+        virtio_mmio_reg_version => virtio_mmio_version,
+        virtio_mmio_reg_device_id => virtio_mmio_device_id_vsock,
+        virtio_mmio_reg_vendor_id => virtio_mmio_vendor_id,
+        virtio_mmio_reg_device_features => virtioVsockDeviceFeatures(virtio_vsock_state.device_features_sel),
+        virtio_mmio_reg_device_features_sel => virtio_vsock_state.device_features_sel,
+        virtio_mmio_reg_driver_features_sel => virtio_vsock_state.driver_features_sel,
+        virtio_mmio_reg_driver_features => blk: {
+            const sel = virtio_vsock_state.driver_features_sel;
+            if (sel < virtio_vsock_state.driver_features.len) break :blk virtio_vsock_state.driver_features[sel];
+            break :blk 0;
+        },
+        virtio_mmio_reg_queue_sel => virtio_vsock_state.queue_sel,
+        virtio_mmio_reg_queue_num_max => virtio_vsock_queue_max,
+        virtio_mmio_reg_queue_num => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len)
+            virtio_vsock_state.queues[virtio_vsock_state.queue_sel].num
+        else
+            0,
+        virtio_mmio_reg_queue_ready => blk: {
+            var ready = false;
+            if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len) {
+                ready = virtio_vsock_state.queues[virtio_vsock_state.queue_sel].ready;
+            }
+            break :blk @intFromBool(ready);
+        },
+        virtio_mmio_reg_interrupt_status => virtio_vsock_state.interrupt_status,
+        virtio_mmio_reg_status => virtio_vsock_state.status,
+        virtio_mmio_reg_queue_desc_low => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len)
+            @as(u64, @intCast(virtio_vsock_state.queues[virtio_vsock_state.queue_sel].desc_addr & 0xFFFF_FFFF))
+        else
+            0,
+        virtio_mmio_reg_queue_desc_high => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len)
+            @as(u64, @intCast(virtio_vsock_state.queues[virtio_vsock_state.queue_sel].desc_addr >> 32))
+        else
+            0,
+        virtio_mmio_reg_queue_driver_low => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len)
+            @as(u64, @intCast(virtio_vsock_state.queues[virtio_vsock_state.queue_sel].avail_addr & 0xFFFF_FFFF))
+        else
+            0,
+        virtio_mmio_reg_queue_driver_high => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len)
+            @as(u64, @intCast(virtio_vsock_state.queues[virtio_vsock_state.queue_sel].avail_addr >> 32))
+        else
+            0,
+        virtio_mmio_reg_queue_device_low => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len)
+            @as(u64, @intCast(virtio_vsock_state.queues[virtio_vsock_state.queue_sel].used_addr & 0xFFFF_FFFF))
+        else
+            0,
+        virtio_mmio_reg_queue_device_high => if (virtio_vsock_state.queue_sel < virtio_vsock_state.queues.len)
+            @as(u64, @intCast(virtio_vsock_state.queues[virtio_vsock_state.queue_sel].used_addr >> 32))
+        else
+            0,
+        virtio_mmio_reg_config_generation => 0,
+        else => blk: {
+            if (offset >= virtio_mmio_reg_config and offset < virtio_mmio_reg_config + 8) {
+                const config_offset = @as(usize, @intCast(offset - virtio_mmio_reg_config));
+                var cid_bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &cid_bytes, virtio_vsock_state.guest_cid, .little);
+                const width = @min(size, 4);
+                const end = @min(config_offset + width, cid_bytes.len);
+                var value_out: u32 = 0;
+                var shift: u6 = 0;
+                var i: usize = config_offset;
+                while (i < end) : (i += 1) {
+                    value_out |= @as(u32, cid_bytes[i]) << @intCast(shift);
+                    shift += 8;
+                }
+                break :blk value_out;
+            }
+            break :blk 0;
+        },
+    };
 }
 
 pub fn processVirtioFsQueue(queue_index: usize) !void {
@@ -1992,7 +2356,7 @@ pub fn processVirtioRngQueue() !void {
             var buf: [256]u8 = undefined;
             while (remaining > 0) {
                 const chunk = @min(remaining, buf.len);
-                std.crypto.random.bytes(buf[0..@intCast(chunk)]);
+                fs.io().random(buf[0..@intCast(chunk)]);
                 try writeGuestBytes(desc.addr + offset, buf[0..@intCast(chunk)]);
                 total_written += @intCast(chunk);
                 remaining -= @as(u64, chunk);
@@ -2192,175 +2556,6 @@ pub fn handleVirtioConsoleMmio(offset: u64, is_write: bool, size: usize, value: 
             break :blk 0;
         },
     };
-}
-
-pub fn handleVirtioNetMmio(offset: u64, is_write: bool, size: usize, value: u64) u64 {
-    if (!virtio_net_state.enabled) return 0;
-    if (!virtio_net_seen.swap(true, .seq_cst)) {
-        log.info("hvf virtio-net mmio first access offset=0x{x} write={s}", .{ offset, if (is_write) "yes" else "no" });
-    }
-    // Debug: log all MMIO accesses
-    if (is_write) {
-        log.debug("hvf virtio-net mmio write offset=0x{x} value=0x{x} size={d}", .{ offset, value, size });
-    } else {
-        log.debug("hvf virtio-net mmio read offset=0x{x} size={d}", .{ offset, size });
-    }
-    const width: usize = @min(size, 4);
-    if (is_write) {
-        const v32: u32 = @intCast(value & 0xFFFF_FFFF);
-        switch (offset) {
-            virtio_mmio_reg_device_features_sel => virtio_net_state.device_features_sel = v32,
-            virtio_mmio_reg_driver_features_sel => virtio_net_state.driver_features_sel = v32,
-            virtio_mmio_reg_driver_features => {
-                const sel = virtio_net_state.driver_features_sel;
-                if (sel < virtio_net_state.driver_features.len) {
-                    virtio_net_state.driver_features[sel] = v32;
-                }
-            },
-            virtio_mmio_reg_queue_sel => virtio_net_state.queue_sel = @intCast(v32 & 0xFFFF),
-            virtio_mmio_reg_queue_num => {
-                const requested: u16 = @intCast(v32 & 0xFFFF);
-                if (virtio_net_state.queue_sel < virtio_net_state.queues.len) {
-                    virtio_net_state.queues[virtio_net_state.queue_sel].num = @min(requested, virtio_net_queue_max);
-                }
-            },
-            virtio_mmio_reg_queue_ready => {
-                if (virtio_net_state.queue_sel < virtio_net_state.queues.len) {
-                    virtio_net_state.queues[virtio_net_state.queue_sel].ready = (v32 & 0x1) == 1;
-                }
-            },
-            virtio_mmio_reg_queue_desc_low => if (virtio_net_state.queue_sel < virtio_net_state.queues.len) {
-                const q = &virtio_net_state.queues[virtio_net_state.queue_sel];
-                q.desc_addr = (q.desc_addr & 0xFFFF_FFFF_0000_0000) | v32;
-            },
-            virtio_mmio_reg_queue_desc_high => if (virtio_net_state.queue_sel < virtio_net_state.queues.len) {
-                const q = &virtio_net_state.queues[virtio_net_state.queue_sel];
-                q.desc_addr = (@as(u64, v32) << 32) | (q.desc_addr & 0xFFFF_FFFF);
-            },
-            virtio_mmio_reg_queue_driver_low => if (virtio_net_state.queue_sel < virtio_net_state.queues.len) {
-                const q = &virtio_net_state.queues[virtio_net_state.queue_sel];
-                q.avail_addr = (q.avail_addr & 0xFFFF_FFFF_0000_0000) | v32;
-            },
-            virtio_mmio_reg_queue_driver_high => if (virtio_net_state.queue_sel < virtio_net_state.queues.len) {
-                const q = &virtio_net_state.queues[virtio_net_state.queue_sel];
-                q.avail_addr = (@as(u64, v32) << 32) | (q.avail_addr & 0xFFFF_FFFF);
-            },
-            virtio_mmio_reg_queue_device_low => if (virtio_net_state.queue_sel < virtio_net_state.queues.len) {
-                const q = &virtio_net_state.queues[virtio_net_state.queue_sel];
-                q.used_addr = (q.used_addr & 0xFFFF_FFFF_0000_0000) | v32;
-            },
-            virtio_mmio_reg_queue_device_high => if (virtio_net_state.queue_sel < virtio_net_state.queues.len) {
-                const q = &virtio_net_state.queues[virtio_net_state.queue_sel];
-                q.used_addr = (@as(u64, v32) << 32) | (q.used_addr & 0xFFFF_FFFF);
-            },
-            virtio_mmio_reg_queue_notify => {
-                const queue_index: u16 = @intCast(v32 & 0xFFFF);
-                if (queue_index == 0) {
-                    // Guest posted RX buffers, drain pending blocked-DNS responses.
-                    drainPendingBlockedDns();
-                } else if (queue_index == 1) {
-                    processVirtioNetTxQueue() catch |e| {
-                        log.warn("hvf virtio-net tx notify failed: {s}", .{@errorName(e)});
-                    };
-                }
-            },
-            virtio_mmio_reg_interrupt_ack => {
-                virtio_net_state.interrupt_status &= ~v32;
-                updateVirtioNetInterrupt();
-            },
-            virtio_mmio_reg_status => {
-                if (v32 == 0) {
-                    virtio_net_state.status = 0;
-                    virtio_net_state.queues = .{ .{}, .{} };
-                } else {
-                    virtio_net_state.status = v32;
-                }
-                if (virtio_net_state.status != virtio_net_state.status_last) {
-                    log.info("hvf virtio-net status=0x{x}", .{virtio_net_state.status});
-                    virtio_net_state.status_last = virtio_net_state.status;
-                }
-            },
-            else => {},
-        }
-        return 0;
-    }
-
-    const result = switch (offset) {
-        virtio_mmio_reg_magic => virtio_mmio_magic,
-        virtio_mmio_reg_version => virtio_mmio_version,
-        virtio_mmio_reg_device_id => virtio_mmio_device_id_net,
-        virtio_mmio_reg_vendor_id => virtio_mmio_vendor_id,
-        virtio_mmio_reg_device_features => virtioNetDeviceFeatures(virtio_net_state.device_features_sel),
-        virtio_mmio_reg_device_features_sel => virtio_net_state.device_features_sel,
-        virtio_mmio_reg_driver_features_sel => virtio_net_state.driver_features_sel,
-        virtio_mmio_reg_driver_features => blk: {
-            const sel = virtio_net_state.driver_features_sel;
-            if (sel < virtio_net_state.driver_features.len) break :blk virtio_net_state.driver_features[sel];
-            break :blk 0;
-        },
-        virtio_mmio_reg_queue_sel => virtio_net_state.queue_sel,
-        virtio_mmio_reg_queue_num_max => virtio_net_queue_max,
-        virtio_mmio_reg_queue_num => if (virtio_net_state.queue_sel < virtio_net_state.queues.len)
-            virtio_net_state.queues[virtio_net_state.queue_sel].num
-        else
-            0,
-        virtio_mmio_reg_queue_ready => blk: {
-            var ready = false;
-            if (virtio_net_state.queue_sel < virtio_net_state.queues.len) {
-                ready = virtio_net_state.queues[virtio_net_state.queue_sel].ready;
-            }
-            break :blk @intFromBool(ready);
-        },
-        virtio_mmio_reg_interrupt_status => virtio_net_state.interrupt_status,
-        virtio_mmio_reg_status => virtio_net_state.status,
-        virtio_mmio_reg_queue_desc_low => if (virtio_net_state.queue_sel < virtio_net_state.queues.len)
-            @as(u64, @intCast(virtio_net_state.queues[virtio_net_state.queue_sel].desc_addr & 0xFFFF_FFFF))
-        else
-            0,
-        virtio_mmio_reg_queue_desc_high => if (virtio_net_state.queue_sel < virtio_net_state.queues.len)
-            @as(u64, @intCast(virtio_net_state.queues[virtio_net_state.queue_sel].desc_addr >> 32))
-        else
-            0,
-        virtio_mmio_reg_queue_driver_low => if (virtio_net_state.queue_sel < virtio_net_state.queues.len)
-            @as(u64, @intCast(virtio_net_state.queues[virtio_net_state.queue_sel].avail_addr & 0xFFFF_FFFF))
-        else
-            0,
-        virtio_mmio_reg_queue_driver_high => if (virtio_net_state.queue_sel < virtio_net_state.queues.len)
-            @as(u64, @intCast(virtio_net_state.queues[virtio_net_state.queue_sel].avail_addr >> 32))
-        else
-            0,
-        virtio_mmio_reg_queue_device_low => if (virtio_net_state.queue_sel < virtio_net_state.queues.len)
-            @as(u64, @intCast(virtio_net_state.queues[virtio_net_state.queue_sel].used_addr & 0xFFFF_FFFF))
-        else
-            0,
-        virtio_mmio_reg_queue_device_high => if (virtio_net_state.queue_sel < virtio_net_state.queues.len)
-            @as(u64, @intCast(virtio_net_state.queues[virtio_net_state.queue_sel].used_addr >> 32))
-        else
-            0,
-        virtio_mmio_reg_config_generation => 0,
-        else => blk: {
-            if (offset >= virtio_mmio_reg_config) {
-                const config_offset = offset - virtio_mmio_reg_config;
-                if (config_offset < virtio_net_state.mac.len) {
-                    const config_start: usize = @intCast(config_offset);
-                    const end = @min(config_start + width, virtio_net_state.mac.len);
-                    var val: u32 = 0;
-                    var shift: u6 = 0;
-                    var i: usize = config_start;
-                    while (i < end) : (i += 1) {
-                        val |= @as(u32, virtio_net_state.mac[i]) << @intCast(shift);
-                        shift += 8;
-                    }
-                    break :blk val;
-                }
-            }
-            break :blk 0;
-        },
-    };
-    if (!is_write) {
-        log.debug("hvf virtio-net mmio read result offset=0x{x} value=0x{x}", .{ offset, result });
-    }
-    return result;
 }
 
 pub fn handleVirtioFsMmio(offset: u64, is_write: bool, size: usize, value: u64) u64 {
@@ -2685,12 +2880,6 @@ test "virtio: virtioRngDeviceFeatures" {
     try std.testing.expectEqual(@as(u32, 0), virtioRngDeviceFeatures(2));
 }
 
-test "virtio: virtioNetDeviceFeatures" {
-    try std.testing.expectEqual(virtio_net_f_mac, virtioNetDeviceFeatures(0));
-    try std.testing.expectEqual(virtio_f_version_1, virtioNetDeviceFeatures(1));
-    try std.testing.expectEqual(@as(u32, 0), virtioNetDeviceFeatures(2));
-}
-
 test "virtio: resetVirtioBlkQueue clears queue state" {
     var device = VirtioBlkDevice{};
     device.queue.num = 128;
@@ -2725,17 +2914,41 @@ test "virtio: resetVirtioRngState clears all state" {
     try std.testing.expect(!virtio_rng_irq_level);
 }
 
-test "virtio: resetVirtioNetState clears all state" {
-    virtio_net_state.enabled = true;
-    virtio_net_state.mac = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
-    gic_virtio_net_intid = 44;
-    virtio_net_irq_level = true;
-    virtio_net_seen.store(true, .seq_cst);
-    resetVirtioNetState();
-    try std.testing.expect(!virtio_net_state.enabled);
-    try std.testing.expectEqual([6]u8{ 0, 0, 0, 0, 0, 0 }, virtio_net_state.mac);
-    try std.testing.expect(gic_virtio_net_intid == null);
-    try std.testing.expect(!virtio_net_seen.load(.seq_cst));
+test "virtio: resetVirtioVsockState clears all state" {
+    try setupVirtioVsock(true, 42, "/tmp/m80-test-bridge.sock");
+    virtio_vsock_state.status = 0xFF;
+    gic_virtio_vsock_intid = 44;
+    virtio_vsock_irq_level = true;
+    virtio_vsock_seen.store(true, .seq_cst);
+    resetVirtioVsockState();
+    try std.testing.expect(!virtio_vsock_state.enabled);
+    try std.testing.expectEqual(@as(u64, 0), virtio_vsock_state.guest_cid);
+    try std.testing.expect(gic_virtio_vsock_intid == null);
+    try std.testing.expect(!virtio_vsock_seen.load(.seq_cst));
+}
+
+test "virtio: vsock connection table supports multiple active streams" {
+    resetVirtioVsockState();
+    try setupVirtioVsock(true, 77, null);
+    defer resetVirtioVsockState();
+
+    virtio_vsock_connection_mutex.lock();
+    virtio_vsock_connections[0].active = true;
+    virtio_vsock_connections[0].guest_port = 1024;
+    virtio_vsock_connections[0].host_port = virtio_vsock_service_port;
+    virtio_vsock_connections[1].active = true;
+    virtio_vsock_connections[1].guest_port = 1025;
+    virtio_vsock_connections[1].host_port = virtio_vsock_service_port;
+    const first = findVirtioVsockConnectionLocked(1024, virtio_vsock_service_port);
+    const second = findVirtioVsockConnectionLocked(1025, virtio_vsock_service_port);
+    virtio_vsock_connection_mutex.unlock();
+
+    try std.testing.expectEqual(@as(?usize, 0), first);
+    try std.testing.expectEqual(@as(?usize, 1), second);
+    try std.testing.expectEqual(@as(usize, 2), activeVirtioVsockConnectionCount());
+
+    resetVirtioVsockState();
+    try std.testing.expectEqual(@as(usize, 0), activeVirtioVsockConnectionCount());
 }
 
 test "virtio: setupVirtioConsole enables device" {
@@ -2754,12 +2967,13 @@ test "virtio: setupVirtioRng enables device" {
     try std.testing.expect(!virtio_rng_state.enabled);
 }
 
-test "virtio: setupVirtioNet enables device with MAC" {
-    resetVirtioNetState();
-    const mac = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
-    setupVirtioNet(true, mac);
-    try std.testing.expect(virtio_net_state.enabled);
-    try std.testing.expectEqual(mac, virtio_net_state.mac);
+test "virtio: setupVirtioVsock enables device with guest cid" {
+    resetVirtioVsockState();
+    try setupVirtioVsock(true, 77, "/tmp/m80-bridge.sock");
+    defer resetVirtioVsockState();
+    try std.testing.expect(virtio_vsock_state.enabled);
+    try std.testing.expectEqual(@as(u64, 77), virtio_vsock_state.guest_cid);
+    try std.testing.expect(virtio_vsock_state.bridge_socket_path != null);
 }
 
 test "virtio: VirtioConsoleInput operations" {
@@ -2775,13 +2989,6 @@ test "virtio: VirtioConsoleInput operations" {
     try std.testing.expectEqualStrings("hello", &buf);
 }
 
-test "virtio: isDhcpPort detects DHCP ports" {
-    try std.testing.expect(isDhcpPort(67));
-    try std.testing.expect(isDhcpPort(68));
-    try std.testing.expect(!isDhcpPort(53));
-    try std.testing.expect(!isDhcpPort(80));
-}
-
 test "virtio: VirtioConsoleState defaults" {
     const state = VirtioConsoleState{};
     try std.testing.expect(!state.enabled);
@@ -2794,10 +3001,11 @@ test "virtio: VirtioRngState defaults" {
     try std.testing.expectEqual(@as(u32, 0), state.status);
 }
 
-test "virtio: VirtioNetState defaults" {
-    const state = VirtioNetState{};
+test "virtio: VirtioVsockState defaults" {
+    const state = VirtioVsockState{};
     try std.testing.expect(!state.enabled);
-    try std.testing.expectEqual([6]u8{ 0, 0, 0, 0, 0, 0 }, state.mac);
+    try std.testing.expectEqual(@as(usize, 3), state.queues.len);
+    try std.testing.expectEqual(@as(u64, 0), state.guest_cid);
 }
 
 test "virtio: VirtioFsState defaults" {
@@ -2869,10 +3077,10 @@ test "virtio: MMIO register offsets match spec" {
 }
 
 test "virtio: device IDs match spec" {
-    try std.testing.expectEqual(@as(u32, 1), virtio_mmio_device_id_net);
     try std.testing.expectEqual(@as(u32, 2), virtio_mmio_device_id_blk);
     try std.testing.expectEqual(@as(u32, 3), virtio_mmio_device_id_console);
     try std.testing.expectEqual(@as(u32, 4), virtio_mmio_device_id_rng);
+    try std.testing.expectEqual(@as(u32, 19), virtio_mmio_device_id_vsock);
     try std.testing.expectEqual(@as(u32, 26), virtio_mmio_device_id_fs);
 }
 
@@ -2880,13 +3088,12 @@ test "virtio: queue max values are power of 2" {
     try std.testing.expect(virtio_blk_queue_max & (virtio_blk_queue_max - 1) == 0);
     try std.testing.expect(virtio_console_queue_max & (virtio_console_queue_max - 1) == 0);
     try std.testing.expect(virtio_rng_queue_max & (virtio_rng_queue_max - 1) == 0);
-    try std.testing.expect(virtio_net_queue_max & (virtio_net_queue_max - 1) == 0);
+    try std.testing.expect(virtio_vsock_queue_max & (virtio_vsock_queue_max - 1) == 0);
 }
 
-test "virtio: ethernet type constants" {
-    try std.testing.expectEqual(@as(u16, 0x0800), ether_type_ipv4);
-    try std.testing.expectEqual(@as(u16, 0x0806), ether_type_arp);
-    try std.testing.expectEqual(@as(u8, 17), ip_proto_udp);
+test "virtio: vsock host rx payload fits the Linux guest buffer" {
+    try std.testing.expectEqual(virtio_vsock_guest_rx_buffer_len, virtio_vsock_hdr_len + virtio_vsock_max_rx_payload_len);
+    try std.testing.expect(virtio_vsock_max_rx_payload_len < virtio_vsock_max_payload_len);
 }
 
 test "virtio: ensureGuestIo returns error when not initialized" {
@@ -2925,293 +3132,6 @@ test "virtio: setInterruptHandler and triggerInterrupt" {
     try std.testing.expectEqual(@as(u32, 1), MockHandler.call_count);
     setInterruptHandler(null);
     triggerInterrupt(1, true);
-}
-
-test "virtio: outboundFrameAllowed with no policy" {
-    net_policy_mutex.lock();
-    const saved = net_policy_state;
-    net_policy_state = null;
-    net_policy_mutex.unlock();
-    defer {
-        net_policy_mutex.lock();
-        net_policy_state = saved;
-        net_policy_mutex.unlock();
-    }
-    const frame = [_]u8{0} ** 100;
-    try std.testing.expect(outboundFrameAllowed(&frame));
-}
-
-test "virtio: maybeSendDnsBlockedResponse returns false with no policy" {
-    net_policy_mutex.lock();
-    const saved = net_policy_state;
-    net_policy_state = null;
-    net_policy_mutex.unlock();
-    defer {
-        net_policy_mutex.lock();
-        net_policy_state = saved;
-        net_policy_mutex.unlock();
-    }
-    const frame = [_]u8{0} ** 100;
-    try std.testing.expect(!maybeSendDnsBlockedResponse(&frame));
-}
-
-test "virtio: maybeSendDnsBlockedResponse returns false for non-DNS" {
-    net_policy_mutex.lock();
-    const saved = net_policy_state;
-    // Set up allowlist policy
-    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
-    policy.mode = .allowlist;
-    net_policy_state = policy;
-    net_policy_mutex.unlock();
-    defer {
-        net_policy_mutex.lock();
-        net_policy_state = saved;
-        net_policy_mutex.unlock();
-    }
-    // Build a minimal IPv4/TCP frame (not DNS)
-    var frame: [60]u8 = undefined;
-    @memset(&frame, 0);
-    // Ethernet header
-    frame[12] = 0x08; // ethertype IPv4
-    frame[13] = 0x00;
-    // IP header at offset 14
-    frame[14] = 0x45; // version 4, IHL 5
-    frame[23] = 6; // protocol TCP (not UDP)
-    // maybeSendDnsBlockedResponse should return false for non-UDP
-    try std.testing.expect(!maybeSendDnsBlockedResponse(&frame));
-}
-
-test "virtio: maybeSendDnsBlockedResponse returns false for allowed domain" {
-    net_policy_mutex.lock();
-    const saved = net_policy_state;
-    // Set up allowlist policy with allowed domain
-    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
-    policy.mode = .allowlist;
-    try policy.addDomainRule("example.com");
-    net_policy_state = policy;
-    net_policy_mutex.unlock();
-    defer {
-        net_policy_mutex.lock();
-        if (net_policy_state) |*p| p.deinit();
-        net_policy_state = saved;
-        net_policy_mutex.unlock();
-    }
-    // Build a DNS query for example.com
-    var frame: [100]u8 = undefined;
-    @memset(&frame, 0);
-    // Ethernet header
-    frame[12] = 0x08; // ethertype IPv4
-    frame[13] = 0x00;
-    // IP header at offset 14
-    frame[14] = 0x45; // version 4, IHL 5
-    frame[23] = 17; // protocol UDP
-    // UDP header at offset 34
-    frame[36] = 0x00; // dst port 53
-    frame[37] = 0x35;
-    // DNS query at offset 42
-    // Transaction ID
-    frame[42] = 0x12;
-    frame[43] = 0x34;
-    // Flags (standard query)
-    frame[44] = 0x01;
-    frame[45] = 0x00;
-    // Questions = 1
-    frame[46] = 0x00;
-    frame[47] = 0x01;
-    // DNS name: example.com = 7example3com0
-    frame[54] = 7;
-    frame[55] = 'e';
-    frame[56] = 'x';
-    frame[57] = 'a';
-    frame[58] = 'm';
-    frame[59] = 'p';
-    frame[60] = 'l';
-    frame[61] = 'e';
-    frame[62] = 3;
-    frame[63] = 'c';
-    frame[64] = 'o';
-    frame[65] = 'm';
-    frame[66] = 0;
-    // maybeSendDnsBlockedResponse should return false for allowed domain
-    try std.testing.expect(!maybeSendDnsBlockedResponse(&frame));
-}
-
-test "virtio: blocked DNS response is NXDOMAIN" {
-    var frame: [100]u8 = undefined;
-    @memset(&frame, 0);
-    frame[0..6].* = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
-    frame[6..12].* = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
-    frame[12] = 0x08;
-    frame[13] = 0x00;
-    frame[14] = 0x45;
-    frame[23] = 17;
-    frame[26..30].* = .{ 10, 0, 2, 15 };
-    frame[30..34].* = .{ 8, 8, 8, 8 };
-    std.mem.writeInt(u16, frame[34..36], 0x1234, .big);
-    std.mem.writeInt(u16, frame[36..38], 53, .big);
-    frame[42] = 0x12;
-    frame[43] = 0x34;
-    std.mem.writeInt(u16, frame[44..46], 0x0100, .big);
-    std.mem.writeInt(u16, frame[46..48], 1, .big);
-    std.mem.writeInt(u16, frame[48..50], 1, .big);
-    std.mem.writeInt(u16, frame[50..52], 1, .big);
-    std.mem.writeInt(u16, frame[52..54], 1, .big);
-    frame[54] = 7;
-    @memcpy(frame[55..62], "blocked");
-    frame[62] = 4;
-    @memcpy(frame[63..67], "test");
-    frame[67] = 0;
-
-    var response_buf: [PendingBlockedDnsQueue.max_frame_len]u8 = undefined;
-    const response = buildDnsBlockedResponse(&frame, 14, 20, 34, 42, &response_buf);
-
-    try std.testing.expectEqualSlices(u8, frame[6..12], response[0..6]);
-    try std.testing.expectEqualSlices(u8, frame[0..6], response[6..12]);
-    try std.testing.expectEqualSlices(u8, frame[30..34], response[26..30]);
-    try std.testing.expectEqualSlices(u8, frame[26..30], response[30..34]);
-    try std.testing.expectEqual(@as(u16, 53), std.mem.readInt(u16, response[34..36], .big));
-    try std.testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, response[36..38], .big));
-    try std.testing.expectEqual(@as(u16, 0x8583), std.mem.readInt(u16, response[44..46], .big));
-    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, response[46..48], .big));
-    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, response[48..50], .big));
-    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, response[50..52], .big));
-    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, response[52..54], .big));
-}
-
-test "virtio: blocked DNS response queues when rx queue is not ready" {
-    net_policy_mutex.lock();
-    const saved_policy = net_policy_state;
-    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
-    policy.mode = .allowlist;
-    net_policy_state = policy;
-    net_policy_mutex.unlock();
-    const saved_net = virtio_net_state;
-    defer {
-        net_policy_mutex.lock();
-        if (net_policy_state) |*p| p.deinit();
-        net_policy_state = saved_policy;
-        net_policy_mutex.unlock();
-        virtio_net_state = saved_net;
-        resetPendingBlockedDnsQueue();
-    }
-    resetPendingBlockedDnsQueue();
-    virtio_net_state = .{ .enabled = true };
-
-    var frame: [100]u8 = undefined;
-    @memset(&frame, 0);
-    frame[12] = 0x08;
-    frame[13] = 0x00;
-    frame[14] = 0x45;
-    frame[23] = 17;
-    frame[36] = 0x00;
-    frame[37] = 0x35;
-    frame[42] = 0x12;
-    frame[43] = 0x34;
-    frame[44] = 0x01;
-    frame[45] = 0x00;
-    frame[46] = 0x00;
-    frame[47] = 0x01;
-    frame[54] = 7;
-    @memcpy(frame[55..62], "blocked");
-    frame[62] = 4;
-    @memcpy(frame[63..67], "test");
-    frame[67] = 0;
-
-    try std.testing.expect(maybeSendDnsBlockedResponse(&frame));
-
-    pending_blocked_dns_mutex.lock();
-    defer pending_blocked_dns_mutex.unlock();
-    try std.testing.expectEqual(@as(usize, 1), pending_blocked_dns_queue.count);
-}
-
-test "virtio: dns allowlist respects port rules" {
-    net_policy_mutex.lock();
-    const saved = net_policy_state;
-    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
-    policy.mode = .allowlist;
-    try policy.addDomainRuleWithPorts("example.com", 443, 443);
-    net_policy_state = policy;
-    net_policy_mutex.unlock();
-    defer {
-        net_policy_mutex.lock();
-        if (net_policy_state) |*p| p.deinit();
-        net_policy_state = saved;
-        net_policy_mutex.unlock();
-    }
-
-    // Build a DNS query for example.com
-    var frame: [100]u8 = undefined;
-    @memset(&frame, 0);
-    // Ethernet header
-    frame[12] = 0x08; // ethertype IPv4
-    frame[13] = 0x00;
-    // IP header at offset 14
-    frame[14] = 0x45; // version 4, IHL 5
-    frame[23] = 17; // protocol UDP
-    // UDP header at offset 34
-    frame[36] = 0x00; // dst port 53
-    frame[37] = 0x35;
-    // DNS query at offset 42
-    frame[42] = 0x12;
-    frame[43] = 0x34;
-    frame[44] = 0x01;
-    frame[45] = 0x00;
-    frame[46] = 0x00;
-    frame[47] = 0x01;
-    frame[54] = 7;
-    frame[55] = 'e';
-    frame[56] = 'x';
-    frame[57] = 'a';
-    frame[58] = 'm';
-    frame[59] = 'p';
-    frame[60] = 'l';
-    frame[61] = 'e';
-    frame[62] = 3;
-    frame[63] = 'c';
-    frame[64] = 'o';
-    frame[65] = 'm';
-    frame[66] = 0;
-
-    try std.testing.expect(!outboundFrameAllowed(&frame));
-    try std.testing.expect(maybeSendDnsBlockedResponse(&frame));
-}
-
-test "virtio: outboundFrameAllowed enforces port rules for resolved IPs" {
-    net_policy_mutex.lock();
-    const saved = net_policy_state;
-    var policy = net_policy.NetworkPolicy.init(std.testing.allocator);
-    policy.mode = .allowlist;
-    try policy.addDomainRuleWithPorts("example.com", 443, 443);
-    try policy.addResolvedIp("example.com", [4]u8{ 1, 2, 3, 4 }, 60);
-    net_policy_state = policy;
-    net_policy_mutex.unlock();
-    defer {
-        net_policy_mutex.lock();
-        if (net_policy_state) |*p| p.deinit();
-        net_policy_state = saved;
-        net_policy_mutex.unlock();
-    }
-
-    var frame: [54]u8 = undefined;
-    @memset(&frame, 0);
-    frame[12] = 0x08; // ethertype IPv4
-    frame[13] = 0x00;
-    frame[14] = 0x45; // version 4, IHL 5
-    frame[23] = 6; // protocol TCP
-    // dst ip 1.2.3.4
-    frame[30] = 1;
-    frame[31] = 2;
-    frame[32] = 3;
-    frame[33] = 4;
-    // TCP header at offset 34; set dst port to 80
-    frame[36] = 0x00;
-    frame[37] = 0x50;
-    try std.testing.expect(!outboundFrameAllowed(&frame));
-
-    // Set dst port to 443
-    frame[36] = 0x01;
-    frame[37] = 0xbb;
-    try std.testing.expect(outboundFrameAllowed(&frame));
 }
 
 test "virtio: resetVirtioBlkDevice handles out of bounds" {

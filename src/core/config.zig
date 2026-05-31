@@ -2,7 +2,8 @@
 //!
 //! This module handles parsing, validating, and writing m80.conf configuration files.
 //! Each VM has its own m80.conf file in its data directory that defines how the VM
-//! should be configured (memory, CPU, kernel paths, network settings, etc.).
+//! should be configured (memory, CPU, kernel paths, mounts, and control-plane
+//! network services and outbound policy).
 //!
 //! ## Configuration File Format
 //! The m80.conf file uses a simple key=value format:
@@ -16,9 +17,9 @@
 //! disk_path=/path/to/rootfs.ext4
 //! seed_path=/path/to/cloud-init.iso
 //! disk_readonly=false
-//! network_mode=allowlist
-//! allowed_domains=example.com,api.example.com
-//! allowed_ips=10.0.0.0/8
+//! network_mode=locked_down
+//! network_services=dns,metadata
+//! network_metadata_file=/path/to/metadata.json
 //! ```
 //!
 //! ## Supported Configuration Keys
@@ -34,18 +35,60 @@
 //! - `disk_readonly`: mount rootfs read-only (default: false)
 //! - `data_disk_readonly`: mount data disk read-only (default: false)
 //! - `kernel_cmdline`: optional kernel command line override
-//! - `network_mode`: locked_down|allowlist|open (default: locked_down)
-//! - `allowed_domains`: comma-separated domain allowlist
-//! - `allowed_ips`: comma-separated IP/CIDR allowlist
+//! - `network_mode`: locked_down|allowlist|open
+//! - `network_services`: comma-separated guest-local services (`dns`, `metadata`)
+//! - `network_metadata_file`: optional JSON source for `/v1/user`
+//! - `network_allowed_domains`: comma-separated domain allowlist
+//! - `network_allowed_ips`: comma-separated IPv4/IPv6/CIDR allowlist
 //!
 //! ## Path Resolution
 //! Paths in the config can be relative or absolute. Relative paths are resolved
 //! relative to the VM's data directory when the VM is started.
 
 const std = @import("std");
+const fs = @import("../util/fs.zig");
 const paths = @import("paths.zig");
-const net_policy = @import("../net/policy.zig");
 const mounts = @import("../fs/mounts.zig");
+const env = @import("../util/env.zig");
+
+pub const NetworkMode = enum {
+    locked_down,
+    allowlist,
+    open,
+
+    pub fn fromString(value: []const u8) ?NetworkMode {
+        if (std.mem.eql(u8, value, "locked_down")) return .locked_down;
+        if (std.mem.eql(u8, value, "allowlist")) return .allowlist;
+        if (std.mem.eql(u8, value, "open")) return .open;
+        return null;
+    }
+
+    pub fn toString(self: NetworkMode) []const u8 {
+        return switch (self) {
+            .locked_down => "locked_down",
+            .allowlist => "allowlist",
+            .open => "open",
+        };
+    }
+};
+
+pub const Service = enum {
+    dns,
+    metadata,
+
+    pub fn fromString(value: []const u8) ?Service {
+        if (std.mem.eql(u8, value, "dns")) return .dns;
+        if (std.mem.eql(u8, value, "metadata")) return .metadata;
+        return null;
+    }
+
+    pub fn toString(self: Service) []const u8 {
+        return switch (self) {
+            .dns => "dns",
+            .metadata => "metadata",
+        };
+    }
+};
 
 /// Configuration for a virtual machine.
 /// This struct holds all settings needed to create and run a VM.
@@ -103,19 +146,26 @@ pub const VmConfig = struct {
     /// Mount configurations (virtio-fs/9p).
     mounts: []mounts.MountConfig = &[_]mounts.MountConfig{},
 
-    /// Network security mode controlling outbound connections.
-    /// - locked_down: No network access (default, most secure)
-    /// - allowlist: Only allowed domains/IPs can be accessed
-    /// - open: Full network access (requires M80_ALLOW_OPEN_NETWORK env var)
-    network_mode: net_policy.NetworkMode = .locked_down,
+    assigned_guest_cid: ?u32 = null,
 
-    /// List of allowed domain names when network_mode is allowlist.
-    /// Supports wildcards (e.g., "*.example.com").
-    allowed_domains: []const []const u8 = &[_][]const u8{},
+    /// Outbound networking policy. Guest-local services are still allowed
+    /// in locked_down mode when explicitly enabled.
+    network_mode: NetworkMode = .locked_down,
 
-    /// List of allowed IP addresses/CIDR ranges when network_mode is allowlist.
-    /// Example: "10.0.0.0/8", "192.168.1.1"
-    allowed_ips: []const []const u8 = &[_][]const u8{},
+    /// Guest-local services injected into the guest bootstrap.
+    network_services: []const Service = &[_]Service{},
+
+    /// Optional JSON document served by the metadata service at `/v1/user`.
+    network_metadata_file: ?[]const u8 = null,
+
+    /// Domain allowlist used when network_mode=allowlist.
+    network_allowed_domains: []const []const u8 = &[_][]const u8{},
+
+    /// IPv4/CIDR allowlist used when network_mode=allowlist.
+    network_allowed_ips: []const []const u8 = &[_][]const u8{},
+
+    /// Per-VM daemon socket assigned during registration.
+    assigned_guest_session_socket_path: ?[]const u8 = null,
 
     /// Number of virtio-fs request queues to expose (1-8).
     /// Higher values can improve throughput on multi-core systems.
@@ -204,6 +254,8 @@ pub const ConfigError = error{
     CpuBelowMinimum,
     /// Could not determine host resources for validation
     HostResourcesUnknown,
+    /// Legacy network policy keys are no longer supported
+    RemovedNetworkKey,
 };
 
 /// Errors that can occur when validating config for VM start.
@@ -235,12 +287,16 @@ pub const StartConfigError = error{
     SeedUnreadable,
     /// data_disk_path exists but can't be opened (permissions?)
     DataDiskUnreadable,
-    /// network_mode=open requires explicit env opt-in
+    /// metadata_file doesn't exist
+    MetadataFileNotFound,
+    /// metadata_file exists but cannot be opened
+    MetadataFileUnreadable,
+    /// network_mode=open requires explicit operator opt-in
     OpenNetworkNotAllowed,
-    /// allowed_domains contains malformed domain or domain:port rule
-    InvalidAllowedDomainSpec,
-    /// allowed_ips contains malformed IP/CIDR rule
-    InvalidAllowedIpSpec,
+    /// network_allowed_domains has an invalid entry
+    InvalidNetworkAllowedDomainSpec,
+    /// network_allowed_ips has an invalid entry
+    InvalidNetworkAllowedIpSpec,
     /// virtio_fs_queues outside supported range
     VirtioFsQueuesInvalid,
     /// mounts configured without mount_roots
@@ -258,7 +314,7 @@ pub const StartConfigError = error{
 ///   - allocator: Memory allocator for the name string
 ///   - name: VM name to use
 ///
-/// Returns: VmConfig with defaults (2GB RAM, 2 CPUs, locked_down network)
+/// Returns: VmConfig with defaults (2GB RAM, 2 CPUs, locked_down networking)
 pub fn defaultConfig(allocator: std.mem.Allocator, name: []const u8) !VmConfig {
     return VmConfig{
         .name = try allocator.dupe(u8, name),
@@ -273,6 +329,7 @@ pub fn defaultConfig(allocator: std.mem.Allocator, name: []const u8) !VmConfig {
         .data_disk_path = null,
         .data_disk_readonly = false,
         .kernel_cmdline = null,
+        .network_metadata_file = null,
     };
 }
 
@@ -282,8 +339,9 @@ pub fn defaultConfig(allocator: std.mem.Allocator, name: []const u8) !VmConfig {
 /// Frees:
 ///   - name string
 ///   - kernel_path, initrd_path, disk_path, seed_path, data_disk_path (if set)
-///   - allowed_domains list and each domain string
-///   - allowed_ips list and each IP string
+///   - network_metadata_file (if set)
+///   - network_services list
+///   - network allowlist entries
 ///
 /// After calling, the config fields are reset to empty/null values.
 pub fn freeConfig(allocator: std.mem.Allocator, cfg: *VmConfig) void {
@@ -301,16 +359,22 @@ pub fn freeConfig(allocator: std.mem.Allocator, cfg: *VmConfig) void {
     cfg.data_disk_path = null;
     if (cfg.kernel_cmdline) |value| allocator.free(value);
     cfg.kernel_cmdline = null;
+    if (cfg.network_metadata_file) |value| allocator.free(value);
+    cfg.network_metadata_file = null;
 
-    // Free each domain string, then the slice itself
-    for (cfg.allowed_domains) |d| allocator.free(d);
-    if (cfg.allowed_domains.len > 0) allocator.free(cfg.allowed_domains);
-    cfg.allowed_domains = &[_][]const u8{};
+    if (cfg.network_services.len > 0) allocator.free(cfg.network_services);
+    cfg.network_services = &[_]Service{};
 
-    // Free each IP string, then the slice itself
-    for (cfg.allowed_ips) |ip| allocator.free(ip);
-    if (cfg.allowed_ips.len > 0) allocator.free(cfg.allowed_ips);
-    cfg.allowed_ips = &[_][]const u8{};
+    for (cfg.network_allowed_domains) |value| allocator.free(value);
+    if (cfg.network_allowed_domains.len > 0) allocator.free(cfg.network_allowed_domains);
+    cfg.network_allowed_domains = &[_][]const u8{};
+
+    for (cfg.network_allowed_ips) |value| allocator.free(value);
+    if (cfg.network_allowed_ips.len > 0) allocator.free(cfg.network_allowed_ips);
+    cfg.network_allowed_ips = &[_][]const u8{};
+
+    if (cfg.assigned_guest_session_socket_path) |value| allocator.free(value);
+    cfg.assigned_guest_session_socket_path = null;
 
     // Free mount roots
     for (cfg.mount_roots) |root| allocator.free(root);
@@ -344,7 +408,7 @@ pub fn freeConfig(allocator: std.mem.Allocator, cfg: *VmConfig) void {
 ///   - ConfigError.InvalidValue: Unparseable value for a key
 pub fn readConfigFile(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: fs.Dir,
     fallback_name: []const u8,
 ) !VmConfig {
     var cfg = try defaultConfig(allocator, fallback_name);
@@ -400,8 +464,8 @@ pub fn resolveRelativePaths(
             allocator.free(path);
             resolved = expanded;
         }
-        if (!std.fs.path.isAbsolute(resolved)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+        if (!fs.path.isAbsolute(resolved)) {
+            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
             allocator.free(resolved);
             cfg.kernel_path = joined;
         } else {
@@ -414,8 +478,8 @@ pub fn resolveRelativePaths(
             allocator.free(path);
             resolved = expanded;
         }
-        if (!std.fs.path.isAbsolute(resolved)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+        if (!fs.path.isAbsolute(resolved)) {
+            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
             allocator.free(resolved);
             cfg.initrd_path = joined;
         } else {
@@ -428,8 +492,8 @@ pub fn resolveRelativePaths(
             allocator.free(path);
             resolved = expanded;
         }
-        if (!std.fs.path.isAbsolute(resolved)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+        if (!fs.path.isAbsolute(resolved)) {
+            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
             allocator.free(resolved);
             cfg.disk_path = joined;
         } else {
@@ -442,8 +506,8 @@ pub fn resolveRelativePaths(
             allocator.free(path);
             resolved = expanded;
         }
-        if (!std.fs.path.isAbsolute(resolved)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+        if (!fs.path.isAbsolute(resolved)) {
+            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
             allocator.free(resolved);
             cfg.seed_path = joined;
         } else {
@@ -456,8 +520,8 @@ pub fn resolveRelativePaths(
             allocator.free(path);
             resolved = expanded;
         }
-        if (!std.fs.path.isAbsolute(resolved)) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+        if (!fs.path.isAbsolute(resolved)) {
+            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
             allocator.free(resolved);
             cfg.data_disk_path = joined;
         } else {
@@ -471,7 +535,7 @@ pub fn resolveRelativePaths(
                 needs_rewrite = true;
                 break;
             }
-            if (!std.fs.path.isAbsolute(root)) {
+            if (!fs.path.isAbsolute(root)) {
                 needs_rewrite = true;
                 break;
             }
@@ -484,8 +548,8 @@ pub fn resolveRelativePaths(
                     allocator.free(root);
                     resolved = expanded;
                 }
-                if (!std.fs.path.isAbsolute(resolved)) {
-                    const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+                if (!fs.path.isAbsolute(resolved)) {
+                    const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
                     allocator.free(resolved);
                     rewritten[i] = joined;
                 } else {
@@ -502,11 +566,25 @@ pub fn resolveRelativePaths(
                 allocator.free(mount_cfg.host_path);
                 mount_cfg.host_path = expanded;
             }
-            if (!std.fs.path.isAbsolute(mount_cfg.host_path)) {
-                const joined = try std.fs.path.join(allocator, &[_][]const u8{ base_dir, mount_cfg.host_path });
+            if (!fs.path.isAbsolute(mount_cfg.host_path)) {
+                const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, mount_cfg.host_path });
                 allocator.free(mount_cfg.host_path);
                 mount_cfg.host_path = joined;
             }
+        }
+    }
+    if (cfg.network_metadata_file) |path| {
+        var resolved = path;
+        if (try expandTildePath(allocator, path)) |expanded| {
+            allocator.free(path);
+            resolved = expanded;
+        }
+        if (!fs.path.isAbsolute(resolved)) {
+            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            allocator.free(resolved);
+            cfg.network_metadata_file = joined;
+        } else {
+            cfg.network_metadata_file = resolved;
         }
     }
 }
@@ -515,14 +593,92 @@ fn expandTildePath(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 
     if (path.len == 0 or path[0] != '~') return null;
     if (path.len > 1 and path[1] != '/') return null;
 
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch
-        std.process.getEnvVarOwned(allocator, "USERPROFILE") catch return null;
+    const home = env.getVarOwned(allocator, "HOME") catch
+        env.getVarOwned(allocator, "USERPROFILE") catch return null;
     if (path.len == 1) return home;
     if (path.len == 2) return home;
 
-    const joined = try std.fs.path.join(allocator, &[_][]const u8{ home, path[2..] });
+    const joined = try fs.path.join(allocator, &[_][]const u8{ home, path[2..] });
     allocator.free(home);
     return joined;
+}
+
+fn openNetworkAllowed() bool {
+    const value = env.getVarOwned(std.heap.page_allocator, "M80_ALLOW_OPEN_NETWORK") catch return false;
+    defer std.heap.page_allocator.free(value);
+    return env.flagEnabledValue(value);
+}
+
+fn isValidDomainLabel(label: []const u8) bool {
+    if (label.len == 0 or label.len > 63) return false;
+    if (label[0] == '-' or label[label.len - 1] == '-') return false;
+    for (label) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+fn isValidDomainAllowlistSpec(spec: []const u8) bool {
+    if (spec.len == 0) return false;
+
+    var host = spec;
+    if (std.mem.lastIndexOfScalar(u8, spec, ':')) |idx| {
+        if (idx == 0 or idx == spec.len - 1) return false;
+        const port = std.fmt.parseInt(u16, spec[idx + 1 ..], 10) catch return false;
+        if (port == 0) return false;
+        host = spec[0..idx];
+    }
+
+    if (host.len == 0 or host.len > 253) return false;
+    if (std.mem.startsWith(u8, host, "*.")) {
+        host = host[2..];
+        if (host.len == 0) return false;
+    }
+    if (host[0] == '.' or host[host.len - 1] == '.') return false;
+
+    var it = std.mem.splitScalar(u8, host, '.');
+    var labels: usize = 0;
+    while (it.next()) |label| {
+        if (!isValidDomainLabel(label)) return false;
+        labels += 1;
+    }
+    return labels > 0;
+}
+
+fn isValidIpv4(value: []const u8) bool {
+    var it = std.mem.splitScalar(u8, value, '.');
+    var octets: usize = 0;
+    while (it.next()) |part| {
+        if (part.len == 0) return false;
+        _ = std.fmt.parseInt(u8, part, 10) catch return false;
+        octets += 1;
+    }
+    return octets == 4;
+}
+
+fn isValidIpLiteral(value: []const u8) bool {
+    _ = std.Io.net.IpAddress.parse(value, 0) catch return false;
+    return true;
+}
+
+fn ipLiteralBitLen(value: []const u8) ?u8 {
+    const parsed = std.Io.net.IpAddress.parse(value, 0) catch return null;
+    return switch (parsed) {
+        .ip4 => 32,
+        .ip6 => 128,
+    };
+}
+
+fn isValidIpAllowlistSpec(spec: []const u8) bool {
+    if (spec.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, spec, '/')) |idx| {
+        if (idx == 0 or idx == spec.len - 1) return false;
+        const bits = ipLiteralBitLen(spec[0..idx]) orelse return false;
+        const prefix = std.fmt.parseInt(u8, spec[idx + 1 ..], 10) catch return false;
+        return prefix <= bits;
+    }
+    return isValidIpLiteral(spec);
 }
 
 /// Validates that required config fields are set for starting a VM.
@@ -539,28 +695,19 @@ pub fn validateStartConfig(cfg: *const VmConfig) StartConfigError!void {
     if (cfg.kernel_path == null) return error.MissingKernel;
     if (cfg.seed_path != null and cfg.disk_path == null) return error.SeedRequiresDisk;
     if (cfg.initrd_path == null and cfg.disk_path == null) return error.MissingRootfs;
+    if (cfg.network_mode == .open and !openNetworkAllowed()) return error.OpenNetworkNotAllowed;
+    for (cfg.network_allowed_domains) |entry| {
+        if (!isValidDomainAllowlistSpec(entry)) return error.InvalidNetworkAllowedDomainSpec;
+    }
+    for (cfg.network_allowed_ips) |entry| {
+        if (!isValidIpAllowlistSpec(entry)) return error.InvalidNetworkAllowedIpSpec;
+    }
     if (cfg.mounts.len > 0 and cfg.mount_roots.len == 0) return error.MountRootsRequired;
     if (cfg.mounts.len > 1) return error.MountCountUnsupported;
     for (cfg.mounts) |mount_cfg| {
         if (mount_cfg.mount_type != .virtio_fs) return error.MountTypeUnsupported;
     }
     if (cfg.virtio_fs_queues == 0 or cfg.virtio_fs_queues > 8) return error.VirtioFsQueuesInvalid;
-    for (cfg.allowed_domains) |domain_spec| {
-        if (domain_spec.len == 0) continue;
-        if (net_policy.parseDomainSpec(domain_spec) == null) return error.InvalidAllowedDomainSpec;
-    }
-    for (cfg.allowed_ips) |ip_spec| {
-        if (ip_spec.len == 0) continue;
-        if (net_policy.parseCidr(ip_spec) == null) return error.InvalidAllowedIpSpec;
-    }
-    if (cfg.network_mode == .open) {
-        const env_var = std.process.getEnvVarOwned(std.heap.page_allocator, "M80_ALLOW_OPEN_NETWORK") catch {
-            return error.OpenNetworkNotAllowed;
-        };
-        defer std.heap.page_allocator.free(env_var);
-        const allowed = std.mem.eql(u8, env_var, "1") or std.mem.eql(u8, env_var, "true");
-        if (!allowed) return error.OpenNetworkNotAllowed;
-    }
 }
 
 /// Validates that kernel/initrd files exist and are readable.
@@ -594,18 +741,21 @@ pub fn validateStartFiles(cfg: *const VmConfig) StartConfigError!void {
     if (cfg.data_disk_path) |path| {
         try checkReadableFile(path, .data_disk);
     }
+    if (cfg.network_metadata_file) |path| {
+        try checkReadableFile(path, .metadata);
+    }
 }
 
 /// Used to provide specific error messages for kernel vs initrd file issues.
-const StartFileKind = enum { kernel, initrd, disk, seed, data_disk };
+const StartFileKind = enum { kernel, initrd, disk, seed, data_disk, metadata };
 
 /// Checks if a file exists and is readable.
 /// Returns appropriate error based on file kind (kernel or initrd).
 fn checkReadableFile(path: []const u8, kind: StartFileKind) StartConfigError!void {
-    const file = if (std.fs.path.isAbsolute(path))
-        std.fs.openFileAbsolute(path, .{})
+    const file = if (fs.path.isAbsolute(path))
+        fs.openFileAbsolute(path, .{})
     else
-        std.fs.cwd().openFile(path, .{});
+        fs.cwd().openFile(path, .{});
 
     if (file) |f| {
         f.close();
@@ -617,6 +767,7 @@ fn checkReadableFile(path: []const u8, kind: StartFileKind) StartConfigError!voi
             .disk => error.DiskNotFound,
             .seed => error.SeedNotFound,
             .data_disk => error.DataDiskNotFound,
+            .metadata => error.MetadataFileNotFound,
         },
         else => return switch (kind) {
             .kernel => error.KernelUnreadable,
@@ -624,6 +775,7 @@ fn checkReadableFile(path: []const u8, kind: StartFileKind) StartConfigError!voi
             .disk => error.DiskUnreadable,
             .seed => error.SeedUnreadable,
             .data_disk => error.DataDiskUnreadable,
+            .metadata => error.MetadataFileUnreadable,
         },
     }
 }
@@ -667,6 +819,40 @@ fn parseCommaSeparated(allocator: std.mem.Allocator, value: []const u8) ![]const
     return result;
 }
 
+fn parseServiceList(allocator: std.mem.Allocator, value: []const u8) ![]const Service {
+    if (value.len == 0) return &[_]Service{};
+
+    const parts = try parseCommaSeparated(allocator, value);
+    defer {
+        for (parts) |part| allocator.free(part);
+        if (parts.len > 0) allocator.free(parts);
+    }
+
+    var services = try allocator.alloc(Service, parts.len);
+    var count: usize = 0;
+    errdefer allocator.free(services);
+
+    for (parts) |part| {
+        const service = Service.fromString(part) orelse return error.InvalidValue;
+        var exists = false;
+        for (services[0..count]) |existing| {
+            if (existing == service) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) continue;
+        services[count] = service;
+        count += 1;
+    }
+
+    if (count == services.len) return services;
+    const trimmed = try allocator.alloc(Service, count);
+    @memcpy(trimmed, services[0..count]);
+    allocator.free(services);
+    return trimmed;
+}
+
 /// Replaces a string list field with a new parsed comma-separated list.
 /// Properly frees the old list before replacing to prevent memory leaks.
 fn replaceStringList(
@@ -674,10 +860,30 @@ fn replaceStringList(
     target: *[]const []const u8,
     value: []const u8,
 ) !void {
-    // Free the previous list before replacing to avoid leaks.
+    freeStringList(allocator, target);
+    target.* = try parseCommaSeparated(allocator, value);
+}
+
+fn freeStringList(allocator: std.mem.Allocator, target: *[]const []const u8) void {
     for (target.*) |item| allocator.free(item);
     if (target.*.len > 0) allocator.free(target.*);
-    target.* = try parseCommaSeparated(allocator, value);
+    target.* = &[_][]const u8{};
+}
+
+fn replaceServiceList(
+    allocator: std.mem.Allocator,
+    target: *[]const Service,
+    value: []const u8,
+) !void {
+    if (target.*.len > 0) allocator.free(target.*);
+    target.* = try parseServiceList(allocator, value);
+}
+
+pub fn hasService(cfg: *const VmConfig, service: Service) bool {
+    for (cfg.network_services) |candidate| {
+        if (candidate == service) return true;
+    }
+    return false;
 }
 
 fn freeMountList(allocator: std.mem.Allocator, list: []mounts.MountConfig) void {
@@ -852,18 +1058,36 @@ fn applyConfigEntry(
         return;
     }
 
+    if (std.mem.eql(u8, key, "services") or
+        std.mem.eql(u8, key, "metadata_file") or
+        std.mem.eql(u8, key, "allowed_domains") or
+        std.mem.eql(u8, key, "allowed_ips"))
+    {
+        return error.RemovedNetworkKey;
+    }
+
     if (std.mem.eql(u8, key, "network_mode")) {
-        cfg.network_mode = net_policy.NetworkMode.fromString(value) orelse return error.InvalidValue;
+        cfg.network_mode = NetworkMode.fromString(value) orelse return error.InvalidValue;
         return;
     }
 
-    if (std.mem.eql(u8, key, "allowed_domains")) {
-        try replaceStringList(allocator, &cfg.allowed_domains, value);
+    if (std.mem.eql(u8, key, "network_services")) {
+        try replaceServiceList(allocator, &cfg.network_services, value);
         return;
     }
 
-    if (std.mem.eql(u8, key, "allowed_ips")) {
-        try replaceStringList(allocator, &cfg.allowed_ips, value);
+    if (std.mem.eql(u8, key, "network_metadata_file")) {
+        try setOptionalPath(allocator, &cfg.network_metadata_file, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "network_allowed_domains")) {
+        try replaceStringList(allocator, &cfg.network_allowed_domains, value);
+        return;
+    }
+
+    if (std.mem.eql(u8, key, "network_allowed_ips")) {
+        try replaceStringList(allocator, &cfg.network_allowed_ips, value);
         return;
     }
 
@@ -888,10 +1112,9 @@ fn applyConfigEntry(
 ///   - name, ephemeral, memory_mb, cpu_cores
 ///   - kernel_path, initrd_path, disk_path, seed_path, data_disk_path, disk_readonly, data_disk_readonly, kernel_cmdline (if set)
 ///   - virtio_fs_queues, virtio_fs_cache (if non-default)
-///   - network_mode
-///   - allowed_domains, allowed_ips (if non-empty, as comma-separated)
+///   - network_mode, network_services, network_metadata_file, network allowlists
 ///   - mount_roots, mounts (if non-empty, as comma-separated)
-pub fn writeConfigFile(dir: std.fs.Dir, cfg: VmConfig) !void {
+pub fn writeConfigFile(dir: fs.Dir, cfg: VmConfig) !void {
     var f = try dir.createFile("m80.conf", .{ .truncate = true });
     defer f.close();
 
@@ -934,21 +1157,30 @@ pub fn writeConfigFile(dir: std.fs.Dir, cfg: VmConfig) !void {
         try w.print("virtio_fs_cache={s}\n", .{cfg.virtio_fs_cache.toString()});
     }
     try w.print("network_mode={s}\n", .{cfg.network_mode.toString()});
-
-    if (cfg.allowed_domains.len > 0) {
-        try w.writeAll("allowed_domains=");
-        for (cfg.allowed_domains, 0..) |d, i| {
+    if (cfg.network_services.len > 0) {
+        try w.writeAll("network_services=");
+        for (cfg.network_services, 0..) |service, i| {
             if (i > 0) try w.writeByte(',');
-            try w.writeAll(d);
+            try w.writeAll(service.toString());
         }
         try w.writeByte('\n');
     }
-
-    if (cfg.allowed_ips.len > 0) {
-        try w.writeAll("allowed_ips=");
-        for (cfg.allowed_ips, 0..) |ip, i| {
+    if (cfg.network_metadata_file) |path| {
+        try w.print("network_metadata_file={s}\n", .{path});
+    }
+    if (cfg.network_allowed_domains.len > 0) {
+        try w.writeAll("network_allowed_domains=");
+        for (cfg.network_allowed_domains, 0..) |entry, i| {
             if (i > 0) try w.writeByte(',');
-            try w.writeAll(ip);
+            try w.writeAll(entry);
+        }
+        try w.writeByte('\n');
+    }
+    if (cfg.network_allowed_ips.len > 0) {
+        try w.writeAll("network_allowed_ips=");
+        for (cfg.network_allowed_ips, 0..) |entry, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll(entry);
         }
         try w.writeByte('\n');
     }
@@ -983,11 +1215,11 @@ pub fn writeConfigFile(dir: std.fs.Dir, cfg: VmConfig) !void {
 
 // Tests that config parsing correctly reads all fields from m80.conf.
 test "config: parse kernel/initrd paths and overrides" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
@@ -1025,11 +1257,11 @@ test "config: parse kernel/initrd paths and overrides" {
 }
 
 test "config: parse mounts and mount_roots" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
@@ -1055,11 +1287,11 @@ test "config: parse mounts and mount_roots" {
 }
 
 test "config: rejects malformed lines and bad values" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -1078,7 +1310,7 @@ test "config: rejects malformed lines and bad values" {
 }
 
 test "config: resolveRelativePaths joins vm dir" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1111,7 +1343,7 @@ test "config: resolveRelativePaths joins vm dir" {
 }
 
 test "config: validateStartConfig requires kernel and rootfs" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1137,11 +1369,11 @@ test "config: validateStartConfig requires kernel and rootfs" {
 }
 
 test "config: validateStartFiles checks existence" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -1167,13 +1399,13 @@ test "config: validateStartFiles checks existence" {
     const base = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
-    const kernel_path = try std.fs.path.join(allocator, &[_][]const u8{ base, "vmlinuz" });
+    const kernel_path = try fs.path.join(allocator, &[_][]const u8{ base, "vmlinuz" });
     defer allocator.free(kernel_path);
-    const initrd_path = try std.fs.path.join(allocator, &[_][]const u8{ base, "initrd.img" });
+    const initrd_path = try fs.path.join(allocator, &[_][]const u8{ base, "initrd.img" });
     defer allocator.free(initrd_path);
-    const disk_path = try std.fs.path.join(allocator, &[_][]const u8{ base, "rootfs.ext4" });
+    const disk_path = try fs.path.join(allocator, &[_][]const u8{ base, "rootfs.ext4" });
     defer allocator.free(disk_path);
-    const seed_path = try std.fs.path.join(allocator, &[_][]const u8{ base, "seed.iso" });
+    const seed_path = try fs.path.join(allocator, &[_][]const u8{ base, "seed.iso" });
     defer allocator.free(seed_path);
     var cfg = try defaultConfig(allocator, "testvm");
     defer freeConfig(allocator, &cfg);
@@ -1194,11 +1426,11 @@ test "config: validateStartFiles checks existence" {
 }
 
 test "config: empty path clears optional value" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
@@ -1213,30 +1445,28 @@ test "config: empty path clears optional value" {
     try std.testing.expect(cfg_mut.kernel_path == null);
 }
 
-test "config: allowed list parsing and overrides" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+test "config: removed legacy network keys fail with migration error" {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    const legacy = [_][]const u8{
+        "services=dns\n",
+        "metadata_file=meta.json\n",
+        "allowed_domains=example.com\n",
+        "allowed_ips=192.0.2.0/24\n",
+    };
 
-    var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
-    defer f.close();
-    try f.writeAll("allowed_domains=example.com, api.example.com\n" ++
-        "allowed_domains=second.com\n" ++
-        "allowed_ips=10.0.0.1 , 10.0.0.2\n");
+    for (legacy) |line| {
+        var tmp = fs.testingTmpDir(.{});
+        defer tmp.cleanup();
 
-    const cfg = try readConfigFile(allocator, tmp.dir, "fallback");
-    var cfg_mut = cfg;
-    defer freeConfig(allocator, &cfg_mut);
+        var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(line);
 
-    try std.testing.expectEqual(@as(usize, 1), cfg_mut.allowed_domains.len);
-    try std.testing.expectEqualStrings("second.com", cfg_mut.allowed_domains[0]);
-
-    try std.testing.expectEqual(@as(usize, 2), cfg_mut.allowed_ips.len);
-    try std.testing.expectEqualStrings("10.0.0.1", cfg_mut.allowed_ips[0]);
-    try std.testing.expectEqualStrings("10.0.0.2", cfg_mut.allowed_ips[1]);
+        try std.testing.expectError(error.RemovedNetworkKey, readConfigFile(allocator, tmp.dir, "fallback"));
+    }
 }
 
 test "config: parseBool accepts 0/1 and rejects other" {
@@ -1266,24 +1496,35 @@ test "config: parseCommaSeparated handles empty string" {
     try std.testing.expectEqual(@as(usize, 0), list.len);
 }
 
-test "config: writeConfigFile emits allowlists" {
+test "config: parse network services and metadata file" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
-    var cfg = try defaultConfig(allocator, "testvm");
-    defer freeConfig(allocator, &cfg);
+    var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });
+    defer f.close();
+    try f.writeAll("network_mode=allowlist\n" ++
+        "network_services=dns, metadata,dns\n" ++
+        "network_metadata_file=meta/runtime.json\n" ++
+        "network_allowed_domains=example.com,*.example.org:443\n" ++
+        "network_allowed_ips=192.0.2.10,198.51.100.0/24,2001:db8::10,2001:db8:abcd::/48\n");
 
-    cfg.allowed_domains = try parseCommaSeparated(allocator, "example.com,api.example.com");
-    cfg.allowed_ips = try parseCommaSeparated(allocator, "10.0.0.1,10.0.0.2");
+    const cfg = try readConfigFile(allocator, tmp.dir, "fallback");
+    var cfg_mut = cfg;
+    defer freeConfig(allocator, &cfg_mut);
 
-    try writeConfigFile(tmp.dir, cfg);
-    const data = try tmp.dir.readFileAlloc(allocator, "m80.conf", 64 * 1024);
-    defer allocator.free(data);
-
-    try std.testing.expect(std.mem.indexOf(u8, data, "allowed_domains=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, data, "allowed_ips=") != null);
+    try std.testing.expectEqual(NetworkMode.allowlist, cfg_mut.network_mode);
+    try std.testing.expectEqual(@as(usize, 2), cfg_mut.network_services.len);
+    try std.testing.expectEqual(Service.dns, cfg_mut.network_services[0]);
+    try std.testing.expectEqual(Service.metadata, cfg_mut.network_services[1]);
+    try std.testing.expectEqualStrings("meta/runtime.json", cfg_mut.network_metadata_file.?);
+    try std.testing.expectEqualStrings("example.com", cfg_mut.network_allowed_domains[0]);
+    try std.testing.expectEqualStrings("*.example.org:443", cfg_mut.network_allowed_domains[1]);
+    try std.testing.expectEqualStrings("192.0.2.10", cfg_mut.network_allowed_ips[0]);
+    try std.testing.expectEqualStrings("198.51.100.0/24", cfg_mut.network_allowed_ips[1]);
+    try std.testing.expectEqualStrings("2001:db8::10", cfg_mut.network_allowed_ips[2]);
+    try std.testing.expectEqualStrings("2001:db8:abcd::/48", cfg_mut.network_allowed_ips[3]);
 }
 
 test "config: validateStartConfig missing fields" {
@@ -1322,53 +1563,67 @@ test "config: validateStartConfig requires mount_roots for mounts" {
     try std.testing.expectError(error.MountRootsRequired, validateStartConfig(&cfg));
 }
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-
-test "config: validateStartConfig requires open network opt-in" {
+test "config: validateStartConfig validates network allowlists" {
     var cfg = try defaultConfig(std.testing.allocator, "test");
     defer freeConfig(std.testing.allocator, &cfg);
-    cfg.network_mode = .open;
-    cfg.kernel_path = try std.testing.allocator.dupe(u8, "kernel");
-    cfg.disk_path = try std.testing.allocator.dupe(u8, "disk");
+    cfg.kernel_path = try std.testing.allocator.dupe(u8, "/kernel");
+    cfg.initrd_path = try std.testing.allocator.dupe(u8, "/initrd.img");
+    cfg.network_mode = .allowlist;
 
-    _ = setenv("M80_ALLOW_OPEN_NETWORK", "0", 1);
-    try std.testing.expectError(error.OpenNetworkNotAllowed, validateStartConfig(&cfg));
-
-    _ = setenv("M80_ALLOW_OPEN_NETWORK", "1", 1);
-    defer _ = setenv("M80_ALLOW_OPEN_NETWORK", "0", 1);
+    cfg.network_allowed_domains = try parseCommaSeparated(std.testing.allocator, "example.com,*.example.org:443");
+    cfg.network_allowed_ips = try parseCommaSeparated(std.testing.allocator, "192.0.2.10,198.51.100.0/24,2001:db8::10,2001:db8:abcd::/48");
     try validateStartConfig(&cfg);
+
+    freeStringList(std.testing.allocator, &cfg.network_allowed_domains);
+    cfg.network_allowed_domains = try parseCommaSeparated(std.testing.allocator, "-bad.example");
+    try std.testing.expectError(error.InvalidNetworkAllowedDomainSpec, validateStartConfig(&cfg));
+
+    freeStringList(std.testing.allocator, &cfg.network_allowed_domains);
+    cfg.network_allowed_domains = &[_][]const u8{};
+    freeStringList(std.testing.allocator, &cfg.network_allowed_ips);
+    cfg.network_allowed_ips = try parseCommaSeparated(std.testing.allocator, "192.0.2.0/99");
+    try std.testing.expectError(error.InvalidNetworkAllowedIpSpec, validateStartConfig(&cfg));
+
+    freeStringList(std.testing.allocator, &cfg.network_allowed_ips);
+    cfg.network_allowed_ips = try parseCommaSeparated(std.testing.allocator, "2001:db8::/129");
+    try std.testing.expectError(error.InvalidNetworkAllowedIpSpec, validateStartConfig(&cfg));
 }
 
-test "config: validateStartConfig rejects invalid allowed domain spec" {
-    var cfg = try defaultConfig(std.testing.allocator, "test");
-    defer freeConfig(std.testing.allocator, &cfg);
-    cfg.kernel_path = try std.testing.allocator.dupe(u8, "kernel");
-    cfg.disk_path = try std.testing.allocator.dupe(u8, "disk");
-    var allowed_domains = try std.testing.allocator.alloc([]const u8, 1);
-    allowed_domains[0] = try std.testing.allocator.dupe(u8, "example.com:notaport");
-    cfg.allowed_domains = allowed_domains;
+test "config: writeConfigFile emits network keys" {
+    const allocator = std.testing.allocator;
 
-    try std.testing.expectError(error.InvalidAllowedDomainSpec, validateStartConfig(&cfg));
-}
+    var tmp = fs.testingTmpDir(.{});
+    defer tmp.cleanup();
 
-test "config: validateStartConfig rejects invalid allowed ip spec" {
-    var cfg = try defaultConfig(std.testing.allocator, "test");
-    defer freeConfig(std.testing.allocator, &cfg);
-    cfg.kernel_path = try std.testing.allocator.dupe(u8, "kernel");
-    cfg.disk_path = try std.testing.allocator.dupe(u8, "disk");
-    var allowed_ips = try std.testing.allocator.alloc([]const u8, 1);
-    allowed_ips[0] = try std.testing.allocator.dupe(u8, "10.0.0.0/99");
-    cfg.allowed_ips = allowed_ips;
+    var cfg = try defaultConfig(allocator, "testvm");
+    defer freeConfig(allocator, &cfg);
 
-    try std.testing.expectError(error.InvalidAllowedIpSpec, validateStartConfig(&cfg));
+    var services = try allocator.alloc(Service, 2);
+    services[0] = .dns;
+    services[1] = .metadata;
+    cfg.network_mode = .allowlist;
+    cfg.network_services = services;
+    cfg.network_metadata_file = try allocator.dupe(u8, "/tmp/meta.json");
+    cfg.network_allowed_domains = try parseCommaSeparated(allocator, "example.com,*.example.org:443");
+    cfg.network_allowed_ips = try parseCommaSeparated(allocator, "192.0.2.10,198.51.100.0/24,2001:db8::10");
+
+    try writeConfigFile(tmp.dir, cfg);
+    const data = try tmp.dir.readFileAlloc(allocator, "m80.conf", 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.indexOf(u8, data, "network_mode=allowlist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "network_services=dns,metadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "network_metadata_file=/tmp/meta.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "network_allowed_domains=example.com,*.example.org:443") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "network_allowed_ips=192.0.2.10,198.51.100.0/24,2001:db8::10") != null);
 }
 
 test "config: unknown keys are ignored" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     var f = try tmp.dir.createFile("m80.conf", .{ .truncate = true });

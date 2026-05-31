@@ -4,6 +4,7 @@ const core = @import("../core.zig");
 pub const Command = union(enum) {
     help,
     ps,
+    daemon: DaemonCommand,
     init: []const u8,
     delete: []const u8,
     start: []const u8,
@@ -14,6 +15,13 @@ pub const Command = union(enum) {
     snapshot: NamePath,
     restore: NamePath,
     clone: NamePair,
+};
+
+pub const DaemonCommand = enum {
+    run,
+    start,
+    stop,
+    status,
 };
 
 pub const NamePath = struct {
@@ -30,7 +38,9 @@ pub const ParseError = error{
     MissingName,
     MissingPath,
     MissingCloneName,
+    MissingDaemonCommand,
     UnknownCommand,
+    UnknownDaemonCommand,
     InvalidVmName,
     InvalidCloneName,
 };
@@ -43,6 +53,14 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         return .help;
     }
     if (std.mem.eql(u8, cmd, "ps")) return .ps;
+    if (std.mem.eql(u8, cmd, "daemon")) {
+        if (args.len < 3) return error.MissingDaemonCommand;
+        if (std.mem.eql(u8, args[2], "run")) return .{ .daemon = .run };
+        if (std.mem.eql(u8, args[2], "start")) return .{ .daemon = .start };
+        if (std.mem.eql(u8, args[2], "stop")) return .{ .daemon = .stop };
+        if (std.mem.eql(u8, args[2], "status")) return .{ .daemon = .status };
+        return error.UnknownDaemonCommand;
+    }
 
     if (args.len < 3) return error.MissingName;
     const name = args[2];
