@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs = @import("../../util/fs.zig");
 const core = @import("../../core.zig");
 const state = core.state;
 const errors = core.errors;
@@ -6,11 +7,21 @@ const Jailer = @import("../../jailer/jailer.zig").Jailer;
 const Vm = @import("../../vm/vm.zig").Vm;
 const runtime = @import("../runtime.zig");
 
+fn dieConfigReadError(err: anyerror) noreturn {
+    switch (err) {
+        error.RemovedNetworkKey => errors.die(
+            "legacy networking keys are no longer supported. Use `network_mode=locked_down|allowlist|open`, `network_services=dns,metadata`, `network_metadata_file=...`, `network_allowed_domains=...`, and `network_allowed_ips=...`.",
+            .{},
+        ),
+        else => errors.die("invalid config: {s}", .{@errorName(err)}),
+    }
+}
+
 pub fn runSnapshot(allocator: std.mem.Allocator, name: []const u8, snap_path: []const u8) !void {
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);
 
-    var cwd = std.fs.cwd();
+    var cwd = fs.cwd();
     var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
     defer vm_dir.close();
 
@@ -48,13 +59,11 @@ pub fn runRestore(allocator: std.mem.Allocator, name: []const u8, snap_path: []c
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);
 
-    var cwd = std.fs.cwd();
+    var cwd = fs.cwd();
     var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
     defer vm_dir.close();
 
-    const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| {
-        errors.die("invalid config: {s}", .{@errorName(e)});
-    };
+    const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| dieConfigReadError(e);
     var cfg_mut = cfg;
     defer core.config.freeConfig(allocator, &cfg_mut);
     try core.config.resolveRelativePaths(allocator, dir_path, &cfg_mut);

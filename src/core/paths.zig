@@ -27,7 +27,9 @@
 //! - No dots, slashes, or other special characters
 
 const std = @import("std");
+const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
+const env = @import("../util/env.zig");
 
 /// Error returned when a VM name fails validation.
 pub const VmNameError = error{InvalidName};
@@ -72,24 +74,24 @@ pub fn validateVmName(name: []const u8) bool {
 pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
     // windows: %localappdata%\m80
     if (builtin.os.tag == .windows) {
-        const local = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch null;
+        const local = env.getVarOwned(allocator, "LOCALAPPDATA") catch null;
         if (local) |base| {
             defer allocator.free(base);
-            return try std.fs.path.join(allocator, &[_][]const u8{ base, "m80" });
+            return try fs.path.join(allocator, &[_][]const u8{ base, "m80" });
         }
     }
 
     // fallback: $XDG_DATA_HOME/m80 or ~/.local/share/m80
-    const xdg = std.process.getEnvVarOwned(allocator, "XDG_DATA_HOME") catch null;
+    const xdg = env.getVarOwned(allocator, "XDG_DATA_HOME") catch null;
     if (xdg) |base| {
         defer allocator.free(base);
-        return try std.fs.path.join(allocator, &[_][]const u8{ base, "m80" });
+        return try fs.path.join(allocator, &[_][]const u8{ base, "m80" });
     }
 
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const home = env.getVarOwned(allocator, "HOME") catch null;
     if (home) |h| {
         defer allocator.free(h);
-        return try std.fs.path.join(allocator, &[_][]const u8{ h, ".local", "share", "m80" });
+        return try fs.path.join(allocator, &[_][]const u8{ h, ".local", "share", "m80" });
     }
 
     // last resort
@@ -113,7 +115,45 @@ pub fn vmDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     if (!validateVmName(name)) return error.InvalidName;
     const base = try dataDir(allocator);
     defer allocator.free(base);
-    return try std.fs.path.join(allocator, &[_][]const u8{ base, "vms", name });
+    return try fs.path.join(allocator, &[_][]const u8{ base, "vms", name });
+}
+
+pub fn daemonDir(allocator: std.mem.Allocator) ![]u8 {
+    const base = try dataDir(allocator);
+    defer allocator.free(base);
+    return try fs.path.join(allocator, &[_][]const u8{ base, "daemon" });
+}
+
+pub fn daemonControlSocketPath(allocator: std.mem.Allocator) ![]u8 {
+    const dir_path = try daemonDir(allocator);
+    defer allocator.free(dir_path);
+    return try fs.path.join(allocator, &[_][]const u8{ dir_path, "control.sock" });
+}
+
+pub fn daemonRegisterSocketPath(allocator: std.mem.Allocator) ![]u8 {
+    const dir_path = try daemonDir(allocator);
+    defer allocator.free(dir_path);
+    return try fs.path.join(allocator, &[_][]const u8{ dir_path, "register.sock" });
+}
+
+pub fn daemonGuestsDir(allocator: std.mem.Allocator) ![]u8 {
+    const dir_path = try daemonDir(allocator);
+    defer allocator.free(dir_path);
+    return try fs.path.join(allocator, &[_][]const u8{ dir_path, "guests" });
+}
+
+pub fn daemonGuestSocketPath(allocator: std.mem.Allocator, guest_cid: u32) ![]u8 {
+    const guests_dir = try daemonGuestsDir(allocator);
+    defer allocator.free(guests_dir);
+    const name = try std.fmt.allocPrint(allocator, "{d}.sock", .{guest_cid});
+    defer allocator.free(name);
+    return try fs.path.join(allocator, &[_][]const u8{ guests_dir, name });
+}
+
+pub fn daemonPidPath(allocator: std.mem.Allocator) ![]u8 {
+    const dir_path = try daemonDir(allocator);
+    defer allocator.free(dir_path);
+    return try fs.path.join(allocator, &[_][]const u8{ dir_path, "pid" });
 }
 
 // =============================================================================
@@ -149,4 +189,14 @@ test "paths: dataDir returns m80 path" {
 test "paths: vmDir rejects invalid name" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.InvalidName, vmDir(allocator, "../evil"));
+}
+
+test "paths: daemon guest socket path is cid scoped" {
+    const allocator = std.testing.allocator;
+    const path = try daemonGuestSocketPath(allocator, 42);
+    defer allocator.free(path);
+
+    try std.testing.expect(std.mem.indexOf(u8, path, "daemon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path, "guests") != null);
+    try std.testing.expect(std.mem.endsWith(u8, path, "42.sock"));
 }

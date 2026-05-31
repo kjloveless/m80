@@ -275,7 +275,7 @@ var log_err_count: usize = 0;
 
 pub fn log(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -291,11 +291,15 @@ pub fn log(
     }
 }
 
+fn nanoTimestamp() i128 {
+    return std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     @disableInstrumentation();
 
     if (builtin.cpu.arch.isSpirV()) {
@@ -308,18 +312,16 @@ pub fn main() !void {
     // Detect if we're in a TTY for fancy output
     const use_ansi = blk: {
         // Check stderr (fd 2) for TTY
-        if (@hasDecl(std.posix, "isatty")) {
-            break :blk std.posix.isatty(std.posix.STDERR_FILENO);
-        }
+        if (@hasDecl(std.c, "isatty")) break :blk std.c.isatty(std.posix.STDERR_FILENO) != 0;
         // Fallback: assume TTY on most systems
         break :blk true;
     };
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const test_filter = parseTestFilter(allocator);
+    const test_filter = parseTestFilter(init, allocator);
     defer if (test_filter) |value| allocator.free(value);
 
     var selected_tests = std.ArrayList(TestFn).empty;
@@ -348,7 +350,7 @@ pub fn main() !void {
     var leak_count: usize = 0;
     var total_time: u64 = 0;
 
-    const start_time = std.time.nanoTimestamp();
+    const start_time = nanoTimestamp();
 
     // Run all tests
     for (selected_tests.items, 0..) |test_fn, i| {
@@ -366,9 +368,9 @@ pub fn main() !void {
         }
 
         // Time the test
-        const test_start = std.time.nanoTimestamp();
+        const test_start = nanoTimestamp();
         const test_result = test_fn.func();
-        const test_end = std.time.nanoTimestamp();
+        const test_end = nanoTimestamp();
         const duration: u64 = @intCast(@max(0, test_end - test_start));
 
         // Check for leaks
@@ -418,16 +420,14 @@ pub fn main() !void {
                     if (use_ansi) Ansi.dim else "",
                     @errorName(err),
                 });
-                if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
-                }
+                _ = @errorReturnTrace();
             },
         }
 
         total_time += duration;
     }
 
-    const end_time = std.time.nanoTimestamp();
+    const end_time = nanoTimestamp();
     const wall_time: u64 = @intCast(@max(0, end_time - start_time));
 
     // Clear progress line
@@ -449,9 +449,10 @@ pub fn main() !void {
     }
 }
 
-fn parseTestFilter(allocator: std.mem.Allocator) ?[]u8 {
-    const args = std.process.argsAlloc(allocator) catch return null;
-    defer std.process.argsFree(allocator, args);
+fn parseTestFilter(init: std.process.Init, allocator: std.mem.Allocator) ?[]u8 {
+    var args_arena = std.heap.ArenaAllocator.init(allocator);
+    defer args_arena.deinit();
+    const args = init.minimal.args.toSlice(args_arena.allocator()) catch return null;
 
     var idx: usize = 0;
     while (idx < args.len) : (idx += 1) {

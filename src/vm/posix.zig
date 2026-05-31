@@ -29,8 +29,11 @@
 //! Non-Linux builds get stub implementations that return errors.
 
 const std = @import("std");
+const sync = @import("../util/sync.zig");
+const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const log = @import("../util/log.zig");
+const env = @import("../util/env.zig");
 const config = @import("../core/config.zig");
 const serial = @import("serial.zig");
 const boot = @import("boot.zig");
@@ -261,8 +264,8 @@ fn readLeU64(data: []const u8, size: usize) u64 {
 }
 
 fn envFlagPresent(allocator: std.mem.Allocator, name: []const u8) bool {
-    const env = std.process.getEnvVarOwned(allocator, name) catch return false;
-    allocator.free(env);
+    const value = env.getVarOwned(allocator, name) catch return false;
+    allocator.free(value);
     return true;
 }
 
@@ -381,7 +384,7 @@ fn runVcpuStub(index: u32) void {
             _ = handleIoExit(.{ .port = 0x3F8, .is_write = true, .size = 1, .rax = '>', .is_string = false, .has_rep = false });
             _ = handleIoExit(.{ .port = 0x3FD, .is_write = false, .size = 1, .rax = 0, .is_string = false, .has_rep = false });
         }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        sync.sleep(50 * std.time.ns_per_ms);
     }
     log.info("posix vcpu {d} stub run loop exited", .{index});
 }
@@ -400,7 +403,7 @@ fn prepareGuestImage(memory_size_bytes: u64) !void {
 }
 
 fn readGuestImageFile(path: []const u8, label: []const u8) !void {
-    var file = try std.fs.cwd().openFile(path, .{});
+    var file = try fs.cwd().openFile(path, .{});
     defer file.close();
     const stat = try file.stat();
     log.info("posix {s} size {d} bytes", .{ label, stat.size });
@@ -434,7 +437,7 @@ fn clearActiveGuestMemory() void {
 
 fn allocateGuestMemory(size_bytes: usize) ![]align(std.heap.page_size_min) u8 {
     if (builtin.os.tag == .linux) {
-        const prot: u32 = @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE);
+        const prot = std.posix.PROT{ .READ = true, .WRITE = true };
         const flags = std.posix.MAP{
             .TYPE = .PRIVATE,
             .ANONYMOUS = true,
@@ -473,7 +476,7 @@ fn mapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64, fd: std.posix.fd_t, f
 
     const host_addr = @intFromPtr(memory.ptr) + range.offset;
     const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
-    const prot: u32 = @intCast(if (writable) (std.posix.PROT.READ | std.posix.PROT.WRITE) else std.posix.PROT.READ);
+    const prot = if (writable) std.posix.PROT{ .READ = true, .WRITE = true } else std.posix.PROT{ .READ = true };
     const flags = std.posix.MAP{
         .TYPE = .SHARED,
         .FIXED = true,
@@ -489,7 +492,7 @@ fn unmapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64) !void {
 
     const host_addr = @intFromPtr(memory.ptr) + range.offset;
     const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
-    const prot: u32 = @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE);
+    const prot = std.posix.PROT{ .READ = true, .WRITE = true };
     const flags = std.posix.MAP{
         .TYPE = .PRIVATE,
         .FIXED = true,
@@ -510,7 +513,7 @@ fn buildDaxMapper(memory_size_bytes: u64) virtio_fs.DaxMapper {
 }
 
 fn loadFileToGuest(path: []const u8, guest_addr: u64, label: []const u8) !void {
-    var file = try std.fs.cwd().openFile(path, .{});
+    var file = try fs.cwd().openFile(path, .{});
     defer file.close();
     var buf: [4096]u8 = undefined;
     var offset: u64 = 0;
@@ -562,8 +565,8 @@ fn handleMmioExit(state: *KvmState) void {
         }
         return;
     }
-    if (addr >= virtio.virtio_net_mmio_base and addr < virtio.virtio_net_mmio_base + virtio.virtio_net_mmio_size) {
-        const result = virtio.handleVirtioNetMmio(addr - virtio.virtio_net_mmio_base, is_write, len, value);
+    if (addr >= virtio.virtio_vsock_mmio_base and addr < virtio.virtio_vsock_mmio_base + virtio.virtio_vsock_mmio_size) {
+        const result = virtio.handleVirtioVsockMmio(addr - virtio.virtio_vsock_mmio_base, is_write, len, value);
         if (!is_write) {
             std.mem.writeInt(u64, exit.mmio.data[0..8], result, .little);
         }
@@ -690,14 +693,14 @@ pub fn start(cfg: config.VmConfig) !void {
 
     if (builtin.os.tag == .linux) {
         const kvm_fd = try std.posix.open("/dev/kvm", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
-        errdefer std.posix.close(kvm_fd);
+        errdefer fs.closeFd(kvm_fd);
 
         const api_version = std.os.linux.ioctl(kvm_fd, linux_kvm.KVM_GET_API_VERSION, 0);
         if (api_version != linux_kvm.KVM_API_VERSION) return error.NotSupported;
 
         const vm_fd = std.os.linux.ioctl(kvm_fd, linux_kvm.KVM_CREATE_VM, 0);
         if (vm_fd < 0) return error.SystemError;
-        errdefer std.posix.close(@intCast(vm_fd));
+        errdefer fs.closeFd(@intCast(vm_fd));
 
         if (@hasDecl(linux_kvm, "KVM_SET_TSS_ADDR")) {
             _ = std.os.linux.ioctl(@intCast(vm_fd), linux_kvm.KVM_SET_TSS_ADDR, 0xfffbd000);
@@ -715,14 +718,14 @@ pub fn start(cfg: config.VmConfig) !void {
 
         const vcpu_fd = std.os.linux.ioctl(@intCast(vm_fd), linux_kvm.KVM_CREATE_VCPU, 0);
         if (vcpu_fd < 0) return error.SystemError;
-        errdefer std.posix.close(@intCast(vcpu_fd));
+        errdefer fs.closeFd(@intCast(vcpu_fd));
 
         const run_size = std.os.linux.ioctl(kvm_fd, linux_kvm.KVM_GET_VCPU_MMAP_SIZE, 0);
         if (run_size <= 0) return error.SystemError;
         const run = try std.posix.mmap(
             null,
             @intCast(run_size),
-            @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE),
+            std.posix.PROT{ .READ = true, .WRITE = true },
             std.posix.MAP{ .TYPE = .SHARED },
             @intCast(vcpu_fd),
             0,
@@ -765,7 +768,7 @@ pub fn start(cfg: config.VmConfig) !void {
     serial_io.setFromEnv(std.heap.page_allocator);
     active_vcpu_thread = try std.Thread.spawn(.{}, runVcpuStub, .{0});
 
-    std.Thread.sleep(std.time.ns_per_s);
+    sync.sleep(std.time.ns_per_s);
     log.info("vm running (stub)", .{});
 }
 
@@ -784,9 +787,9 @@ pub fn stop() !void {
     if (builtin.os.tag == .linux) {
         if (active_kvm) |state| {
             std.posix.munmap(state.run[0..state.run_size]);
-            std.posix.close(state.vcpu_fd);
-            std.posix.close(state.vm_fd);
-            std.posix.close(state.kvm_fd);
+            fs.closeFd(state.vcpu_fd);
+            fs.closeFd(state.vm_fd);
+            fs.closeFd(state.kvm_fd);
             active_kvm = null;
         }
     }
@@ -796,6 +799,10 @@ pub fn stop() !void {
     clearActiveGuestMemory();
     active_memory_is_mmap = false;
     active_memory_size = 0;
+}
+
+pub fn isVcpuRunning() bool {
+    return vcpu_running.load(.seq_cst);
 }
 
 // =============================================================================

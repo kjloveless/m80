@@ -17,7 +17,7 @@
 //! The VMM profile allows only what's needed for hypervisor operation:
 //! - `mach-lookup`: Access Mach services
 //! - File read for kernel/initrd images
-//! - Optional network access
+//! - Exact per-VM Unix socket access for the vsock relay
 //! - Explicitly denies `process-exec` and `process-fork`
 //!
 //! ## Platform Support
@@ -47,7 +47,8 @@ pub const VmmSandboxOptions = struct {
     data_disk_readonly: bool = false,
     mount_roots: []const []const u8 = &.{},
     shared_paths: []const SharedPath = &.{},
-    allow_network: bool = false,
+    guest_session_socket_path: ?[]const u8 = null,
+    console_socket_path: ?[]const u8 = null,
 };
 
 pub const SharedPath = struct {
@@ -72,7 +73,9 @@ pub const SandboxProfile = struct {
 
     pub fn buildVmmProfile(self: *SandboxProfile, options: VmmSandboxOptions) !void {
         self.profile.clearRetainingCapacity();
-        var w = self.profile.writer(self.allocator);
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.profile);
+        defer self.profile = aw.toArrayList();
+        const w = &aw.writer;
 
         // Sandbox profile is built as a declarative allowlist.
         try w.writeAll("(version 1)\n");
@@ -133,12 +136,17 @@ pub const SandboxProfile = struct {
         try w.writeAll("(allow file-read* (literal \"/dev/urandom\"))\n");
         try w.writeAll("(allow file-write* (literal \"/dev/null\"))\n");
 
-        if (options.allow_network) {
-            try w.writeAll("\n(allow network-outbound)\n");
-            try w.writeAll("(allow network-bind)\n");
-            try w.writeAll("(allow system-socket)\n");
-        } else {
-            try w.writeAll("\n(deny network*)\n");
+        if (options.guest_session_socket_path) |socket_path| {
+            try w.writeByte('\n');
+            try writePathRule(w, "file-read*", "literal", socket_path);
+            try writePathRule(w, "file-write*", "literal", socket_path);
+            try writePathRule(w, "network-outbound", "literal", socket_path);
+        }
+        if (options.console_socket_path) |socket_path| {
+            try w.writeByte('\n');
+            try writePathRule(w, "file-read*", "literal", socket_path);
+            try writePathRule(w, "file-write*", "literal", socket_path);
+            try writePathRule(w, "network-bind", "literal", socket_path);
         }
 
         try w.writeAll("\n(deny process-exec)\n");
@@ -248,7 +256,6 @@ test "sandbox_darwin: SandboxProfile buildVmmProfile" {
     try profile.buildVmmProfile(.{
         .vm_directory = "/Users/test/vms/myvm",
         .allow_write_vm_dir = true,
-        .allow_network = false,
     });
 
     const s = profile.getProfileString();
@@ -265,22 +272,39 @@ test "sandbox_darwin: network disabled" {
     var profile = SandboxProfile.init(allocator);
     defer profile.deinit();
 
-    try profile.buildVmmProfile(.{ .allow_network = false });
+    try profile.buildVmmProfile(.{});
 
     const s = profile.getProfileString();
-    try std.testing.expect(std.mem.indexOf(u8, s, "(deny network*)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow network-outbound)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow network-bind)") == null);
 }
 
-test "sandbox_darwin: network enabled" {
+test "sandbox_darwin: guest session socket allows only exact outbound networking" {
     const allocator = std.testing.allocator;
 
     var profile = SandboxProfile.init(allocator);
     defer profile.deinit();
 
-    try profile.buildVmmProfile(.{ .allow_network = true });
+    try profile.buildVmmProfile(.{ .guest_session_socket_path = "/tmp/m80/daemon/guests/16.sock" });
 
     const s = profile.getProfileString();
-    try std.testing.expect(std.mem.indexOf(u8, s, "(allow network-outbound)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow network-outbound (literal \"/tmp/m80/daemon/guests/16.sock\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow network-bind)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow system-socket)") == null);
+}
+
+test "sandbox_darwin: console socket allows only exact bind path" {
+    const allocator = std.testing.allocator;
+
+    var profile = SandboxProfile.init(allocator);
+    defer profile.deinit();
+
+    try profile.buildVmmProfile(.{ .console_socket_path = "/tmp/m80/vms/deb/console.sock" });
+
+    const s = profile.getProfileString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow network-bind (literal \"/tmp/m80/vms/deb/console.sock\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow network-outbound)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "(allow system-socket)") == null);
 }
 
 test "sandbox_darwin: profile with kernel path" {
@@ -493,7 +517,8 @@ test "sandbox_darwin: VmmSandboxOptions defaults" {
     try std.testing.expect(options.disk_path == null);
     try std.testing.expect(options.seed_path == null);
     try std.testing.expect(options.data_disk_path == null);
-    try std.testing.expect(!options.allow_network);
+    try std.testing.expect(options.guest_session_socket_path == null);
+    try std.testing.expect(options.console_socket_path == null);
     try std.testing.expect(!options.allow_write_vm_dir);
 }
 
@@ -513,13 +538,13 @@ test "sandbox_darwin: profile can be rebuilt" {
     var profile = SandboxProfile.init(allocator);
     defer profile.deinit();
 
-    try profile.buildVmmProfile(.{ .allow_network = false });
+    try profile.buildVmmProfile(.{});
     const s1 = profile.getProfileString();
-    try std.testing.expect(std.mem.indexOf(u8, s1, "(deny network*)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "(allow network-outbound)") == null);
 
-    try profile.buildVmmProfile(.{ .allow_network = true });
+    try profile.buildVmmProfile(.{ .guest_session_socket_path = "/tmp/m80/daemon/guests/17.sock" });
     const s2 = profile.getProfileString();
-    try std.testing.expect(std.mem.indexOf(u8, s2, "(allow network-outbound)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s2, "(allow network-outbound ") != null);
 }
 
 test "sandbox_darwin: vm_directory write permission" {

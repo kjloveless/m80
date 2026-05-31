@@ -23,6 +23,7 @@
 //! - Chosen node with bootargs (kernel cmdline)
 //! - GIC-v3 interrupt controller
 //! - Arch timer
+//! - PSCI firmware interface
 //! - PL011 UART serial port
 
 const std = @import("std");
@@ -63,9 +64,9 @@ pub const DtbConfig = struct {
     virtio_rng_base: ?u64 = null,
     virtio_rng_size: u64 = 0x1000,
     virtio_rng_irq: ?u32 = null,
-    virtio_net_base: ?u64 = null,
-    virtio_net_size: u64 = 0x1000,
-    virtio_net_irq: ?u32 = null,
+    virtio_vsock_base: ?u64 = null,
+    virtio_vsock_size: u64 = 0x1000,
+    virtio_vsock_irq: ?u32 = null,
     virtio_fs_base: ?u64 = null,
     virtio_fs_size: u64 = 0x1000,
     virtio_fs_irq: ?u32 = null,
@@ -153,6 +154,11 @@ pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
     );
     try endNode(allocator, &struct_buf);
 
+    try beginNode(allocator, &struct_buf, "psci");
+    try propStrings(allocator, &struct_buf, &strings, "compatible", &.{ "arm,psci-1.0", "arm,psci-0.2" });
+    try propString(allocator, &struct_buf, &strings, "method", "smc");
+    try endNode(allocator, &struct_buf);
+
     try beginNode(allocator, &struct_buf, "clk24m");
     try propString(allocator, &struct_buf, &strings, "compatible", "fixed-clock");
     try propU32(allocator, &struct_buf, &strings, "#clock-cells", 0);
@@ -225,13 +231,13 @@ pub fn buildVirtDtb(allocator: std.mem.Allocator, cfg: DtbConfig) ![]u8 {
         try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_rng_irq.?, 4);
         try endNode(allocator, &struct_buf);
     }
-    if (cfg.virtio_net_base != null and cfg.virtio_net_irq != null) {
+    if (cfg.virtio_vsock_base != null and cfg.virtio_vsock_irq != null) {
         var node_name_buf: [64]u8 = undefined;
-        const node_name = try std.fmt.bufPrint(&node_name_buf, "virtio_net@{x}", .{cfg.virtio_net_base.?});
+        const node_name = try std.fmt.bufPrint(&node_name_buf, "virtio_vsock@{x}", .{cfg.virtio_vsock_base.?});
         try beginNode(allocator, &struct_buf, node_name);
         try propString(allocator, &struct_buf, &strings, "compatible", "virtio,mmio");
-        try propReg64(allocator, &struct_buf, &strings, "reg", cfg.virtio_net_base.?, cfg.virtio_net_size);
-        try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_net_irq.?, 4);
+        try propReg64(allocator, &struct_buf, &strings, "reg", cfg.virtio_vsock_base.?, cfg.virtio_vsock_size);
+        try propU32x3(allocator, &struct_buf, &strings, "interrupts", 0, cfg.virtio_vsock_irq.?, 4);
         try endNode(allocator, &struct_buf);
     }
     if (cfg.virtio_fs_base != null and cfg.virtio_fs_irq != null) {
@@ -567,6 +573,23 @@ test "dtb: buildVirtDtb includes arch timer" {
     defer allocator.free(blob);
 
     try std.testing.expect(std.mem.indexOf(u8, blob, "arm,armv8-timer") != null);
+}
+
+test "dtb: buildVirtDtb includes psci smc interface" {
+    const allocator = std.testing.allocator;
+    const blob = try buildVirtDtb(allocator, .{
+        .memory_base = 0x40000000,
+        .memory_size = 256 * 1024 * 1024,
+        .cmdline = "console=ttyAMA0",
+        .gic_dist_base = 0x08000000,
+        .gic_redist_base = 0x080a0000,
+        .uart_irq = 33,
+    });
+    defer allocator.free(blob);
+
+    try std.testing.expect(std.mem.indexOf(u8, blob, "arm,psci-1.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blob, "arm,psci-0.2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blob, "smc") != null);
 }
 
 test "dtb: buildVirtDtb includes initrd range when provided" {

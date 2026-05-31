@@ -22,6 +22,8 @@
 //! Platform-specific state and logic live in the backend modules.
 
 const std = @import("std");
+const sync = @import("../util/sync.zig");
+const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const log = @import("../util/log.zig");
 const config = @import("../core/config.zig");
@@ -50,17 +52,17 @@ const FsSnapshotManifest = struct {
     }
 };
 
-fn openPathForRead(path: []const u8) !std.fs.File {
-    if (std.fs.path.isAbsolute(path)) {
-        return std.fs.openFileAbsolute(path, .{});
+fn openPathForRead(path: []const u8) !fs.File {
+    if (fs.path.isAbsolute(path)) {
+        return fs.openFileAbsolute(path, .{});
     }
-    return std.fs.cwd().openFile(path, .{});
+    return fs.cwd().openFile(path, .{});
 }
 
 fn copyFileContents(
     allocator: std.mem.Allocator,
-    src: *std.fs.File,
-    dst: *std.fs.File,
+    src: *fs.File,
+    dst: *fs.File,
 ) !u64 {
     var buf = try allocator.alloc(u8, 64 * 1024);
     defer allocator.free(buf);
@@ -79,7 +81,7 @@ fn copyFileContents(
 fn copyFileToDir(
     allocator: std.mem.Allocator,
     src_path: []const u8,
-    out_dir: std.fs.Dir,
+    out_dir: fs.Dir,
     out_name: []const u8,
 ) !u64 {
     var src = try openPathForRead(src_path);
@@ -90,7 +92,7 @@ fn copyFileToDir(
 }
 
 fn snapshotFileNameForSlot(allocator: std.mem.Allocator, slot: []const u8, src_path: []const u8) ![]u8 {
-    const base = std.fs.path.basename(src_path);
+    const base = fs.path.basename(src_path);
     const name = if (base.len == 0) "disk.img" else base;
     return std.fmt.allocPrint(allocator, "{s}-{s}", .{ slot, name });
 }
@@ -98,7 +100,7 @@ fn snapshotFileNameForSlot(allocator: std.mem.Allocator, slot: []const u8, src_p
 fn appendSnapshotEntry(
     allocator: std.mem.Allocator,
     entries: *std.ArrayList(FsSnapshotEntry),
-    out_dir: std.fs.Dir,
+    out_dir: fs.Dir,
     slot: []const u8,
     src_path: ?[]const u8,
 ) !void {
@@ -117,14 +119,14 @@ fn appendSnapshotEntry(
     });
 }
 
-fn writeFilesystemSnapshotManifest(out_dir: std.fs.Dir, entries: []const FsSnapshotEntry) !void {
+fn writeFilesystemSnapshotManifest(out_dir: fs.Dir, entries: []const FsSnapshotEntry) !void {
     var manifest = try out_dir.createFile("manifest.txt", .{ .truncate = true });
     defer manifest.close();
     var writer_buf: [1024]u8 = undefined;
     var file_writer = manifest.writer(&writer_buf);
     const w = &file_writer.interface;
     try w.writeAll("format=m80-fs-snapshot-v1\n");
-    try w.print("created_unix={d}\n", .{std.time.timestamp()});
+    try w.print("created_unix={d}\n", .{sync.timestamp()});
     for (entries) |entry| {
         try w.print("{s}={s}\n", .{ entry.slot, entry.snapshot_name });
         try w.print("{s}_source={s}\n", .{ entry.slot, entry.source_path });
@@ -140,7 +142,7 @@ fn manifestSlotRef(manifest: *FsSnapshotManifest, key: []const u8) ?*?[]u8 {
     return null;
 }
 
-fn parseFilesystemSnapshotManifest(allocator: std.mem.Allocator, snapshot_dir: std.fs.Dir) !FsSnapshotManifest {
+fn parseFilesystemSnapshotManifest(allocator: std.mem.Allocator, snapshot_dir: fs.Dir) !FsSnapshotManifest {
     var file = try snapshot_dir.openFile("manifest.txt", .{});
     defer file.close();
 
@@ -177,16 +179,16 @@ fn parseFilesystemSnapshotManifest(allocator: std.mem.Allocator, snapshot_dir: s
     return manifest;
 }
 
-fn openPathForWriteTruncate(path: []const u8) !std.fs.File {
-    if (std.fs.path.isAbsolute(path)) {
-        return std.fs.createFileAbsolute(path, .{ .truncate = true });
+fn openPathForWriteTruncate(path: []const u8) !fs.File {
+    if (fs.path.isAbsolute(path)) {
+        return fs.createFileAbsolute(path, .{ .truncate = true });
     }
-    return std.fs.cwd().createFile(path, .{ .truncate = true });
+    return fs.cwd().createFile(path, .{ .truncate = true });
 }
 
 fn copySnapshotEntryToPath(
     allocator: std.mem.Allocator,
-    snapshot_dir: std.fs.Dir,
+    snapshot_dir: fs.Dir,
     snapshot_name: []const u8,
     target_path: []const u8,
 ) !u64 {
@@ -199,7 +201,7 @@ fn copySnapshotEntryToPath(
 
 fn restoreSlotFromManifest(
     allocator: std.mem.Allocator,
-    snapshot_dir: std.fs.Dir,
+    snapshot_dir: fs.Dir,
     slot: []const u8,
     snapshot_name: ?[]const u8,
     target_path: ?[]const u8,
@@ -289,6 +291,16 @@ pub const Vm = struct {
         }
     }
 
+    pub fn isRunning(self: *Vm) bool {
+        _ = self;
+        return switch (@import("builtin").os.tag) {
+            .windows => windows.isVcpuRunning(),
+            .macos => hvf.isVcpuRunning(),
+            .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .haiku => posix.isVcpuRunning(),
+            else => false,
+        };
+    }
+
     /// Creates a filesystem snapshot of the VM block images while the VM is running.
     ///
     /// This copies configured block-image files (`disk_path`, `seed_path`,
@@ -296,7 +308,7 @@ pub const Vm = struct {
     /// Unlike full VM snapshots, this does not capture guest memory or vCPU state.
     pub fn snapshotFilesystem(self: *Vm, cfg: config.VmConfig, out_dir_path: []const u8) !void {
         const virtio = @import("virtio.zig");
-        var cwd = std.fs.cwd();
+        var cwd = fs.cwd();
 
         if (cfg.disk_path == null and cfg.seed_path == null and cfg.data_disk_path == null) {
             return error.NoDiskConfigured;
@@ -337,7 +349,7 @@ pub const Vm = struct {
     /// `manifest.txt` and per-slot image files.
     pub fn restoreFilesystem(self: *Vm, cfg: config.VmConfig, snapshot_dir_path: []const u8) !void {
         const virtio = @import("virtio.zig");
-        var cwd = std.fs.cwd();
+        var cwd = fs.cwd();
         var snapshot_dir = try cwd.openDir(snapshot_dir_path, .{});
         defer snapshot_dir.close();
 
@@ -548,12 +560,15 @@ pub const Vm = struct {
                             const state = std.mem.bytesAsValue(snap.VirtioRngSnapshotState, entry.data);
                             virtio.restoreVirtioRngState(state.*);
                         },
-                        .virtio_net => {
-                            if (entry.header.state_size != @sizeOf(snap.VirtioNetSnapshotState)) {
+                        .virtio_vsock => {
+                            if (entry.header.state_size != @sizeOf(snap.VirtioVsockSnapshotState)) {
                                 return error.CorruptedSnapshot;
                             }
-                            const state = std.mem.bytesAsValue(snap.VirtioNetSnapshotState, entry.data);
-                            virtio.restoreVirtioNetState(state.*);
+                            const state = std.mem.bytesAsValue(snap.VirtioVsockSnapshotState, entry.data);
+                            virtio.restoreVirtioVsockState(state.*);
+                        },
+                        .virtio_net => {
+                            return error.UnsupportedLegacySnapshot;
                         },
                         .virtio_fs => {
                             if (entry.header.state_size != @sizeOf(snap.VirtioFsSnapshotState)) {
@@ -614,7 +629,7 @@ pub const Vm = struct {
 // =============================================================================
 
 test "smoke: backend start/stop" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -643,7 +658,7 @@ test "vm: snapshot file name prefixes slot" {
 }
 
 test "vm: copyFileToDir copies source bytes" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     var src = try tmp.dir.createFile("src.img", .{ .truncate = true });
@@ -665,7 +680,7 @@ test "vm: copyFileToDir copies source bytes" {
 }
 
 test "vm: parseFilesystemSnapshotManifest reads slot mappings" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     var manifest = try tmp.dir.createFile("manifest.txt", .{ .truncate = true });

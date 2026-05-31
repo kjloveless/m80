@@ -1,6 +1,52 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const integration_env = "M80_TEST_INTEGRATION";
+
+pub fn getVarOwned(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        const environ: std.process.Environ = .{ .block = .global };
+        return environ.getAlloc(allocator, key);
+    }
+
+    if (comptime builtin.link_libc) {
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+        const value = std.c.getenv(key_z.ptr) orelse return error.EnvironmentVariableMissing;
+        return allocator.dupe(u8, std.mem.span(value));
+    }
+
+    if (builtin.is_test) {
+        return std.testing.environ.getAlloc(allocator, key);
+    }
+    return error.EnvironmentVariableMissing;
+}
+
+pub fn getMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    if (builtin.os.tag == .windows) {
+        const environ: std.process.Environ = .{ .block = .global };
+        return environ.createMap(allocator);
+    }
+
+    if (comptime builtin.link_libc) {
+        var map = std.process.Environ.Map.init(allocator);
+        errdefer map.deinit();
+
+        var index: usize = 0;
+        while (std.c.environ[index]) |entry_ptr| : (index += 1) {
+            const entry = std.mem.span(entry_ptr);
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+            if (eq == 0) continue;
+            try map.put(entry[0..eq], entry[eq + 1 ..]);
+        }
+        return map;
+    }
+
+    if (builtin.is_test) {
+        return std.testing.environ.createMap(allocator);
+    }
+    return std.process.Environ.Map.init(allocator);
+}
 
 pub fn flagEnabledValue(value: []const u8) bool {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -26,7 +72,7 @@ pub fn integrationEnabledValue(value: []const u8, key: []const u8) bool {
 }
 
 pub fn integrationEnabled(allocator: std.mem.Allocator, key: []const u8) bool {
-    const raw = std.process.getEnvVarOwned(allocator, integration_env) catch return false;
+    const raw = getVarOwned(allocator, integration_env) catch return false;
     defer allocator.free(raw);
     return integrationEnabledValue(raw, key);
 }

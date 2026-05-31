@@ -31,8 +31,12 @@
 //! to provide console output from the guest.
 
 const std = @import("std");
+const net = @import("../util/net.zig");
+const sync = @import("../util/sync.zig");
+const fs = @import("../util/fs.zig");
 const log = @import("../util/log.zig");
 const env_util = @import("../util/env.zig");
+const core = @import("../core.zig");
 const config = @import("../core/config.zig");
 const serial = @import("serial.zig");
 const boot = @import("boot.zig");
@@ -43,12 +47,15 @@ const guest_mem = @import("guest_mem.zig");
 const hvf_boot = @import("hvf/boot.zig");
 const hvf_vcpu = @import("hvf/vcpu.zig");
 const hvf_mmio = @import("hvf/mmio.zig");
-const hvf_net_console = @import("hvf/net_console.zig");
 const hvf_state = @import("hvf/state.zig");
 const virtio_fs = @import("../fs/virtio_fs.zig");
-const vmnet = @import("../net/vmnet.zig");
+const daemon_client = @import("../daemon/client.zig");
+const daemon_protocol = @import("../daemon/protocol.zig");
+const daemon_server = @import("../daemon/server.zig");
 const SerialIo = serial.SerialIo;
 const IoExit = serial.IoExit;
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // Memory size conversion constant
 const mb_to_bytes: u64 = 1024 * 1024;
@@ -1367,7 +1374,7 @@ pub fn pauseVcpu() !void {
             else => return error.NotSupported,
         };
         if (active) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        sync.sleep(10 * std.time.ns_per_ms);
     }
 
     switch (builtin.cpu.arch) {
@@ -1397,7 +1404,7 @@ pub fn pauseVcpu() !void {
     while (true) {
         if (vcpu_paused.load(.seq_cst)) return;
         if (!vcpu_running.load(.seq_cst)) return error.NotRunning;
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        sync.sleep(1 * std.time.ns_per_ms);
     }
 }
 
@@ -1406,7 +1413,7 @@ pub fn pauseVcpu() !void {
 pub fn resumeVcpu() void {
     vcpu_pause_requested.store(false, .seq_cst);
     while (vcpu_paused.load(.seq_cst)) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        sync.sleep(1 * std.time.ns_per_ms);
     }
 
     paused_vcpu_state_mutex.lock();
@@ -1460,7 +1467,7 @@ pub fn applyPausedVcpuState(state: snapshot.VcpuState) !void {
             if (err) |e| return e;
             return;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        sync.sleep(1 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
@@ -1512,7 +1519,7 @@ var paused_vcpu_state: ?snapshot.VcpuState = null;
 var paused_vcpu_state_error: ?anyerror = null;
 var restore_vcpu_state: ?snapshot.VcpuState = null;
 var restore_vcpu_state_error: ?anyerror = null;
-var paused_vcpu_state_mutex = std.Thread.Mutex{};
+var paused_vcpu_state_mutex = sync.Mutex{};
 
 /// Atomic flag: trigger simulated I/O for testing
 var simulate_io = std.atomic.Value(bool).init(false);
@@ -1525,11 +1532,6 @@ var console_socket_thread: ?std.Thread = null;
 var console_socket_running = std.atomic.Value(bool).init(false);
 var console_socket_path: ?[]u8 = null;
 var console_rx_logged = std.atomic.Value(bool).init(false);
-
-/// Active vmnet interface for networking (macOS only)
-var active_vmnet_iface: ?vmnet.VmnetInterface = null;
-var vmnet_rx_thread: ?std.Thread = null;
-var vmnet_rx_running = std.atomic.Value(bool).init(false);
 var arm64_unknown_sysreg_trap_count = std.atomic.Value(u32).init(0);
 
 /// GIC wiring for arm64 interrupt injection
@@ -1819,8 +1821,8 @@ fn buildHvfArmRegSet(state: boot.BootState, layout: ArmBootLayout) HvfArmRegSet 
 }
 
 fn envFlagPresent(allocator: std.mem.Allocator, name: []const u8) bool {
-    const env = std.process.getEnvVarOwned(allocator, name) catch return false;
-    allocator.free(env);
+    const value = env_util.getVarOwned(allocator, name) catch return false;
+    allocator.free(value);
     return true;
 }
 
@@ -1948,6 +1950,17 @@ fn setupGic() void {
 const arm64_ec_data_abort_lower: u64 = 0x24;
 const arm64_ec_data_abort_same: u64 = 0x25;
 const arm64_ec_sysreg: u64 = 0x18;
+const arm64_ec_hvc: u64 = 0x16;
+const arm64_ec_smc: u64 = 0x17;
+
+const psci_version_fn: u64 = 0x84000000;
+const psci_cpu_off_fn: u64 = 0x84000002;
+const psci_system_off_fn: u64 = 0x84000008;
+const psci_system_reset_fn: u64 = 0x84000009;
+const psci_features_fn: u64 = 0x8400000a;
+const psci_version_1_0: u64 = 0x00010000;
+const psci_ret_success: u64 = 0;
+const psci_ret_not_supported: u64 = std.math.maxInt(u64);
 
 const arm64_sysreg_op0_shift: u6 = 20;
 const arm64_sysreg_op2_shift: u6 = 17;
@@ -2141,14 +2154,14 @@ fn handlePl011Mmio(offset: u64, is_write: bool, size: usize, value: u64) u64 {
 }
 
 fn serialInputLoop() void {
-    const fd = std.fs.File.stdin().handle;
+    const fd = fs.File.stdin().handle;
     var buf: [256]u8 = undefined;
     while (serial_input_running.load(.seq_cst)) {
         var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
         const ready = std.posix.poll(fds[0..], 100) catch continue;
         if (ready <= 0) continue;
         if ((fds[0].revents & std.posix.POLL.IN) == 0) continue;
-        const n = std.posix.read(fd, buf[0..]) catch continue;
+        const n = fs.readFd(fd, buf[0..]) catch continue;
         if (n <= 0) continue;
         const chunk = buf[0..@intCast(n)];
         appendSerialInput(chunk);
@@ -2177,7 +2190,7 @@ fn stopSerialInputThread() void {
 
 fn shouldEnableSerialStdin(allocator: std.mem.Allocator) bool {
     if (envFlagPresent(allocator, "M80_SERIAL_STDIN")) return true;
-    return std.posix.isatty(std.fs.File.stdin().handle);
+    return fs.isTty(fs.File.stdin().handle);
 }
 
 fn appendSerialInput(bytes: []const u8) void {
@@ -2188,124 +2201,16 @@ fn appendSerialInput(bytes: []const u8) void {
     }
 }
 
-// =============================================================================
-// VMNET NETWORKING (macOS only)
-// =============================================================================
-
-/// TX callback: called by virtio-net when guest sends a packet.
-/// Writes the frame to the vmnet interface.
-fn vmnetTxCallback(frame: []const u8) void {
-    const iface = active_vmnet_iface orelse return;
-    if (frame.len == 0 or frame.len > iface.max_packet_size) return;
-
-    // Set up packet descriptor for vmnet_write
-    var iov: vmnet.c_types.iovec = .{
-        .iov_base = @ptrCast(@constCast(frame.ptr)),
-        .iov_len = frame.len,
-    };
-    var pkt: vmnet.c_types.vmpktdesc = .{
-        .vm_pkt_size = frame.len,
-        .vm_pkt_iov = &iov,
-        .vm_pkt_iovcnt = 1,
-        .vm_flags = 0,
-    };
-    var pktcnt: c_int = 1;
-    vmnet.writePackets(iface, @ptrCast(&pkt), &pktcnt) catch |e| {
-        log.debug("hvf vmnet tx write failed: {s}", .{@errorName(e)});
-        return;
-    };
-    if (pktcnt != 1) {
-        log.debug("hvf vmnet tx write incomplete: pktcnt={d}", .{pktcnt});
-    }
-}
-
-/// RX loop: polls vmnet for incoming packets and delivers to virtio-net.
-fn vmnetRxLoop() void {
-    const iface = active_vmnet_iface orelse return;
-    var pkt_buf: [2048]u8 = undefined;
-
-    var rx_poll_count: u64 = 0;
-    while (vmnet_rx_running.load(.seq_cst)) {
-        // Reset iov and pkt each iteration (vmnet_read may modify them)
-        var iov: vmnet.c_types.iovec = .{
-            .iov_base = &pkt_buf,
-            .iov_len = pkt_buf.len,
-        };
-        var pkt: vmnet.c_types.vmpktdesc = .{
-            .vm_pkt_size = pkt_buf.len,
-            .vm_pkt_iov = &iov,
-            .vm_pkt_iovcnt = 1,
-            .vm_flags = 0,
-        };
-        var pktcnt: c_int = 1;
-
-        vmnet.readPackets(iface, @ptrCast(&pkt), &pktcnt) catch |e| {
-            if (e != vmnet.VmnetError.StartFailed) {
-                log.debug("hvf vmnet rx failed: {s}", .{@errorName(e)});
-            }
-            std.Thread.sleep(1 * std.time.ns_per_ms); // 1ms backoff on error
-            continue;
-        };
-
-        rx_poll_count += 1;
-        if (rx_poll_count % 10000 == 0) {
-            log.debug("hvf vmnet rx poll count={d} pktcnt={d} size={d}", .{ rx_poll_count, pktcnt, pkt.vm_pkt_size });
-        }
-
-        if (pktcnt > 0 and pkt.vm_pkt_size > 0) {
-            const frame = pkt_buf[0..pkt.vm_pkt_size];
-            virtio.maybeCacheDnsResponse(frame);
-            virtio.virtioNetRxPacket(frame) catch |e| {
-                log.debug("hvf vmnet rx deliver failed: {s}", .{@errorName(e)});
-            };
-        } else {
-            // No packets available, sleep briefly to avoid busy-spinning
-            std.Thread.sleep(100 * std.time.ns_per_us); // 100µs
-        }
-    }
-}
-
-fn startVmnetRxThread() !void {
-    if (vmnet_rx_running.load(.seq_cst)) return;
-    vmnet_rx_running.store(true, .seq_cst);
-    vmnet_rx_thread = std.Thread.spawn(.{}, vmnetRxLoop, .{}) catch |e| {
-        vmnet_rx_running.store(false, .seq_cst);
-        log.warn("hvf vmnet rx thread failed: {s}", .{@errorName(e)});
-        return e;
-    };
-    log.info("hvf vmnet rx thread started", .{});
-}
-
-fn stopVmnetRxThread() void {
-    vmnet_rx_running.store(false, .seq_cst);
-    if (vmnet_rx_thread) |thread| {
-        thread.join();
-        vmnet_rx_thread = null;
-    }
-}
-
-fn stopVmnetInterface() void {
-    stopVmnetRxThread();
-    virtio.setNetTxCallback(null);
-    if (active_vmnet_iface) |iface| {
-        vmnet.stop(iface) catch |e| {
-            log.warn("hvf vmnet stop failed: {s}", .{@errorName(e)});
-        };
-        active_vmnet_iface = null;
-        log.info("hvf vmnet stopped", .{});
-    }
-}
-
 fn consoleSocketLoop() void {
     const path = console_socket_path orelse return;
     defer console_socket_running.store(false, .seq_cst);
-    std.fs.cwd().deleteFile(path) catch {};
+    fs.cwd().deleteFile(path) catch {};
 
-    const address = std.net.Address.initUnix(path) catch |e| {
+    const address = net.Address.initUnix(path) catch |e| {
         log.warn("hvf console socket invalid path: {s}", .{@errorName(e)});
         return;
     };
-    var server = std.net.Address.listen(address, .{
+    var server = net.Address.listen(address, .{
         .kernel_backlog = 4,
         .reuse_address = false,
         .force_nonblocking = true,
@@ -2313,16 +2218,19 @@ fn consoleSocketLoop() void {
         log.warn("hvf console socket listen failed: {s}", .{@errorName(e)});
         return;
     };
+    fs.chmodAt(std.posix.AT.FDCWD, path, 0o600, 0) catch |e| {
+        log.warn("hvf console socket chmod failed: {s}", .{@errorName(e)});
+    };
     defer {
         server.deinit();
-        std.fs.cwd().deleteFile(path) catch {};
+        fs.cwd().deleteFile(path) catch {};
     }
 
     var buf: [512]u8 = undefined;
     while (console_socket_running.load(.seq_cst)) {
         const conn = server.accept() catch |e| switch (e) {
             error.WouldBlock => {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                sync.sleep(50 * std.time.ns_per_ms);
                 continue;
             },
             else => {
@@ -2334,10 +2242,7 @@ fn consoleSocketLoop() void {
         console_rx_logged.store(false, .seq_cst);
 
         if (builtin.os.tag != .windows) {
-            const flags = std.posix.fcntl(conn.stream.handle, std.posix.F.GETFL, 0) catch 0;
-            var oflags = @as(std.posix.O, @bitCast(@as(u32, @intCast(flags))));
-            oflags.NONBLOCK = false;
-            _ = std.posix.fcntl(conn.stream.handle, std.posix.F.SETFL, @as(u32, @bitCast(oflags))) catch {};
+            net.setNonblocking(conn.stream.handle, false) catch {};
         }
 
         serial.setConsoleFd(conn.stream.handle);
@@ -2351,7 +2256,7 @@ fn consoleSocketLoop() void {
             const ready = std.posix.poll(fds[0..], 100) catch break;
             if (ready == 0) continue;
             if ((fds[0].revents & std.posix.POLL.IN) == 0) break;
-            const n = std.posix.read(conn.stream.handle, &buf) catch break;
+            const n = fs.readFd(conn.stream.handle, &buf) catch break;
             if (n <= 0) break;
             if (!console_rx_logged.swap(true, .seq_cst)) {
                 const queue = &virtio.virtio_console_state.queues[0];
@@ -2370,9 +2275,9 @@ fn consoleSocketLoop() void {
 
 fn startConsoleSocketServer(allocator: std.mem.Allocator) bool {
     if (console_socket_running.load(.seq_cst)) return true;
-    const env = std.process.getEnvVarOwned(allocator, "M80_CONSOLE_SOCKET") catch null;
-    if (env == null) return false;
-    console_socket_path = env;
+    const value = env_util.getVarOwned(allocator, "M80_CONSOLE_SOCKET") catch null;
+    if (value == null) return false;
+    console_socket_path = value;
     console_socket_running.store(true, .seq_cst);
     console_socket_thread = std.Thread.spawn(.{}, consoleSocketLoop, .{}) catch |e| {
         console_socket_running.store(false, .seq_cst);
@@ -2492,13 +2397,13 @@ fn handleArm64Mmio(vcpu: arm64_bindings.VcpuId, exit: HvfArmExitException) !bool
         try advanceArmPc(vcpu, il);
         return true;
     }
-    if (virtio.virtio_net_state.enabled and addr >= virtio.virtio_net_mmio_base and addr < virtio.virtio_net_mmio_base + virtio.virtio_net_mmio_size) {
-        const offset = addr - virtio.virtio_net_mmio_base;
+    if (virtio.virtio_vsock_state.enabled and addr >= virtio.virtio_vsock_mmio_base and addr < virtio.virtio_vsock_mmio_base + virtio.virtio_vsock_mmio_size) {
+        const offset = addr - virtio.virtio_vsock_mmio_base;
         if (is_write) {
             const value = try arm64ReadRegByIndex(vcpu, srt);
-            _ = virtio.handleVirtioNetMmio(offset, true, size, value);
+            _ = virtio.handleVirtioVsockMmio(offset, true, size, value);
         } else {
-            const value = virtio.handleVirtioNetMmio(offset, false, size, 0);
+            const value = virtio.handleVirtioVsockMmio(offset, false, size, 0);
             const mask: u64 = if (size >= 8)
                 std.math.maxInt(u64)
             else
@@ -2568,6 +2473,54 @@ fn handleArm64SysRegTrap(vcpu: arm64_bindings.VcpuId, exit: HvfArmExitException)
         );
     }
     return false;
+}
+
+fn psciFunctionSupported(function_id: u64) bool {
+    return switch (function_id) {
+        psci_version_fn,
+        psci_cpu_off_fn,
+        psci_system_off_fn,
+        psci_system_reset_fn,
+        psci_features_fn,
+        => true,
+        else => false,
+    };
+}
+
+fn handleArm64Psci(vcpu: arm64_bindings.VcpuId, exit: HvfArmExitException) !bool {
+    const esr = exit.syndrome;
+    const ec = (esr >> 26) & 0x3F;
+    if (ec != arm64_ec_hvc and ec != arm64_ec_smc) return false;
+
+    const il = (esr >> 25) & 0x1;
+    const function_id = try arm64_bindings.readReg(vcpu, .X0);
+    switch (function_id) {
+        psci_version_fn => {
+            try arm64_bindings.writeReg(vcpu, .X0, psci_version_1_0);
+            try advanceArmPc(vcpu, il);
+            return true;
+        },
+        psci_features_fn => {
+            const queried_function = try arm64_bindings.readReg(vcpu, .X1);
+            try arm64_bindings.writeReg(
+                vcpu,
+                .X0,
+                if (psciFunctionSupported(queried_function)) psci_ret_success else psci_ret_not_supported,
+            );
+            try advanceArmPc(vcpu, il);
+            return true;
+        },
+        psci_cpu_off_fn, psci_system_off_fn, psci_system_reset_fn => {
+            log.info("hvf arm64 PSCI shutdown function=0x{x}", .{function_id});
+            vcpu_running.store(false, .seq_cst);
+            return true;
+        },
+        else => {
+            try arm64_bindings.writeReg(vcpu, .X0, psci_ret_not_supported);
+            try advanceArmPc(vcpu, il);
+            return true;
+        },
+    }
 }
 
 fn decodeVmxIoExit(qualification: u64, rax: u64) IoExit {
@@ -2655,7 +2608,7 @@ fn maybePauseVcpu() void {
             restore_vcpu_state = null;
         }
         paused_vcpu_state_mutex.unlock();
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        sync.sleep(1 * std.time.ns_per_ms);
     }
 }
 
@@ -2683,7 +2636,7 @@ fn setForceStopTimeoutForTests(enabled: bool) void {
 
 fn maybeDelayVcpuThreadExitForTests() void {
     if (!shouldForceStopTimeoutForTests()) return;
-    std.Thread.sleep(forceStopTimeoutTestDelayNs());
+    sync.sleep(forceStopTimeoutTestDelayNs());
 }
 
 const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)
@@ -2704,7 +2657,7 @@ const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64
                 };
                 active_vcpu_id_arm = null;
             }
-            var last_heartbeat_ns: i128 = std.time.nanoTimestamp();
+            var last_heartbeat_ns: i128 = sync.nanoTimestamp();
 
             const regset = init.arm_regset orelse {
                 log.err("hvf arm64 missing regset", .{});
@@ -2729,7 +2682,7 @@ const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64
                     log.err("hvf arm64 vcpu run failed: {s}", .{@errorName(e)});
                     break;
                 };
-                const now_ns = std.time.nanoTimestamp();
+                const now_ns = sync.nanoTimestamp();
                 if (now_ns - last_heartbeat_ns > std.time.ns_per_s) {
                     last_heartbeat_ns = now_ns;
                     const pc = arm64_bindings.readReg(vcpu, .PC) catch 0;
@@ -2743,6 +2696,11 @@ const runVcpuArm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64
                         continue;
                     },
                     .Exception => {
+                        const handled_psci = handleArm64Psci(vcpu, exit.exception) catch |e| {
+                            log.err("hvf arm64 psci handler failed: {s}", .{@errorName(e)});
+                            break;
+                        };
+                        if (handled_psci) continue;
                         const handled_sysreg = handleArm64SysRegTrap(vcpu, exit.exception) catch |e| {
                             log.err("hvf arm64 sysreg handler failed: {s}", .{@errorName(e)});
                             break;
@@ -2890,7 +2848,7 @@ fn copyFileToGuest(
     const offset_base = guest_base - base;
     if (offset_base >= memory_size_bytes) return error.GuestImageTooLarge;
 
-    var file = try std.fs.cwd().openFile(path, .{});
+    var file = try fs.cwd().openFile(path, .{});
     defer file.close();
 
     const stat = try file.stat();
@@ -2932,7 +2890,7 @@ fn copyFileMmapToGuest(
     const mapped = std.posix.mmap(
         null,
         file_size,
-        std.posix.PROT.READ,
+        std.posix.PROT{ .READ = true },
         .{ .TYPE = .PRIVATE },
         fd,
         0,
@@ -2951,7 +2909,7 @@ fn copyFileMmapToGuest(
 
 /// Copy file to guest using chunked reads (fallback path).
 fn copyFileChunkedToGuest(
-    file: std.fs.File,
+    file: fs.File,
     file_size: usize,
     guest_base: u64,
     label: []const u8,
@@ -2979,7 +2937,7 @@ fn copyFileChunkedToGuest(
 fn copyGzipToGuest(
     memory_size_bytes: u64,
     guest_base: u64,
-    file: std.fs.File,
+    file: fs.File,
     label: []const u8,
 ) !u64 {
     const memory = active_guest_memory orelse return error.NoGuestMemory;
@@ -3035,7 +2993,7 @@ fn allocateGuestMemoryLazy(size_bytes: usize) ![]align(std.heap.page_size_min) u
     const ptr = std.posix.mmap(
         null,
         size_bytes,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        std.posix.PROT{ .READ = true, .WRITE = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -3101,7 +3059,7 @@ fn mapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64, fd: std.posix.fd_t, f
 
     const host_addr = @intFromPtr(memory.ptr) + range.offset;
     const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
-    const prot: u32 = @intCast(if (writable) (std.posix.PROT.READ | std.posix.PROT.WRITE) else std.posix.PROT.READ);
+    const prot = if (writable) std.posix.PROT{ .READ = true, .WRITE = true } else std.posix.PROT{ .READ = true };
     const flags = std.posix.MAP{
         .TYPE = .SHARED,
         .FIXED = true,
@@ -3122,7 +3080,7 @@ fn unmapDaxRegion(_: ?*anyopaque, guest_addr: u64, len: u64) !void {
 
     const host_addr = @intFromPtr(memory.ptr) + range.offset;
     const host_ptr: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(host_addr);
-    const prot: u32 = @intCast(std.posix.PROT.READ | std.posix.PROT.WRITE);
+    const prot = std.posix.PROT{ .READ = true, .WRITE = true };
     const flags = std.posix.MAP{
         .TYPE = .PRIVATE,
         .FIXED = true,
@@ -3198,7 +3156,7 @@ fn loadGuestKernel(memory_size_bytes: u64, kernel_path: ?[]const u8) !KernelLoad
         return .{};
     }
 
-    var file = try std.fs.cwd().openFile(kernel_path.?, .{});
+    var file = try fs.cwd().openFile(kernel_path.?, .{});
     defer file.close();
 
     var header: [256]u8 = undefined;
@@ -3247,7 +3205,7 @@ var boot_timing: struct {
 
 /// Returns the current timestamp in microseconds for boot timing.
 fn bootTimestamp() i64 {
-    return std.time.microTimestamp();
+    return @intCast(@divTrunc(sync.nanoTimestamp(), std.time.ns_per_us));
 }
 
 /// Logs boot timing breakdown at info level.
@@ -3393,17 +3351,16 @@ pub fn start(cfg: config.VmConfig) !void {
     const size_bytes_u64 = try std.math.mul(u64, cfg.memory_mb, mb_to_bytes);
     if (size_bytes_u64 > std.math.maxInt(usize)) return error.MemoryTooLarge;
     const size_bytes: usize = @intCast(size_bytes_u64);
-    var vmnet_started = false;
+    var vsock_started = false;
     var console_server_started = false;
     var serial_stdin_started = false;
 
     errdefer {
         if (serial_stdin_started) stopSerialInputThread();
         if (console_server_started) stopConsoleSocketServer(std.heap.page_allocator);
-        if (vmnet_started) {
-            stopVmnetInterface();
-            virtio.resetVirtioNetState();
-            vmnet_started = false;
+        if (vsock_started) {
+            virtio.resetVirtioVsockState();
+            vsock_started = false;
         }
     }
 
@@ -3477,53 +3434,13 @@ pub fn start(cfg: config.VmConfig) !void {
         log.err("hvf virtio-fs setup failed: {s}", .{@errorName(e)});
         return e;
     };
-    // Initialize networking if not locked down
-    if (cfg.network_mode != .locked_down and builtin.os.tag == .macos) {
-        // Start vmnet interface in shared mode
-        if (vmnet.startShared()) |vmnet_iface| {
-            active_vmnet_iface = vmnet_iface;
-            vmnet_started = true;
-            log.info(
-                "hvf vmnet started mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} mtu={d}",
-                .{
-                    vmnet_iface.mac[0], vmnet_iface.mac[1], vmnet_iface.mac[2],
-                    vmnet_iface.mac[3], vmnet_iface.mac[4], vmnet_iface.mac[5],
-                    vmnet_iface.mtu,
-                },
-            );
-            virtio.setupVirtioNet(true, vmnet_iface.mac);
-            virtio.initNetworkPolicy(cfg) catch |e| {
-                log.err("hvf network policy init failed: {s}", .{@errorName(e)});
-                stopVmnetInterface();
-                vmnet_started = false;
-                virtio.resetVirtioNetState();
-                return e;
-            };
-            virtio.setNetTxCallback(vmnetTxCallback);
-            startVmnetRxThread() catch |e| {
-                log.err("hvf vmnet rx thread start failed: {s}", .{@errorName(e)});
-                stopVmnetInterface();
-                vmnet_started = false;
-                virtio.resetVirtioNetState();
-                return e;
-            };
-        } else |e| {
-            if (e == vmnet.VmnetError.NotAuthorized or e == vmnet.VmnetError.StartFailed) {
-                log.warn(
-                    "hvf vmnet unavailable (check codesign.conf binary signing or use M80_TEST_VMNET_ENTITLEMENTS=1 for vmnet integration tests)",
-                    .{},
-                );
-            } else {
-                log.warn("hvf vmnet start failed: {s}", .{@errorName(e)});
-            }
-            log.warn("hvf networking disabled for this VM", .{});
-            virtio.setupVirtioNet(false, .{ 0, 0, 0, 0, 0, 0 });
-        }
-    } else if (cfg.network_mode != .locked_down) {
-        log.warn("hvf networking only supported on macOS; network_mode ignored", .{});
-        virtio.setupVirtioNet(false, .{ 0, 0, 0, 0, 0, 0 });
+    if (cfg.network_services.len > 0 or cfg.network_mode != .locked_down) {
+        const guest_cid = cfg.assigned_guest_cid orelse return error.MissingGuestCid;
+        const guest_socket_path = cfg.assigned_guest_session_socket_path orelse return error.MissingGuestSessionSocket;
+        try virtio.setupVirtioVsock(true, guest_cid, guest_socket_path);
+        vsock_started = true;
     } else {
-        virtio.setupVirtioNet(false, .{ 0, 0, 0, 0, 0, 0 });
+        try virtio.setupVirtioVsock(false, 0, null);
     }
     const cmdline = buildCmdlineWithMounts(std.heap.page_allocator, cfg) catch |e| {
         log.err("hvf buildCmdlineWithMounts failed: {s}", .{@errorName(e)});
@@ -3609,7 +3526,7 @@ pub fn start(cfg: config.VmConfig) !void {
         virtio.gic_virtio_blk_intid = .{ virtio_blk0_intid, virtio_blk1_intid, virtio_blk2_intid };
         var virtio_console_intid: ?u32 = null;
         var virtio_rng_intid: ?u32 = null;
-        var virtio_net_intid: ?u32 = null;
+        var virtio_vsock_intid: ?u32 = null;
         var virtio_fs_intid: ?u32 = null;
         if (enable_virtio_console) {
             const candidate = spi_base + pl011_irq_offset + 1;
@@ -3627,13 +3544,13 @@ pub fn start(cfg: config.VmConfig) !void {
             virtio_rng_intid = candidate;
             virtio.gic_virtio_rng_intid = candidate;
         }
-        if (virtio.virtio_net_state.enabled) {
+        if (virtio.virtio_vsock_state.enabled) {
             const candidate = spi_base + pl011_irq_offset + 4;
             if (spi_count != 0 and candidate >= spi_base + spi_count) {
-                log.warn("hvf virtio-net irq out of range base={d} count={d}", .{ spi_base, spi_count });
+                log.warn("hvf virtio-vsock irq out of range base={d} count={d}", .{ spi_base, spi_count });
             }
-            virtio_net_intid = candidate;
-            virtio.gic_virtio_net_intid = candidate;
+            virtio_vsock_intid = candidate;
+            virtio.gic_virtio_vsock_intid = candidate;
         }
         if (virtio.virtio_fs_state.enabled) {
             const candidate = spi_base + pl011_irq_offset + 5;
@@ -3649,7 +3566,7 @@ pub fn start(cfg: config.VmConfig) !void {
         const virtio_blk2_irq = if (virtio_blk2_intid) |intid| intid - spi_base else null;
         const virtio_console_irq = if (virtio_console_intid) |intid| intid - spi_base else null;
         const virtio_rng_irq = if (virtio_rng_intid) |intid| intid - spi_base else null;
-        const virtio_net_irq = if (virtio_net_intid) |intid| intid - spi_base else null;
+        const virtio_vsock_irq = if (virtio_vsock_intid) |intid| intid - spi_base else null;
         const virtio_fs_irq = if (virtio_fs_intid) |intid| intid - spi_base else null;
         const initrd_start = if (initrd_size > 0) guestInitrdBase() else null;
         const initrd_end = if (initrd_size > 0) guestInitrdBase() + initrd_size else null;
@@ -3683,10 +3600,10 @@ pub fn start(cfg: config.VmConfig) !void {
                 .{ virtio.virtio_rng_mmio_base, virtio_rng_irq.?, virtio_rng_intid.? },
             );
         }
-        if (virtio.virtio_net_state.enabled and virtio_net_irq != null) {
+        if (virtio.virtio_vsock_state.enabled and virtio_vsock_irq != null) {
             log.info(
-                "hvf virtio-net dtb base=0x{x} irq={d} intid={d}",
-                .{ virtio.virtio_net_mmio_base, virtio_net_irq.?, virtio_net_intid.? },
+                "hvf virtio-vsock dtb base=0x{x} irq={d} intid={d}",
+                .{ virtio.virtio_vsock_mmio_base, virtio_vsock_irq.?, virtio_vsock_intid.? },
             );
         }
         if (virtio.virtio_fs_state.enabled and virtio_fs_irq != null) {
@@ -3714,8 +3631,8 @@ pub fn start(cfg: config.VmConfig) !void {
             .virtio_console_irq = virtio_console_irq,
             .virtio_rng_base = if (virtio.virtio_rng_state.enabled) virtio.virtio_rng_mmio_base else null,
             .virtio_rng_irq = virtio_rng_irq,
-            .virtio_net_base = if (virtio.virtio_net_state.enabled) virtio.virtio_net_mmio_base else null,
-            .virtio_net_irq = virtio_net_irq,
+            .virtio_vsock_base = if (virtio.virtio_vsock_state.enabled) virtio.virtio_vsock_mmio_base else null,
+            .virtio_vsock_irq = virtio_vsock_irq,
             .virtio_fs_base = if (virtio.virtio_fs_state.enabled) virtio.virtio_fs_mmio_base else null,
             .virtio_fs_irq = virtio_fs_irq,
         }) catch |e| {
@@ -3834,7 +3751,7 @@ pub fn stop() !void {
         var attempts: usize = 0;
         while (!vcpu_thread_exited.load(.seq_cst) and attempts < vcpu_stop_signal_attempts) : (attempts += 1) {
             signalActiveVcpuForStop();
-            std.Thread.sleep(vcpu_stop_signal_interval_ns);
+            sync.sleep(vcpu_stop_signal_interval_ns);
         }
 
         if (!vcpu_thread_exited.load(.seq_cst)) {
@@ -3861,8 +3778,7 @@ pub fn stop() !void {
     virtio.resetVirtioBlkState();
     virtio.resetVirtioConsoleState();
     virtio.resetVirtioRngState();
-    stopVmnetInterface();
-    virtio.resetVirtioNetState();
+    virtio.resetVirtioVsockState();
     virtio.resetVirtioFsState();
 
     if (active_guest_memory) |buffer| {
@@ -3891,7 +3807,7 @@ pub fn stop() !void {
     gic_uart_intid = null;
     virtio.gic_virtio_blk_intid = .{ null, null, null };
     virtio.gic_virtio_console_intid = null;
-    virtio.gic_virtio_net_intid = null;
+    virtio.gic_virtio_vsock_intid = null;
     virtio.gic_virtio_fs_intid = null;
     gic_layout = null;
     arm64_unknown_sysreg_trap_count.store(0, .seq_cst);
@@ -3902,55 +3818,10 @@ pub fn stop() !void {
 // =============================================================================
 // Tests use the "hvf:" prefix to identify which module they belong to.
 
-fn encodeDnsName(out: []u8, domain: []const u8) !usize {
-    return hvf_net_console.encodeDnsName(out, domain);
-}
-
-fn buildDnsQueryFrame(frame: []u8, domain: []const u8, dst_ip: [4]u8) ![]const u8 {
-    return hvf_net_console.buildDnsQueryFrame(frame, domain, dst_ip);
-}
-
 fn prepareSerialCapture(out_path: []const u8) !void {
-    var out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+    var out_file = try fs.cwd().createFile(out_path, .{ .truncate = true });
     out_file.close();
-    try serial.setCapturePath(std.testing.allocator, out_path);
-}
-
-fn runVirtioNetTxFrame(frame: []const u8, desc_addr: u64, avail_addr: u64, used_addr: u64, data_addr: u64) !void {
-    virtio.virtio_net_state.queues[1] = .{
-        .num = 8,
-        .ready = true,
-        .desc_addr = desc_addr,
-        .avail_addr = avail_addr,
-        .used_addr = used_addr,
-        .last_avail_idx = 0,
-        .used_idx = 0,
-    };
-
-    const payload_len = virtio.virtio_net_hdr_len + frame.len;
-    var payload = try std.testing.allocator.alloc(u8, payload_len);
-    defer std.testing.allocator.free(payload);
-    @memset(payload[0..virtio.virtio_net_hdr_len], 0);
-    @memcpy(payload[virtio.virtio_net_hdr_len..], frame);
-    try writeGuestBytes(data_addr, payload);
-
-    const desc = virtio.VirtqDesc{
-        .addr = data_addr,
-        .len = @intCast(payload_len),
-        .flags = 0,
-        .next = 0,
-    };
-    var desc_buf: [@sizeOf(virtio.VirtqDesc)]u8 = undefined;
-    std.mem.copyForwards(u8, &desc_buf, std.mem.asBytes(&desc));
-    try writeGuestBytes(desc_addr, desc_buf[0..]);
-
-    try writeGuestU16(avail_addr, 0);
-    try writeGuestU16(avail_addr + 2, 1);
-    try writeGuestU16(avail_addr + 4, 0);
-    try writeGuestU16(used_addr + 2, 0);
-
-    try virtio.processVirtioNetTxQueue();
-    try std.testing.expectEqual(@as(u16, 1), try readGuestU16(used_addr + 2));
+    try serial.setCapturePath(std.heap.page_allocator, out_path);
 }
 
 fn expectLifecycleReset() !void {
@@ -3963,11 +3834,50 @@ fn expectLifecycleReset() !void {
     try std.testing.expect(!serial_input_running.load(.seq_cst));
     try std.testing.expect(console_socket_thread == null);
     try std.testing.expect(!console_socket_running.load(.seq_cst));
-    try std.testing.expect(active_vmnet_iface == null);
-    try std.testing.expect(vmnet_rx_thread == null);
-    try std.testing.expect(!vmnet_rx_running.load(.seq_cst));
     try std.testing.expect(active_memory_size == 0);
-    try std.testing.expect(virtio.net_policy_state == null);
+}
+
+fn setTestEnvVar(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    const key_z = try allocator.dupeZ(u8, key);
+    defer allocator.free(key_z);
+    const value_z = try allocator.dupeZ(u8, value);
+    defer allocator.free(value_z);
+    _ = setenv(key_z, value_z, 1);
+}
+
+fn runDaemonThread() void {
+    daemon_server.run(std.heap.page_allocator) catch |e| {
+        if (e != error.NotSupported) {
+            log.warn("hvf test daemon thread exited: {s}", .{@errorName(e)});
+        }
+    };
+}
+
+fn daemonControlRpc(allocator: std.mem.Allocator, method: []const u8) ![]u8 {
+    const control_path = try core.paths.daemonControlSocketPath(allocator);
+    defer allocator.free(control_path);
+    const request = try daemon_protocol.buildRequestPayload(allocator, 1, method, struct {}{});
+    defer allocator.free(request);
+    return try daemon_protocol.rpc(allocator, control_path, request);
+}
+
+fn waitForDaemonReady(allocator: std.mem.Allocator) bool {
+    var attempt: usize = 0;
+    while (attempt < 50) : (attempt += 1) {
+        const response = daemonControlRpc(allocator, "daemon.ping") catch {
+            sync.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+        defer allocator.free(response);
+        if (std.mem.indexOf(u8, response, "\"ok\":true") != null) return true;
+        sync.sleep(100 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+fn stopTestDaemon(allocator: std.mem.Allocator) void {
+    const response = daemonControlRpc(allocator, "daemon.shutdown") catch return;
+    allocator.free(response);
 }
 
 test "smoke: hvf backend start/stop" {
@@ -3982,6 +3892,30 @@ test "smoke: hvf backend start/stop" {
     };
     try stop();
     try expectLifecycleReset();
+}
+
+test "hvf: network services enable virtio-vsock with assigned guest cid" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const cfg = try config.defaultConfig(std.testing.allocator, "svc");
+    var cfg_mut = cfg;
+    defer config.freeConfig(std.testing.allocator, &cfg_mut);
+
+    var services = try std.testing.allocator.alloc(config.Service, 2);
+    services[0] = .dns;
+    services[1] = .metadata;
+    cfg_mut.network_services = services;
+    cfg_mut.assigned_guest_cid = 16;
+    cfg_mut.assigned_guest_session_socket_path = try std.testing.allocator.dupe(u8, "/tmp/m80-test-guest.sock");
+
+    start(cfg_mut) catch |e| switch (e) {
+        error.NotImplemented => return error.SkipZigTest,
+        error.HvfFailure => return,
+        else => return e,
+    };
+    defer stop() catch {};
+
+    try std.testing.expect(virtio.virtio_vsock_state.enabled);
+    try std.testing.expectEqual(@as(u64, 16), virtio.virtio_vsock_state.guest_cid);
 }
 
 test "hvf: handleIoExit reads serial data" {
@@ -4231,12 +4165,12 @@ test "hvf: loadGuestInitrd skips when unset" {
 }
 
 test "hvf: loadGuestKernel inflates gzip image" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const gz_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "kernel.gz" });
+    const gz_path = try fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "kernel.gz" });
     defer std.testing.allocator.free(gz_path);
 
     const gzip_data = [_]u8{
@@ -4245,7 +4179,7 @@ test "hvf: loadGuestKernel inflates gzip image" {
         0x4a, 0x1c, 0xe9, 0x02, 0x04, 0x00, 0x00, 0x00,
     };
 
-    var file = try std.fs.cwd().createFile(gz_path, .{ .truncate = true });
+    var file = try fs.cwd().createFile(gz_path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(&gzip_data);
 
@@ -4267,18 +4201,18 @@ test "hvf: loadGuestKernel inflates gzip image" {
 test "hvf: copyFileToGuest uses mmap on supported platforms" {
     if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const file_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "test.bin" });
+    const file_path = try fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "test.bin" });
     defer std.testing.allocator.free(file_path);
 
     // Create a test file with known content
     const test_data = "TESTDATA1234567890ABCDEF";
     {
-        var file = try std.fs.cwd().createFile(file_path, .{ .truncate = true });
+        var file = try fs.cwd().createFile(file_path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(test_data);
     }
@@ -4302,18 +4236,18 @@ test "hvf: copyFileToGuest uses mmap on supported platforms" {
 test "hvf: copyFileMmapToGuest loads file correctly" {
     if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const file_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "mmap_test.bin" });
+    const file_path = try fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "mmap_test.bin" });
     defer std.testing.allocator.free(file_path);
 
     // Create test file with larger content to verify mmap works
     const test_content = "MMAP_TEST_CONTENT_" ** 100;
     {
-        var file = try std.fs.cwd().createFile(file_path, .{ .truncate = true });
+        var file = try fs.cwd().createFile(file_path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(test_content);
     }
@@ -4326,7 +4260,7 @@ test "hvf: copyFileMmapToGuest loads file correctly" {
     setActiveGuestMemory(guest_memory);
     defer clearActiveGuestMemory();
 
-    var file = try std.fs.cwd().openFile(file_path, .{});
+    var file = try fs.cwd().openFile(file_path, .{});
     defer file.close();
 
     const guest_base = guestKernelBase();
@@ -4436,25 +4370,25 @@ test "hvf: gic parameters available on macos arm64" {
 test "smoke: hvf arm64 boot emits serial output" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
-    const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    const kernel = env_util.getVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
     defer if (kernel) |k| std.testing.allocator.free(k);
-    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    const initrd = env_util.getVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
     defer if (initrd) |i| std.testing.allocator.free(i);
-    const disk = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
+    const disk = env_util.getVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
     defer if (disk) |d| std.testing.allocator.free(d);
-    const expect = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_SERIAL_EXPECT") catch null;
+    const expect = env_util.getVarOwned(std.testing.allocator, "M80_TEST_SERIAL_EXPECT") catch null;
     defer if (expect) |e| std.testing.allocator.free(e);
     if (kernel == null or (initrd == null and disk == null)) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
+    const out_path = try fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
     defer std.testing.allocator.free(out_path);
 
     try prepareSerialCapture(out_path);
-    defer serial.clearCapture(std.testing.allocator);
+    defer serial.clearCapture(std.heap.page_allocator);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
@@ -4475,7 +4409,7 @@ test "smoke: hvf arm64 boot emits serial output" {
             "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 loglevel=8 m80.smoke=1",
     );
 
-    const start_ms: i64 = std.time.milliTimestamp();
+    const start_ms: i64 = sync.milliTimestamp();
     var started = false;
     start(cfg_mut) catch |e| {
         std.debug.print("hvf arm64 boot test start failed: {s}\n", .{@errorName(e)});
@@ -4487,7 +4421,7 @@ test "smoke: hvf arm64 boot emits serial output" {
     var found = false;
     var tries: usize = 0;
     while (tries < 20) : (tries += 1) {
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        sync.sleep(500 * std.time.ns_per_ms);
         if (expect) |needle| {
             if (serial.captureContains(needle)) {
                 found = true;
@@ -4500,7 +4434,7 @@ test "smoke: hvf arm64 boot emits serial output" {
     }
 
     if (found) {
-        const elapsed_ms = std.time.milliTimestamp() - start_ms;
+        const elapsed_ms = sync.milliTimestamp() - start_ms;
         std.debug.print("hvf boot host_ms={d}\n", .{elapsed_ms});
     }
 
@@ -4519,31 +4453,31 @@ test "smoke: hvf arm64 repeated start-stop reliability" {
 
     if (!env_util.integrationEnabled(std.testing.allocator, "hvf-reliability")) return error.SkipZigTest;
 
-    const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    const kernel = env_util.getVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
     defer if (kernel) |k| std.testing.allocator.free(k);
-    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    const initrd = env_util.getVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
     defer if (initrd) |i| std.testing.allocator.free(i);
-    const disk = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
+    const disk = env_util.getVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
     defer if (disk) |d| std.testing.allocator.free(d);
-    const expect = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_SERIAL_EXPECT") catch null;
+    const expect = env_util.getVarOwned(std.testing.allocator, "M80_TEST_SERIAL_EXPECT") catch null;
     defer if (expect) |e| std.testing.allocator.free(e);
     if (kernel == null or (initrd == null and disk == null)) return error.SkipZigTest;
 
     var reliability_cycles: usize = 20;
-    const cycles_text = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_HVF_RELIABILITY_CYCLES") catch null;
+    const cycles_text = env_util.getVarOwned(std.testing.allocator, "M80_TEST_HVF_RELIABILITY_CYCLES") catch null;
     defer if (cycles_text) |v| std.testing.allocator.free(v);
     if (cycles_text) |value| {
         reliability_cycles = std.fmt.parseInt(usize, value, 10) catch 20;
         if (reliability_cycles == 0) reliability_cycles = 20;
     }
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
+    const out_path = try fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
     defer std.testing.allocator.free(out_path);
-    defer serial.clearCapture(std.testing.allocator);
+    defer serial.clearCapture(std.heap.page_allocator);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
@@ -4578,7 +4512,7 @@ test "smoke: hvf arm64 repeated start-stop reliability" {
         var found = false;
         var tries: usize = 0;
         while (tries < 20) : (tries += 1) {
-            std.Thread.sleep(500 * std.time.ns_per_ms);
+            sync.sleep(500 * std.time.ns_per_ms);
             if (expect) |needle| {
                 if (serial.captureContains(needle)) {
                     found = true;
@@ -4604,21 +4538,21 @@ test "smoke: hvf arm64 repeated start-stop reliability" {
 test "smoke: hvf arm64 initramfs shell accepts uptime" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
-    const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    const kernel = env_util.getVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
     defer if (kernel) |k| std.testing.allocator.free(k);
-    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    const initrd = env_util.getVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
     defer if (initrd) |i| std.testing.allocator.free(i);
     if (kernel == null or initrd == null) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
+    const out_path = try fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
     defer std.testing.allocator.free(out_path);
 
     try prepareSerialCapture(out_path);
-    defer serial.clearCapture(std.testing.allocator);
+    defer serial.clearCapture(std.heap.page_allocator);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
@@ -4642,7 +4576,7 @@ test "smoke: hvf arm64 initramfs shell accepts uptime" {
     var saw_uptime = false;
     var tries: usize = 0;
     while (tries < 40) : (tries += 1) {
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        sync.sleep(500 * std.time.ns_per_ms);
         if (!sent_uptime and serial.captureContains("m80 initramfs: boot ok")) {
             appendSerialInput("uptime\n");
             sent_uptime = true;
@@ -4664,74 +4598,135 @@ test "smoke: hvf arm64 initramfs shell accepts uptime" {
     try std.testing.expect(saw_uptime);
 }
 
-test "hvf: integration allowlist blocks non-whitelisted dns egress via virtio-net tx path" {
+test "smoke: hvf arm64 services resolve metadata over vsock" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
-    if (!env_util.integrationEnabled(std.testing.allocator, "hvf-net")) return error.SkipZigTest;
+    const kernel = env_util.getVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    defer if (kernel) |k| std.testing.allocator.free(k);
+    const initrd = env_util.getVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    defer if (initrd) |i| std.testing.allocator.free(i);
+    if (kernel == null or initrd == null) return error.SkipZigTest;
+
+    var tmp = fs.testingTmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const xdg_path = try fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "xdg" });
+    defer std.testing.allocator.free(xdg_path);
+    try fs.cwd().makePath(xdg_path);
+    try setTestEnvVar(std.testing.allocator, "XDG_DATA_HOME", xdg_path);
+
+    const out_path = try fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial-services.log" });
+    defer std.testing.allocator.free(out_path);
+
+    const daemon_thread = try std.Thread.spawn(.{}, runDaemonThread, .{});
+    defer daemon_thread.join();
+    defer stopTestDaemon(std.testing.allocator);
+    if (!waitForDaemonReady(std.testing.allocator)) return error.SkipZigTest;
+
+    try prepareSerialCapture(out_path);
+    defer serial.clearCapture(std.heap.page_allocator);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
     defer config.freeConfig(std.testing.allocator, &cfg_mut);
-    cfg_mut.kernel_path = null;
-    cfg_mut.network_mode = .allowlist;
-    var allowed_domains = try std.testing.allocator.alloc([]const u8, 1);
-    allowed_domains[0] = try std.testing.allocator.dupe(u8, "allowed.test");
-    cfg_mut.allowed_domains = allowed_domains;
+    cfg_mut.kernel_path = try std.testing.allocator.dupe(u8, kernel.?);
+    cfg_mut.initrd_path = try std.testing.allocator.dupe(u8, initrd.?);
+    cfg_mut.kernel_cmdline = try std.testing.allocator.dupe(
+        u8,
+        "earlycon=pl011,0x09000000 keep_bootcon console=ttyAMA0 console=hvc0 loglevel=8 m80.smoke=1",
+    );
+    const services = try std.testing.allocator.alloc(config.Service, 2);
+    services[0] = .dns;
+    services[1] = .metadata;
+    cfg_mut.network_services = services;
+
+    var registration = try daemon_client.registerVm(std.testing.allocator, .{
+        .name = cfg_mut.name,
+        .memory_mb = cfg_mut.memory_mb,
+        .cpu_cores = cfg_mut.cpu_cores,
+        .network_mode = cfg_mut.network_mode,
+        .network_services = cfg_mut.network_services,
+        .network_metadata_file = null,
+        .network_allowed_domains = cfg_mut.network_allowed_domains,
+        .network_allowed_ips = cfg_mut.network_allowed_ips,
+        .mounts = &[_][]const u8{},
+        .started_at = 1,
+    });
+    defer registration.deinit(std.testing.allocator);
+    defer daemon_client.unregisterVm(std.testing.allocator, cfg_mut.name) catch {};
+    cfg_mut.assigned_guest_cid = registration.guest_cid;
+    cfg_mut.assigned_guest_session_socket_path = try std.testing.allocator.dupe(u8, registration.guest_socket_path);
 
     var started = false;
-    start(cfg_mut) catch |e| switch (e) {
-        error.NotImplemented => return error.SkipZigTest,
-        error.HvfFailure => return error.SkipZigTest,
-        else => return e,
+    start(cfg_mut) catch |e| {
+        std.debug.print("hvf services smoke start failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
     };
     started = true;
     defer if (started) stop() catch {};
 
-    // vmnet entitlement/codesign may be absent on many hosts; only assert behavior
-    // when virtio-net was actually enabled by the platform path.
-    if (!virtio.virtio_net_state.enabled or active_vmnet_iface == null) return error.SkipZigTest;
+    var sent_resolve_metadata = false;
+    var saw_resolve_metadata = false;
+    var sent_http_runtime = false;
+    var saw_http_runtime = false;
+    var sent_resolve_external = false;
+    var saw_resolve_external = false;
+    var tries: usize = 0;
+    while (tries < 60) : (tries += 1) {
+        sync.sleep(500 * std.time.ns_per_ms);
 
-    const TxProbe = struct {
-        var sent = std.atomic.Value(usize).init(0);
-        fn callback(_: []const u8) void {
-            _ = sent.fetchAdd(1, .seq_cst);
+        if (serial.captureContains("m80 initramfs: shell console open") and !sent_resolve_metadata) {
+            appendSerialInput("resolve metadata.m80.internal\n");
+            sent_resolve_metadata = true;
         }
-    };
-    TxProbe.sent.store(0, .seq_cst);
-    virtio.setNetTxCallback(TxProbe.callback);
 
-    if (active_memory_size < 0x8000) return error.SkipZigTest;
-    const scratch_base = guestMemoryBase() + @as(u64, active_memory_size) - 0x8000;
-    const desc_addr = scratch_base;
-    const avail_addr = scratch_base + 0x1000;
-    const used_addr = scratch_base + 0x2000;
-    const data_addr = scratch_base + 0x3000;
+        if (!saw_resolve_metadata and serial.captureContains("m80 shell: resolve metadata.m80.internal -> 127.0.0.1")) {
+            saw_resolve_metadata = true;
+        }
+        if (saw_resolve_metadata and !sent_http_runtime) {
+            appendSerialInput("http-get /v1/runtime\n");
+            sent_http_runtime = true;
+        }
+        if (!saw_http_runtime and serial.captureContains("\"guest_cid\":16") and serial.captureContains("\"name\":\"test\"")) {
+            saw_http_runtime = true;
+        }
+        if (saw_http_runtime and !sent_resolve_external) {
+            appendSerialInput("resolve example.com\n");
+            sent_resolve_external = true;
+        }
+        if (!saw_resolve_external and serial.captureContains("m80 shell: resolve example.com -> NXDOMAIN")) {
+            saw_resolve_external = true;
+            break;
+        }
 
-    var blocked_buf: [256]u8 = undefined;
-    const blocked_frame = try buildDnsQueryFrame(blocked_buf[0..], "blocked.test", .{ 8, 8, 8, 8 });
-    try runVirtioNetTxFrame(blocked_frame, desc_addr, avail_addr, used_addr, data_addr);
-    try std.testing.expectEqual(@as(usize, 0), TxProbe.sent.load(.seq_cst));
-    try std.testing.expect(!virtio.outboundFrameAllowed(blocked_frame));
+        if (!saw_resolve_metadata and sent_resolve_metadata and tries % 8 == 7) {
+            appendSerialInput("resolve metadata.m80.internal\n");
+        }
+        if (saw_resolve_metadata and !saw_http_runtime and sent_http_runtime and tries % 8 == 7) {
+            appendSerialInput("http-get /v1/runtime\n");
+        }
+        if (saw_http_runtime and !saw_resolve_external and sent_resolve_external and tries % 8 == 7) {
+            appendSerialInput("resolve example.com\n");
+        }
+    }
 
-    var allowed_buf: [256]u8 = undefined;
-    const allowed_frame = try buildDnsQueryFrame(allowed_buf[0..], "allowed.test", .{ 8, 8, 8, 8 });
-    try runVirtioNetTxFrame(allowed_frame, desc_addr, avail_addr, used_addr, data_addr);
-    try std.testing.expectEqual(@as(usize, 1), TxProbe.sent.load(.seq_cst));
-    try std.testing.expect(virtio.outboundFrameAllowed(allowed_frame));
-
-    try stop();
-    started = false;
-    try expectLifecycleReset();
+    try std.testing.expect(sent_resolve_metadata);
+    try std.testing.expect(saw_resolve_metadata);
+    try std.testing.expect(sent_http_runtime);
+    try std.testing.expect(saw_http_runtime);
+    try std.testing.expect(sent_resolve_external);
+    try std.testing.expect(saw_resolve_external);
 }
 
 test "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
-    const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    const kernel = env_util.getVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
     defer if (kernel) |k| std.testing.allocator.free(k);
-    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    const initrd = env_util.getVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
     defer if (initrd) |i| std.testing.allocator.free(i);
-    const disk = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
+    const disk = env_util.getVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
     defer if (disk) |d| std.testing.allocator.free(d);
     if (kernel == null or (initrd == null and disk == null)) return error.SkipZigTest;
 
@@ -4767,7 +4762,7 @@ test "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled" 
 
     try std.testing.expectError(error.VcpuStopTimeout, stop());
 
-    std.Thread.sleep(forceStopTimeoutTestDelayNs() + (100 * std.time.ns_per_ms));
+    sync.sleep(forceStopTimeoutTestDelayNs() + (100 * std.time.ns_per_ms));
     try stop();
     started = false;
     try expectLifecycleReset();
@@ -4776,29 +4771,29 @@ test "hvf: stop returns VcpuStopTimeout when forced vcpu-exit delay is enabled" 
 test "hvf: arm64 boot accepts console input" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
-    const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    const kernel = env_util.getVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
     defer if (kernel) |k| std.testing.allocator.free(k);
-    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    const initrd = env_util.getVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
     defer if (initrd) |i| std.testing.allocator.free(i);
-    const disk = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
+    const disk = env_util.getVarOwned(std.testing.allocator, "M80_TEST_DISK") catch null;
     defer if (disk) |d| std.testing.allocator.free(d);
-    const cmdline = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_CMDLINE") catch null;
+    const cmdline = env_util.getVarOwned(std.testing.allocator, "M80_TEST_CMDLINE") catch null;
     defer if (cmdline) |c| std.testing.allocator.free(c);
-    const login_input = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_LOGIN_INPUT") catch null;
+    const login_input = env_util.getVarOwned(std.testing.allocator, "M80_TEST_LOGIN_INPUT") catch null;
     defer if (login_input) |v| std.testing.allocator.free(v);
-    const login_expect = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_LOGIN_EXPECT") catch null;
+    const login_expect = env_util.getVarOwned(std.testing.allocator, "M80_TEST_LOGIN_EXPECT") catch null;
     defer if (login_expect) |v| std.testing.allocator.free(v);
     if (kernel == null or disk == null or login_input == null or login_expect == null) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const out_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
+    const out_path = try fs.path.join(std.testing.allocator, &[_][]const u8{ dir_path, "serial.log" });
     defer std.testing.allocator.free(out_path);
 
     try prepareSerialCapture(out_path);
-    defer serial.clearCapture(std.testing.allocator);
+    defer serial.clearCapture(std.heap.page_allocator);
 
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
@@ -4834,7 +4829,7 @@ test "hvf: arm64 boot accepts console input" {
         "";
     var tries: usize = 0;
     while (tries < 40) : (tries += 1) {
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        sync.sleep(500 * std.time.ns_per_ms);
         if (!saw_prompt and serial.captureContains("login:")) {
             saw_prompt = true;
             appendSerialInput(user_line);

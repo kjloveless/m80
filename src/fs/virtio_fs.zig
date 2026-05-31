@@ -31,6 +31,8 @@
 //! - Invalid handles return EBADF (-9)
 
 const std = @import("std");
+const sync = @import("../util/sync.zig");
+const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const c = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("unistd.h");
@@ -226,7 +228,7 @@ const StatView = struct {
     gid: u32,
     rdev: u32,
     blksize: u32,
-    kind: std.fs.File.Kind,
+    kind: fs.File.Kind,
 };
 
 pub const FuseAttrOut = extern struct {
@@ -533,8 +535,8 @@ pub const NodeHandle = struct {
 pub const FileHandle = struct {
     handle_id: u64,
     node: *NodeHandle,
-    file: ?std.fs.File,
-    dir: ?std.fs.Dir,
+    file: ?fs.File,
+    dir: ?fs.Dir,
     open_flags: u32,
     append: bool,
     sync_mode: SyncMode,
@@ -573,7 +575,7 @@ pub const VirtioFsDevice = struct {
             .handles = std.AutoHashMap(u64, FileHandle).init(allocator),
             .features = VirtioFeatures.VIRTIO_F_VERSION_1,
             .dax = null,
-            .dax_mappings = .{},
+            .dax_mappings = .empty,
         };
     }
 
@@ -752,7 +754,7 @@ pub const VirtioFsDevice = struct {
         };
         const parent_path = parent_node.path;
 
-        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_path, name }) catch {
+        const full_path = fs.path.join(self.allocator, &[_][]const u8{ parent_path, name }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
@@ -807,18 +809,18 @@ pub const VirtioFsDevice = struct {
         }
 
         const link_buf = response_buf[out_header_size..];
-        const link = std.posix.readlink(node.path, link_buf) catch |e| switch (e) {
+        const link_len = fs.readLink(node.path, link_buf) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
-            error.InvalidUtf8 => return self.sendError(header, -5, response_buf),
+            error.NotLink => return self.sendError(header, -22, response_buf),
             else => return self.sendError(header, -5, response_buf),
         };
 
         const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + link.len);
+        out_header.len = @intCast(out_header_size + link_len);
         out_header.@"error" = 0;
         out_header.unique = header.unique;
-        return out_header_size + link.len;
+        return out_header_size + link_len;
     }
 
     fn handleSymlink(
@@ -840,7 +842,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -1, response_buf);
         }
 
-        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, name.slice }) catch {
+        const full_path = fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, name.slice }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
@@ -849,7 +851,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        std.posix.symlink(target.slice, full_path) catch |e| switch (e) {
+        fs.symLink(target.slice, full_path) catch |e| switch (e) {
             error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.FileNotFound => return self.sendError(header, -2, response_buf),
@@ -894,11 +896,11 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -1, response_buf);
         }
 
-        const old_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, names.slice }) catch {
+        const old_path = fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, names.slice }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(old_path);
-        const new_path = std.fs.path.join(self.allocator, &[_][]const u8{ new_parent.path, new_name.slice }) catch {
+        const new_path = fs.path.join(self.allocator, &[_][]const u8{ new_parent.path, new_name.slice }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(new_path);
@@ -906,7 +908,7 @@ pub const VirtioFsDevice = struct {
         if (self.validateAccess(old_path, .rename)) |errno| return self.sendError(header, errno, response_buf);
         if (self.validateAccess(new_path, .create)) |errno| return self.sendError(header, errno, response_buf);
 
-        std.posix.rename(old_path, new_path) catch |e| switch (e) {
+        fs.renamePath(old_path, new_path) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.NotDir => return self.sendError(header, -20, response_buf),
@@ -953,11 +955,11 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -1, response_buf);
         }
 
-        const old_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, names.slice }) catch {
+        const old_path = fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, names.slice }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(old_path);
-        const new_path = std.fs.path.join(self.allocator, &[_][]const u8{ new_parent.path, new_name.slice }) catch {
+        const new_path = fs.path.join(self.allocator, &[_][]const u8{ new_parent.path, new_name.slice }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(new_path);
@@ -971,7 +973,7 @@ pub const VirtioFsDevice = struct {
         if (self.validateAccess(old_path, .rename)) |errno| return self.sendError(header, errno, response_buf);
         if (self.validateAccess(new_path, .create)) |errno| return self.sendError(header, errno, response_buf);
 
-        std.posix.rename(old_path, new_path) catch |e| switch (e) {
+        fs.renamePath(old_path, new_path) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.NotDir => return self.sendError(header, -20, response_buf),
@@ -1006,14 +1008,14 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -1, response_buf);
         }
 
-        const new_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, name.slice }) catch {
+        const new_path = fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, name.slice }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(new_path);
 
         if (self.validateAccess(new_path, .create)) |errno| return self.sendError(header, errno, response_buf);
 
-        std.posix.link(old_node.path, new_path) catch |e| switch (e) {
+        fs.linkPath(old_node.path, new_path) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
@@ -1075,7 +1077,7 @@ pub const VirtioFsDevice = struct {
 
         // Apply size change (truncate)
         if (valid & FATTR_SIZE != 0) {
-            const file = std.fs.cwd().openFile(node.path, .{ .mode = .read_write }) catch {
+            const file = fs.cwd().openFile(node.path, .{ .mode = .read_write }) catch {
                 return self.sendError(header, -13, response_buf); // EACCES
             };
             defer file.close();
@@ -1087,7 +1089,7 @@ pub const VirtioFsDevice = struct {
         // Apply mode change (chmod)
         if (valid & FATTR_MODE != 0) {
             const mode: std.posix.mode_t = @truncate(setattr_in.mode & 0o7777);
-            std.posix.fchmodat(std.fs.cwd().fd, node.path, mode, 0) catch {
+            fs.chmodAt(fs.cwd().fd, node.path, mode, 0) catch {
                 return self.sendError(header, -13, response_buf); // EACCES
             };
         }
@@ -1101,14 +1103,14 @@ pub const VirtioFsDevice = struct {
             if ((stat_before.mode & std.posix.S.IFMT) == std.posix.S.IFDIR) {
                 flags.DIRECTORY = true;
             }
-            const fd = std.posix.openat(std.fs.cwd().fd, node.path, flags, 0) catch {
+            const fd = fs.openAt(fs.cwd().fd, node.path, flags, 0) catch {
                 return self.sendError(header, -13, response_buf);
             };
-            defer std.posix.close(fd);
+            defer fs.closeFd(fd);
             const uid: ?std.posix.uid_t = if (valid & FATTR_UID != 0) @intCast(setattr_in.uid) else null;
             const gid: ?std.posix.gid_t = if (valid & FATTR_GID != 0) @intCast(setattr_in.gid) else null;
-            std.posix.fchown(fd, uid, gid) catch |e| switch (e) {
-                error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => return self.sendError(header, -13, response_buf),
+            fs.chownFd(fd, uid, gid) catch |e| switch (e) {
+                error.AccessDenied => return self.sendError(header, -13, response_buf),
                 error.FileNotFound => return self.sendError(header, -2, response_buf),
                 else => return self.sendError(header, -5, response_buf),
             };
@@ -1122,7 +1124,7 @@ pub const VirtioFsDevice = struct {
             const current_stat = statPath(node.path, true) catch {
                 return self.sendError(header, -2, response_buf); // ENOENT
             };
-            const now = std.time.nanoTimestamp();
+            const now = sync.nanoTimestamp();
 
             // Compute atime in nanoseconds
             var atime_ns: i128 = undefined;
@@ -1147,7 +1149,7 @@ pub const VirtioFsDevice = struct {
             }
 
             // Open file and update times
-            const file = std.fs.cwd().openFile(node.path, .{ .mode = .read_write }) catch {
+            const file = fs.cwd().openFile(node.path, .{ .mode = .read_write }) catch {
                 return self.sendError(header, -13, response_buf); // EACCES
             };
             defer file.close();
@@ -1199,8 +1201,8 @@ pub const VirtioFsDevice = struct {
             }
         }
 
-        const file_mode: std.fs.File.OpenMode = if (accmode == O_WRONLY) .write_only else if (accmode == O_RDWR) .read_write else .read_only;
-        const file = std.fs.cwd().openFile(node.path, .{ .mode = file_mode }) catch |e| switch (e) {
+        const file_mode: fs.File.OpenMode = if (accmode == O_WRONLY) .write_only else if (accmode == O_RDWR) .read_write else .read_only;
+        const file = fs.cwd().openFile(node.path, .{ .mode = file_mode }) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             else => return self.sendError(header, -5, response_buf),
@@ -1246,7 +1248,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -1, response_buf);
         }
 
-        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+        const full_path = fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
@@ -1255,7 +1257,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        std.fs.cwd().makeDir(full_path) catch |e| switch (e) {
+        fs.cwd().makeDir(full_path) catch |e| switch (e) {
             error.PathAlreadyExists => return self.sendError(header, -17, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.FileNotFound => return self.sendError(header, -2, response_buf),
@@ -1293,7 +1295,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -1, response_buf);
         }
 
-        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+        const full_path = fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
@@ -1302,8 +1304,8 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        const file = std.fs.cwd().createFile(full_path, .{ .read = true, .truncate = false }) catch |e| switch (e) {
-            error.PathAlreadyExists => std.fs.cwd().openFile(full_path, .{ .mode = .read_write }) catch |open_err| switch (open_err) {
+        const file = fs.cwd().createFile(full_path, .{ .read = true, .truncate = false }) catch |e| switch (e) {
+            error.PathAlreadyExists => fs.cwd().openFile(full_path, .{ .mode = .read_write }) catch |open_err| switch (open_err) {
                 error.AccessDenied => return self.sendError(header, -13, response_buf),
                 error.FileNotFound => return self.sendError(header, -2, response_buf),
                 else => return self.sendError(header, -5, response_buf),
@@ -1501,7 +1503,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -1, response_buf);
         }
 
-        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+        const full_path = fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
@@ -1516,9 +1518,9 @@ pub const VirtioFsDevice = struct {
         if ((create_in.flags & O_TRUNC) != 0 and accmode == O_RDONLY) {
             return self.sendError(header, -13, response_buf);
         }
-        const file_mode: std.fs.File.OpenMode = if (accmode == O_WRONLY) .write_only else if (accmode == O_RDWR) .read_write else .read_only;
-        const file = std.fs.cwd().createFile(full_path, .{ .read = read_enabled, .truncate = false }) catch |e| switch (e) {
-            error.PathAlreadyExists => std.fs.cwd().openFile(full_path, .{ .mode = file_mode }) catch |open_err| switch (open_err) {
+        const file_mode: fs.File.OpenMode = if (accmode == O_WRONLY) .write_only else if (accmode == O_RDWR) .read_write else .read_only;
+        const file = fs.cwd().createFile(full_path, .{ .read = read_enabled, .truncate = false }) catch |e| switch (e) {
+            error.PathAlreadyExists => fs.cwd().openFile(full_path, .{ .mode = file_mode }) catch |open_err| switch (open_err) {
                 error.AccessDenied => return self.sendError(header, -13, response_buf),
                 error.FileNotFound => return self.sendError(header, -2, response_buf),
                 else => return self.sendError(header, -5, response_buf),
@@ -1573,7 +1575,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -1, response_buf);
         }
 
-        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+        const full_path = fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
@@ -1582,7 +1584,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        std.fs.cwd().deleteFile(full_path) catch |e| switch (e) {
+        fs.cwd().deleteFile(full_path) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.IsDir => return self.sendError(header, -21, response_buf),
@@ -1612,7 +1614,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -1, response_buf);
         }
 
-        const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
+        const full_path = fs.path.join(self.allocator, &[_][]const u8{ parent_node.path, entry_name }) catch {
             return self.sendError(header, -12, response_buf);
         };
         defer self.allocator.free(full_path);
@@ -1621,7 +1623,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        std.fs.cwd().deleteDir(full_path) catch |e| switch (e) {
+        fs.cwd().deleteDir(full_path) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             error.NotDir => return self.sendError(header, -20, response_buf),
@@ -1702,7 +1704,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        const dir = std.fs.cwd().openDir(node.path, .{ .iterate = true }) catch |e| switch (e) {
+        const dir = fs.cwd().openDir(node.path, .{ .iterate = true }) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             else => return self.sendError(header, -5, response_buf),
@@ -1845,7 +1847,7 @@ pub const VirtioFsDevice = struct {
             const padded_size = std.mem.alignForward(usize, entry_size, 8);
             if (pos + padded_size > out_header_size + max_data) break;
 
-            const full_path = std.fs.path.join(self.allocator, &[_][]const u8{ handle.node.path, entry_val.name }) catch {
+            const full_path = fs.path.join(self.allocator, &[_][]const u8{ handle.node.path, entry_val.name }) catch {
                 return self.sendError(header, -12, response_buf);
             };
             defer self.allocator.free(full_path);
@@ -1938,7 +1940,7 @@ pub const VirtioFsDevice = struct {
         const fsync_in: *const FuseFsyncIn = @ptrCast(@alignCast(payload.ptr));
         const handle = self.handles.get(fsync_in.fh) orelse return self.sendError(header, -9, response_buf);
         if (handle.dir) |d| {
-            std.posix.fsync(d.fd) catch return self.sendError(header, -5, response_buf);
+            fs.syncFd(d.fd) catch return self.sendError(header, -5, response_buf);
         }
         return self.sendError(header, 0, response_buf);
     }
@@ -1976,7 +1978,7 @@ pub const VirtioFsDevice = struct {
             if (!mount.allow_exec) return self.sendError(header, -13, response_buf);
         }
 
-        std.posix.faccessat(std.posix.AT.FDCWD, node.path, access_in.mask, 0) catch |e| switch (e) {
+        fs.accessAt(std.posix.AT.FDCWD, node.path, access_in.mask, 0) catch |e| switch (e) {
             error.FileNotFound => return self.sendError(header, -2, response_buf),
             error.AccessDenied => return self.sendError(header, -13, response_buf),
             else => return self.sendError(header, -5, response_buf),
@@ -2412,16 +2414,13 @@ pub const VirtioFsDevice = struct {
 
         const offset = switch (lseek_in.whence) {
             0 => blk: {
-                std.posix.lseek_SET(file.handle, lseek_in.offset) catch return self.sendError(header, -5, response_buf);
-                break :blk lseek_in.offset;
+                break :blk fs.seekFd(file.handle, @intCast(lseek_in.offset), std.c.SEEK.SET) catch return self.sendError(header, -5, response_buf);
             },
             1 => blk: {
-                std.posix.lseek_CUR(file.handle, @bitCast(@as(i64, @intCast(lseek_in.offset)))) catch return self.sendError(header, -5, response_buf);
-                break :blk std.posix.lseek_CUR_get(file.handle) catch return self.sendError(header, -5, response_buf);
+                break :blk fs.seekFd(file.handle, @as(i64, @bitCast(lseek_in.offset)), std.c.SEEK.CUR) catch return self.sendError(header, -5, response_buf);
             },
             2 => blk: {
-                std.posix.lseek_END(file.handle, @bitCast(@as(i64, @intCast(lseek_in.offset)))) catch return self.sendError(header, -5, response_buf);
-                break :blk std.posix.lseek_CUR_get(file.handle) catch return self.sendError(header, -5, response_buf);
+                break :blk fs.seekFd(file.handle, @as(i64, @bitCast(lseek_in.offset)), std.c.SEEK.END) catch return self.sendError(header, -5, response_buf);
             },
             else => return self.sendError(header, -22, response_buf),
         };
@@ -2455,13 +2454,13 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        const copied = std.posix.copy_file_range(
+        const copied = fs.copyFileRange(
             in_file.handle,
             copy_in.off_in,
             out_file.handle,
             copy_in.off_out,
             @intCast(copy_in.len),
-            @intCast(copy_in.flags),
+            copy_in.flags,
         ) catch return self.sendError(header, -5, response_buf);
 
         return self.sendWriteOut(header, @intCast(copied), response_buf);
@@ -2809,7 +2808,7 @@ pub const VirtioFsDevice = struct {
         }) catch return VirtioFsError.OutOfMemory;
     }
 
-    fn allocateFileHandle(self: *VirtioFsDevice, nodeid: u64, file: std.fs.File, open_flags: u32) !u64 {
+    fn allocateFileHandle(self: *VirtioFsDevice, nodeid: u64, file: fs.File, open_flags: u32) !u64 {
         const fh = self.next_fh;
         self.next_fh += 1;
 
@@ -2828,7 +2827,7 @@ pub const VirtioFsDevice = struct {
         return fh;
     }
 
-    fn allocateDirHandle(self: *VirtioFsDevice, nodeid: u64, dir: std.fs.Dir) !u64 {
+    fn allocateDirHandle(self: *VirtioFsDevice, nodeid: u64, dir: fs.Dir) !u64 {
         const fh = self.next_fh;
         self.next_fh += 1;
 
@@ -2850,7 +2849,7 @@ pub const VirtioFsDevice = struct {
         const mount = self.mount_manager.getMountByTag(self.tag) orelse return -2;
         if (!path_util.isWithinRoot(path, mount.host_path)) return -13;
         const rel = if (path.len > mount.host_path.len) path[mount.host_path.len..] else "";
-        const rel_trim = std.mem.trimLeft(u8, rel, "/");
+        const rel_trim = std.mem.trimStart(u8, rel, "/");
         self.mount_manager.validateFileOperation(mount.tag, rel_trim, op) catch |err| {
             return switch (err) {
                 mounts.MountError.PathTraversal => -1,
@@ -2980,7 +2979,7 @@ fn parseOpenFlags(flags: u32) OpenFlagState {
     };
 }
 
-fn syncFile(file: *std.fs.File, mode: SyncMode) !void {
+fn syncFile(file: *fs.File, mode: SyncMode) !void {
     switch (mode) {
         .none => return,
         .full => try file.sync(),
@@ -3077,7 +3076,7 @@ fn flockToLock(flock: c.struct_flock) FuseFileLock {
 
 fn statPath(path: []const u8, follow: bool) !StatView {
     if (builtin.os.tag == .windows) {
-        const stat = try std.fs.cwd().statFile(path);
+        const stat = try fs.cwd().statFile(path);
         const mode: u32 = switch (stat.kind) {
             .directory => 0o040000 | 0o755,
             else => 0o100000 | 0o644,
@@ -3099,11 +3098,11 @@ fn statPath(path: []const u8, follow: bool) !StatView {
     }
 
     const flags: u32 = if (follow) 0 else @as(u32, std.posix.AT.SYMLINK_NOFOLLOW);
-    const st = try std.posix.fstatat(std.posix.AT.FDCWD, path, flags);
+    const st = try fs.statPosixAt(std.posix.AT.FDCWD, path, flags);
     const atime = st.atime();
     const mtime = st.mtime();
     const ctime = st.ctime();
-    const kind: std.fs.File.Kind = std.fs.File.Stat.fromPosix(st).kind;
+    const kind: fs.File.Kind = fs.File.Stat.fromPosix(st).kind;
     return .{
         .size = @bitCast(st.size),
         .blocks = @bitCast(st.blocks),
@@ -3265,7 +3264,7 @@ test "virtio_fs: handleInit accepts unaligned request" {
 test "virtio_fs: lookup open read write release roundtrip" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -3451,7 +3450,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
 test "virtio_fs: lookup rejects traversal" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     var mount_manager = mounts.MountManager.init(allocator);
@@ -3563,7 +3562,7 @@ test "virtio_fs: handleOpen returns not found for missing node" {
 test "virtio_fs: handleOpen rejects write on read-only mount" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -3619,7 +3618,7 @@ test "virtio_fs: handleOpen rejects write on read-only mount" {
 test "virtio_fs: handleOpen honors O_TRUNC" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -3671,7 +3670,7 @@ test "virtio_fs: handleOpen honors O_TRUNC" {
     const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
     try std.testing.expectEqual(@as(i32, 0), out.@"error");
 
-    var check = try std.fs.cwd().openFile(abs, .{ .mode = .read_only });
+    var check = try fs.cwd().openFile(abs, .{ .mode = .read_only });
     defer check.close();
     const size = try check.getEndPos();
     try std.testing.expectEqual(@as(u64, 0), size);
@@ -3680,7 +3679,7 @@ test "virtio_fs: handleOpen honors O_TRUNC" {
 test "virtio_fs: handleWrite appends with O_APPEND" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -3770,7 +3769,7 @@ test "virtio_fs: handleWrite appends with O_APPEND" {
     const write_out: *const FuseOutHeader = @ptrCast(@alignCast(&write_resp));
     try std.testing.expectEqual(@as(i32, 0), write_out.@"error");
 
-    var check = try std.fs.cwd().openFile(abs, .{ .mode = .read_only });
+    var check = try fs.cwd().openFile(abs, .{ .mode = .read_only });
     defer check.close();
     var buf: [4]u8 = undefined;
     const bytes = try check.readAll(&buf);
@@ -3782,7 +3781,7 @@ test "virtio_fs: handleFallocate keep size" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -3811,7 +3810,7 @@ test "virtio_fs: handleFallocate keep size" {
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
-    const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
+    const file = try fs.cwd().openFile(abs, .{ .mode = .read_write });
     const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseFallocateIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -3841,7 +3840,7 @@ test "virtio_fs: handleFallocate keep size" {
     const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
     try std.testing.expectEqual(@as(i32, 0), out.@"error");
 
-    var check = try std.fs.cwd().openFile(abs, .{ .mode = .read_only });
+    var check = try fs.cwd().openFile(abs, .{ .mode = .read_only });
     defer check.close();
     const size = try check.getEndPos();
     try std.testing.expectEqual(@as(u64, 4), size);
@@ -3972,7 +3971,7 @@ test "virtio_fs: handleRead rejects invalid handle" {
 test "virtio_fs: handleRead errors on short response buffer" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -4002,7 +4001,7 @@ test "virtio_fs: handleRead errors on short response buffer" {
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
-    const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
+    const file = try fs.cwd().openFile(abs, .{ .mode = .read_write });
     const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
@@ -4067,7 +4066,7 @@ test "virtio_fs: handleWrite rejects short payload" {
 test "virtio_fs: handleRead maps io error on write-only file" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -4097,7 +4096,7 @@ test "virtio_fs: handleRead maps io error on write-only file" {
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
-    const file = try std.fs.cwd().openFile(abs, .{ .mode = .write_only });
+    const file = try fs.cwd().openFile(abs, .{ .mode = .write_only });
     const fh = try device.allocateFileHandle(nodeid, file, O_WRONLY);
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
@@ -4137,7 +4136,7 @@ test "virtio_fs: handleRead maps io error on write-only file" {
 test "virtio_fs: handleWrite maps io error on read-only file" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -4167,7 +4166,7 @@ test "virtio_fs: handleWrite maps io error on read-only file" {
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
-    const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_only });
+    const file = try fs.cwd().openFile(abs, .{ .mode = .read_only });
     const fh = try device.allocateFileHandle(nodeid, file, O_RDONLY);
 
     const write_data = "x";
@@ -4214,7 +4213,7 @@ test "virtio_fs: handleWrite maps io error on read-only file" {
 test "virtio_fs: handleOpendir rejects non-dir node" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -4299,7 +4298,7 @@ test "virtio_fs: handleReleasedir rejects short payload" {
 test "virtio_fs: handleRelease closes file handle" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -4318,7 +4317,7 @@ test "virtio_fs: handleRelease closes file handle" {
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
-    const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
+    const file = try fs.cwd().openFile(abs, .{ .mode = .read_write });
     const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
     try std.testing.expect(device.handles.contains(fh));
 
@@ -4382,7 +4381,7 @@ test "virtio_fs: handleReaddir rejects short payload" {
 test "virtio_fs: handleReaddir returns entries" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("data");
@@ -4497,7 +4496,7 @@ test "virtio_fs: handleReaddir returns entries" {
 test "virtio_fs: readdirplus returns generation" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -4607,7 +4606,7 @@ test "virtio_fs: xattr roundtrip" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -4817,7 +4816,7 @@ test "virtio_fs: statPath reports posix metadata" {
         return error.SkipZigTest;
     }
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     const filename = "meta.txt";
@@ -4832,7 +4831,7 @@ test "virtio_fs: statPath reports posix metadata" {
 
     const stat = try statPath(full_path, true);
     const attr = statToFuseAttr(2, &stat);
-    try std.testing.expectEqual(@as(u32, @intCast(std.posix.getuid())), attr.uid);
+    try std.testing.expectEqual(@as(u32, @intCast(fs.getUid())), attr.uid);
     try std.testing.expectEqual(@as(u32, @intCast(c.getgid())), attr.gid);
     try std.testing.expectEqual(stat.mode, attr.mode);
     try std.testing.expectEqual(stat.nlink, attr.nlink);
@@ -4843,7 +4842,7 @@ test "virtio_fs: statPath respects symlinks" {
         return error.SkipZigTest;
     }
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     const filename = "target.txt";
@@ -4858,7 +4857,7 @@ test "virtio_fs: statPath respects symlinks" {
 
     const root = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(root);
-    const link_path = try std.fs.path.join(allocator, &[_][]const u8{ root, linkname });
+    const link_path = try fs.path.join(allocator, &[_][]const u8{ root, linkname });
     defer allocator.free(link_path);
 
     const stat_link = try statPath(link_path, false);
@@ -4880,7 +4879,7 @@ test "virtio_fs: setattr ctime no-op succeeds" {
     }
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -4961,7 +4960,7 @@ test "virtio_fs: fcntl locks" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -4990,7 +4989,7 @@ test "virtio_fs: fcntl locks" {
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
-    const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
+    const file = try fs.cwd().openFile(abs, .{ .mode = .read_write });
     const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
 
     const lk_in = FuseLkIn{
@@ -5050,7 +5049,7 @@ test "virtio_fs: ioctl with buffers" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -5079,7 +5078,7 @@ test "virtio_fs: ioctl with buffers" {
     defer device.deinit();
 
     const nodeid = try device.allocateNode(abs, false);
-    const file = try std.fs.cwd().openFile(abs, .{ .mode = .read_write });
+    const file = try fs.cwd().openFile(abs, .{ .mode = .read_write });
     const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
 
     const data = [_]u8{0xAB};

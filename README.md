@@ -1,18 +1,20 @@
 # m80
 
-Zig microVM runtime with a small CLI, platform-specific hypervisor backends, explicit VM config, and deny-by-default policy controls.
+Zig microVM runtime with a small CLI, platform-specific hypervisor backends, and an HVF-first vsock control plane for guest-local services.
 
 See [docs/PROJECT.md](docs/PROJECT.md) for the canonical project status, roadmap, QA snapshot, integration test commands, and macOS signing notes.
 
 ## Status
 
-- CLI control plane is implemented; there is no daemon or REST API yet.
-- macOS HVF is the most complete backend path.
-- Windows WHP and Linux/POSIX KVM paths exist but still need real-host lifecycle validation.
-- Jailer, mount, networking-policy, virtio device, and filesystem-image snapshot building blocks are implemented with platform-gated integration work still pending.
-- Latest local validation from 2026-05-02: `zig build test` loaded 354 tests; 333 passed, 21 skipped, 0 failed.
+- `m80 daemon` now provides the local control-plane daemon used by `m80 start` and `m80 run`.
+- macOS HVF is the active backend for the `network_*` guest networking model and virtio-vsock.
+- Windows WHP and Linux/POSIX KVM paths still need real-host lifecycle validation and fail fast when `network_*` guest networking is enabled.
+- Guest-local DNS, metadata, external DNS forwarding, TCP CONNECT, SOCKS5 UDP ASSOCIATE, and daemon-side ICMP echo run over an authenticated per-VM vsock session. TCP and UDP egress are exposed through a guest-local SOCKS5 endpoint on `127.0.0.1:1080`; transparent TUN remains pending.
+- Latest local validation from 2026-05-31: `zig build test` with Zig 0.16.0 loaded 333 tests; 312 passed, 21 skipped, 0 failed.
 
 ## Build
+
+m80 currently targets Zig 0.16.0. The Makefile uses `~/.local/opt/zig-v0.16.0/zig` when present.
 
 ```bash
 zig build
@@ -24,6 +26,10 @@ zig build test
 
 ```text
 m80 init <name>              create a new VM
+m80 daemon run               run the local control-plane daemon in the foreground
+m80 daemon start             start the local control-plane daemon
+m80 daemon stop              stop the local control-plane daemon
+m80 daemon status            show daemon status
 m80 start <name>             start a VM in the background
 m80 run <name>               run a VM in the foreground; normally used internally
 m80 console <name>           attach to a running VM console
@@ -53,6 +59,10 @@ disk_path=images/rootfs.ext4
 seed_path=images/nocloud-seed.iso
 kernel_cmdline=console=ttyAMA0 root=/dev/vda rootwait rw
 network_mode=locked_down
+network_services=dns,metadata
+network_metadata_file=images/metadata.json
+network_allowed_domains=example.com,*.example.org:443
+network_allowed_ips=192.0.2.10,198.51.100.0/24,2001:db8::10,2001:db8:abcd::/48
 ```
 
 Useful optional keys:
@@ -65,12 +75,9 @@ mount_roots=/Users/you/projects
 mounts=code:/Users/you/projects/m80:/mnt/code:rw:virtiofs
 virtio_fs_queues=1
 virtio_fs_cache=auto
-network_mode=allowlist
-allowed_domains=deb.debian.org,security.debian.org,repo.example.com:443
-allowed_ips=10.0.0.0/8
 ```
 
-`kernel_path` is required to start. Either `initrd_path` or `disk_path` is required. `network_mode=open` requires `M80_ALLOW_OPEN_NETWORK=1`.
+`kernel_path` is required to start. Either `initrd_path` or `disk_path` is required. `network_*` guest networking is currently implemented on the macOS HVF path only. `network_mode=open` requires `M80_ALLOW_OPEN_NETWORK=1`; `services=`, `metadata_file=`, `allowed_domains=`, and `allowed_ips=` are rejected with migration guidance. For `allowlist` and gated `open` modes, guest TCP and UDP egress are available through `socks5h://127.0.0.1:1080` when using the m80 initramfs, and ICMP echo uses the m80 TUN/vsock path with IPv4 and IPv6 allowlist enforcement.
 
 ## Logging
 
@@ -94,8 +101,9 @@ Each VM lives under `{data}/vms/{name}/`.
 ```bash
 make initramfs
 make hvf-smoke
+make boot-hvf-login
 make hvf-reliability CYCLES=20
-make hvf-vmnet-policy
+make hvf-vsock-smoke
 ```
 
 Most integration tests are gated by environment variables and local boot images. Full commands are in [docs/PROJECT.md](docs/PROJECT.md).

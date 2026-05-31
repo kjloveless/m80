@@ -1,11 +1,16 @@
 const std = @import("std");
+const sync = @import("../../util/sync.zig");
+const fs = @import("../../util/fs.zig");
 const builtin = @import("builtin");
 const core = @import("../../core.zig");
 const errors = core.errors;
 const state = core.state;
 const log = @import("../../util/log.zig");
+const util_env = @import("../../util/env.zig");
 const mounts = @import("../../fs/mounts.zig");
 const runtime = @import("../runtime.zig");
+const daemon_cmd = @import("daemon.zig");
+const daemon_client = @import("../../daemon/client.zig");
 
 const Vm = @import("../../vm/vm.zig").Vm;
 const Jailer = @import("../../jailer/jailer.zig").Jailer;
@@ -26,10 +31,10 @@ fn setEnvFlag(allocator: std.mem.Allocator, name: []const u8, value: []const u8)
 fn fileSizeIfExists(path_opt: ?[]const u8) ?u64 {
     if (path_opt == null) return null;
     const path = path_opt.?;
-    const file = if (std.fs.path.isAbsolute(path))
-        std.fs.openFileAbsolute(path, .{})
+    const file = if (fs.path.isAbsolute(path))
+        fs.openFileAbsolute(path, .{})
     else
-        std.fs.cwd().openFile(path, .{});
+        fs.cwd().openFile(path, .{});
 
     if (file) |f| {
         defer f.close();
@@ -71,6 +76,129 @@ fn logStartPreflight(cfg: *const core.config.VmConfig) void {
 
 fn optPath(path: ?[]const u8) []const u8 {
     return path orelse "<unset>";
+}
+
+fn collectGuestMountPaths(allocator: std.mem.Allocator, cfg: *const core.config.VmConfig) ![][]const u8 {
+    const result = try allocator.alloc([]const u8, cfg.mounts.len);
+    for (result) |*entry| entry.* = "";
+    errdefer {
+        for (result) |path| {
+            if (path.len != 0) allocator.free(path);
+        }
+        allocator.free(result);
+    }
+
+    for (cfg.mounts, 0..) |mount_cfg, i| {
+        result[i] = try allocator.dupe(u8, mount_cfg.guest_path);
+    }
+    return result;
+}
+
+fn freeGuestMountPaths(allocator: std.mem.Allocator, mounts_list: [][]const u8) void {
+    for (mounts_list) |path| allocator.free(path);
+    if (mounts_list.len > 0) allocator.free(mounts_list);
+}
+
+fn unregisterVmBestEffort(allocator: std.mem.Allocator, vm_dir: fs.Dir, name: []const u8) void {
+    daemon_client.unregisterVm(allocator, name) catch |e| {
+        log.warn("daemon unregister failed: {s}", .{@errorName(e)});
+    };
+    runtime.clearGuestCid(vm_dir);
+}
+
+fn requestGuestShutdownBestEffort(allocator: std.mem.Allocator, name: []const u8) bool {
+    daemon_client.requestVmShutdown(allocator, name) catch |e| {
+        log.warn("daemon guest shutdown request failed: {s}", .{@errorName(e)});
+        return false;
+    };
+    return true;
+}
+
+fn defaultServiceInitrdPath(allocator: std.mem.Allocator) ![]u8 {
+    const override = util_env.getVarOwned(allocator, "M80_SERVICE_INITRD") catch null;
+    if (override) |path| {
+        return path;
+    }
+
+    const cwd_path = try fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd_path);
+    return try fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "m80-initramfs.cpio.gz" });
+}
+
+fn copyFileInto(target: *fs.File, source_path: []const u8) !void {
+    var source = if (fs.path.isAbsolute(source_path))
+        try fs.openFileAbsolute(source_path, .{})
+    else
+        try fs.cwd().openFile(source_path, .{});
+    defer source.close();
+
+    var buf: [16 * 1024]u8 = undefined;
+    while (true) {
+        const n = try source.read(&buf);
+        if (n == 0) break;
+        try target.writeAll(buf[0..n]);
+    }
+}
+
+fn ensureServiceInitrd(
+    allocator: std.mem.Allocator,
+    vm_dir: fs.Dir,
+    vm_dir_path: []const u8,
+    cfg: *core.config.VmConfig,
+) !void {
+    if (cfg.network_services.len == 0 and cfg.network_mode == .locked_down) return;
+
+    const service_initrd = try defaultServiceInitrdPath(allocator);
+    defer allocator.free(service_initrd);
+
+    if (cfg.initrd_path) |current_initrd| {
+        if (std.mem.eql(u8, current_initrd, service_initrd)) return;
+
+        const bundle_name = "services-initrd.cpio.gz";
+        var bundle_file = try vm_dir.createFile(bundle_name, .{ .truncate = true });
+        defer bundle_file.close();
+
+        try copyFileInto(&bundle_file, service_initrd);
+        try copyFileInto(&bundle_file, current_initrd);
+
+        const bundle_path = try fs.path.join(allocator, &[_][]const u8{ vm_dir_path, bundle_name });
+        if (cfg.initrd_path) |old_path| allocator.free(old_path);
+        cfg.initrd_path = bundle_path;
+        return;
+    }
+
+    cfg.initrd_path = try allocator.dupe(u8, service_initrd);
+}
+
+fn hasNetworkService(services: []const core.config.Service, service: core.config.Service) bool {
+    for (services) |candidate| {
+        if (candidate == service) return true;
+    }
+    return false;
+}
+
+fn ensureDebNetworkServices(allocator: std.mem.Allocator, cfg: *core.config.VmConfig) !void {
+    const wants = [_]core.config.Service{ .dns, .metadata };
+    var missing: usize = 0;
+    for (wants) |service| {
+        if (!hasNetworkService(cfg.network_services, service)) missing += 1;
+    }
+    if (missing == 0) return;
+
+    const old_services = cfg.network_services;
+    const services = try allocator.alloc(core.config.Service, old_services.len + missing);
+    @memcpy(services[0..old_services.len], old_services);
+
+    var i = old_services.len;
+    for (wants) |service| {
+        if (!hasNetworkService(old_services, service)) {
+            services[i] = service;
+            i += 1;
+        }
+    }
+
+    if (old_services.len > 0) allocator.free(old_services);
+    cfg.network_services = services;
 }
 
 fn dieStartConfigError(err: core.config.StartConfigError, cfg: *const core.config.VmConfig) noreturn {
@@ -127,16 +255,24 @@ fn dieStartConfigError(err: core.config.StartConfigError, cfg: *const core.confi
             "data_disk_path not readable: {s}. Check permissions (chmod +r) or ownership.",
             .{optPath(cfg.data_disk_path)},
         ),
+        error.MetadataFileNotFound => errors.die(
+            "network_metadata_file not found: {s}. Check the path or remove network_metadata_file.",
+            .{optPath(cfg.network_metadata_file)},
+        ),
+        error.MetadataFileUnreadable => errors.die(
+            "network_metadata_file not readable: {s}. Check permissions (chmod +r) or ownership.",
+            .{optPath(cfg.network_metadata_file)},
+        ),
         error.OpenNetworkNotAllowed => errors.die(
-            "network_mode=open requires explicit opt-in. Run `export M80_ALLOW_OPEN_NETWORK=1` and retry.",
+            "network_mode=open requires M80_ALLOW_OPEN_NETWORK=1. Use network_mode=allowlist unless full egress is intentional.",
             .{},
         ),
-        error.InvalidAllowedDomainSpec => errors.die(
-            "allowed_domains contains an invalid entry. Use domain patterns like `example.com`, `*.example.com`, or `example.com:443`.",
+        error.InvalidNetworkAllowedDomainSpec => errors.die(
+            "network_allowed_domains contains an invalid entry. Use domains like example.com, *.example.com, or example.com:443.",
             .{},
         ),
-        error.InvalidAllowedIpSpec => errors.die(
-            "allowed_ips contains an invalid entry. Use IPv4 or CIDR values like `1.2.3.4` or `10.0.0.0/8`.",
+        error.InvalidNetworkAllowedIpSpec => errors.die(
+            "network_allowed_ips contains an invalid entry. Use IPv4 literals or CIDR ranges like 192.0.2.10 or 192.0.2.0/24.",
             .{},
         ),
         error.MountRootsRequired => errors.die(
@@ -158,6 +294,16 @@ fn dieStartConfigError(err: core.config.StartConfigError, cfg: *const core.confi
     }
 }
 
+fn dieConfigReadError(err: anyerror) noreturn {
+    switch (err) {
+        error.RemovedNetworkKey => errors.die(
+            "legacy networking keys are no longer supported. Use `network_mode=locked_down|allowlist|open`, `network_services=dns,metadata`, `network_metadata_file=...`, `network_allowed_domains=...`, and `network_allowed_ips=...`.",
+            .{},
+        ),
+        else => errors.die("invalid config: {s}", .{@errorName(err)}),
+    }
+}
+
 fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
     const name = "deb";
     state.initVm(allocator, name) catch |e| switch (e) {
@@ -169,34 +315,32 @@ fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);
 
-    var cwd = std.fs.cwd();
+    var cwd = fs.cwd();
     var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
     defer vm_dir.close();
 
-    const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| {
-        errors.die("invalid config: {s}", .{@errorName(e)});
-    };
+    const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| dieConfigReadError(e);
     var cfg_mut = cfg;
     defer core.config.freeConfig(allocator, &cfg_mut);
 
     const cwd_path = try cwd.realpathAlloc(allocator, ".");
     defer allocator.free(cwd_path);
-    const kernel_path = try std.fs.path.join(
+    const kernel_path = try fs.path.join(
         allocator,
         &[_][]const u8{ cwd_path, "images", "debian-kernels", "boot", "vmlinuz-6.1.0-42-cloud-arm64" },
     );
     defer allocator.free(kernel_path);
-    const initrd_path = try std.fs.path.join(
+    const initrd_path = try fs.path.join(
         allocator,
         &[_][]const u8{ cwd_path, "images", "m80-initramfs.cpio.gz" },
     );
     defer allocator.free(initrd_path);
-    const disk_path = try std.fs.path.join(
+    const disk_path = try fs.path.join(
         allocator,
         &[_][]const u8{ cwd_path, "images", "debian-12-nocloud-arm64-20250703-2162.raw" },
     );
     defer allocator.free(disk_path);
-    const seed_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "debian-nocloud-seed.iso" });
+    const seed_path = try fs.path.join(allocator, &[_][]const u8{ cwd_path, "images", "debian-nocloud-seed.iso" });
     defer allocator.free(seed_path);
 
     if (cfg_mut.kernel_path) |path| {
@@ -238,6 +382,7 @@ fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
         u8,
         "console=ttyAMA0 root=/dev/vda1 rootwait rootfstype=ext4 rw devtmpfs.mount=1 systemd.mask=boot-efi.mount systemd.mask=systemd-boot-update.service quiet loglevel=3 systemd.show_status=false systemd.log_level=warning systemd.log_color=no fsck.mode=skip fsck.repair=no",
     );
+    try ensureDebNetworkServices(allocator, &cfg_mut);
 
     if (cfg_mut.mounts.len == 0) {
         if (cfg_mut.mount_roots.len > 0) {
@@ -246,7 +391,7 @@ fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
             cfg_mut.mount_roots = &[_][]const u8{};
         }
 
-        const mount_root = std.fs.path.dirname(cwd_path) orelse cwd_path;
+        const mount_root = fs.path.dirname(cwd_path) orelse cwd_path;
         const mount_root_owned = try allocator.dupe(u8, mount_root);
         const mount_host = try allocator.dupe(u8, cwd_path);
         const mount_tag = try allocator.dupe(u8, "host");
@@ -271,7 +416,7 @@ fn ensureDebVmConfig(allocator: std.mem.Allocator) !void {
     try core.config.writeConfigFile(vm_dir, cfg_mut);
 }
 
-fn handleSignal(sig: c_int) callconv(.c) void {
+fn handleSignal(sig: std.posix.SIG) callconv(.c) void {
     _ = sig;
     stop_requested.store(true, .seq_cst);
 }
@@ -290,18 +435,18 @@ fn installSignalHandlers() !void {
 fn waitForStopSignal() void {
     if (builtin.os.tag == .windows) {
         while (true) {
-            std.Thread.sleep(250 * std.time.ns_per_ms);
+            sync.sleep(250 * std.time.ns_per_ms);
         }
     }
     while (!stop_requested.load(.seq_cst)) {
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        sync.sleep(200 * std.time.ns_per_ms);
     }
 }
 
 fn waitForStopOrSnapshot(
     allocator: std.mem.Allocator,
     vm: *Vm,
-    vm_dir: std.fs.Dir,
+    vm_dir: fs.Dir,
     cfg: *const core.config.VmConfig,
 ) !void {
     if (builtin.os.tag == .windows) {
@@ -310,6 +455,10 @@ fn waitForStopOrSnapshot(
     }
 
     while (!stop_requested.load(.seq_cst)) {
+        if (!vm.isRunning()) {
+            log.info("vm exited", .{});
+            break;
+        }
         if (try runtime.hasStopRequest(vm_dir)) {
             log.info("stop request received", .{});
             stop_requested.store(true, .seq_cst);
@@ -323,7 +472,7 @@ fn waitForStopOrSnapshot(
                 log.warn("snapshot failed: {s}", .{@errorName(e)});
                 runtime.writeResultFile(vm_dir, runtime.snapshot_result_file, @errorName(e));
                 vm_dir.deleteFile(runtime.snapshot_request_file) catch {};
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                sync.sleep(50 * std.time.ns_per_ms);
                 continue;
             };
             runtime.writeResultFile(vm_dir, runtime.snapshot_result_file, "ok");
@@ -336,13 +485,13 @@ fn waitForStopOrSnapshot(
                 log.warn("restore failed: {s}", .{@errorName(e)});
                 runtime.writeResultFile(vm_dir, runtime.restore_result_file, @errorName(e));
                 vm_dir.deleteFile(runtime.restore_request_file) catch {};
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                sync.sleep(50 * std.time.ns_per_ms);
                 continue;
             };
             runtime.writeResultFile(vm_dir, runtime.restore_result_file, "ok");
             vm_dir.deleteFile(runtime.restore_request_file) catch {};
         }
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        sync.sleep(200 * std.time.ns_per_ms);
     }
 }
 
@@ -350,6 +499,8 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     if (ensure_deb) {
         try ensureDebVmConfig(allocator);
     }
+
+    try daemon_cmd.ensureStarted(allocator);
 
     var jailer = try Jailer.init(allocator);
     defer jailer.deinit();
@@ -360,7 +511,7 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);
 
-    var cwd = std.fs.cwd();
+    var cwd = fs.cwd();
     var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
     defer vm_dir.close();
 
@@ -372,13 +523,18 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
         );
     }
 
-    const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| {
-        errors.die("invalid config: {s}", .{@errorName(e)});
-    };
+    const cfg = core.config.readConfigFile(allocator, vm_dir, name) catch |e| dieConfigReadError(e);
     var cfg_mut = cfg;
     defer core.config.freeConfig(allocator, &cfg_mut);
 
+    if ((cfg_mut.network_services.len > 0 or cfg_mut.network_mode != .locked_down) and builtin.os.tag != .macos) {
+        errors.die("network_* guest networking is currently supported only on the HVF backend (NotSupported).", .{});
+    }
+
     try core.config.resolveRelativePaths(allocator, dir_path, &cfg_mut);
+    ensureServiceInitrd(allocator, vm_dir, dir_path, &cfg_mut) catch |e| {
+        errors.die("service initramfs prepare failed: {s}", .{@errorName(e)});
+    };
 
     logStartPreflight(&cfg_mut);
 
@@ -388,20 +544,53 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     core.config.validateStartFiles(&cfg_mut) catch |e| {
         dieStartConfigError(e, &cfg_mut);
     };
+
+    const guest_mounts = try collectGuestMountPaths(allocator, &cfg_mut);
+    defer freeGuestMountPaths(allocator, guest_mounts);
+
+    var registration = daemon_client.registerVm(allocator, .{
+        .name = cfg_mut.name,
+        .memory_mb = cfg_mut.memory_mb,
+        .cpu_cores = cfg_mut.cpu_cores,
+        .network_mode = cfg_mut.network_mode,
+        .network_services = cfg_mut.network_services,
+        .network_metadata_file = cfg_mut.network_metadata_file,
+        .network_allowed_domains = cfg_mut.network_allowed_domains,
+        .network_allowed_ips = cfg_mut.network_allowed_ips,
+        .mounts = guest_mounts,
+        .started_at = sync.timestamp(),
+    }) catch |e| {
+        errors.die("daemon registration failed: {s}", .{@errorName(e)});
+    };
+    defer registration.deinit(allocator);
+    errdefer unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+
+    const guest_cid = registration.guest_cid;
+    runtime.writeGuestCid(vm_dir, guest_cid) catch |e| {
+        unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+        errors.die("failed to persist guest cid: {s}", .{@errorName(e)});
+    };
+    cfg_mut.assigned_guest_cid = guest_cid;
+    cfg_mut.assigned_guest_session_socket_path = try allocator.dupe(u8, registration.guest_socket_path);
+
     jailer.prepareForVm(dir_path, &cfg_mut) catch |e| {
+        unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
         errors.die("jailer prepare failed: {s}", .{@errorName(e)});
     };
 
-    vm.start(cfg_mut) catch |e| switch (e) {
-        error.MountsInvalid => errors.die(
-            "mounts rejected. Ensure mount_roots includes the host path and no path traversal is present.",
-            .{},
-        ),
-        error.MountsUnsupported => errors.die(
-            "mounts not supported in this configuration. Use a single virtiofs mount.",
-            .{},
-        ),
-        else => errors.die("start failed: {s}", .{@errorName(e)}),
+    vm.start(cfg_mut) catch |e| {
+        unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+        switch (e) {
+            error.MountsInvalid => errors.die(
+                "mounts rejected. Ensure mount_roots includes the host path and no path traversal is present.",
+                .{},
+            ),
+            error.MountsUnsupported => errors.die(
+                "mounts not supported in this configuration. Use a single virtiofs mount.",
+                .{},
+            ),
+            else => errors.die("start failed: {s}", .{@errorName(e)}),
+        }
     };
 
     state.setStatus(allocator, name, .running) catch |e| switch (e) {
@@ -424,6 +613,7 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     vm.stop() catch |e| {
         errors.die("stop failed: {s}", .{@errorName(e)});
     };
+    unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
     state.setStatus(allocator, name, .stopped) catch |e| switch (e) {
         error.InvalidArgs => errors.die("invalid vm name: {s}\n", .{name}),
         error.NotFound => errors.die("vm not found: {s}\n", .{name}),
@@ -438,10 +628,12 @@ pub fn runStart(allocator: std.mem.Allocator, name: []const u8) !void {
         try ensureDebVmConfig(allocator);
     }
 
+    try daemon_cmd.ensureStarted(allocator);
+
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);
 
-    var cwd = std.fs.cwd();
+    var cwd = fs.cwd();
     var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
     defer vm_dir.close();
 
@@ -456,32 +648,31 @@ pub fn runStart(allocator: std.mem.Allocator, name: []const u8) !void {
 
     const socket_path = try runtime.vmConsoleSocketPath(allocator, name);
     defer allocator.free(socket_path);
-    std.fs.cwd().deleteFile(socket_path) catch {};
+    fs.cwd().deleteFile(socket_path) catch {};
     vm_dir.deleteFile(runtime.stop_request_file) catch {};
 
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
 
     var argv = [_][]const u8{ exe_path, "run", name };
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    if (builtin.os.tag != .windows) {
-        child.pgid = 0;
-    }
-
-    var env_map = try std.process.getEnvMap(allocator);
+    var env_map = try util_env.getMap(allocator);
     defer env_map.deinit();
     try env_map.put("M80_CONSOLE_SOCKET", socket_path);
-    const log_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, "run.log" });
+    const log_path = try fs.path.join(allocator, &[_][]const u8{ dir_path, "run.log" });
     defer allocator.free(log_path);
     try env_map.put("M80_LOG_FILE", log_path);
-    child.env_map = &env_map;
-
-    try child.spawn();
+    var threaded_io = std.Io.Threaded.init(allocator, .{});
+    defer threaded_io.deinit();
+    const child = try std.process.spawn(threaded_io.io(), .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = if (builtin.os.tag != .windows) 0 else null,
+        .environ_map = &env_map,
+    });
     if (builtin.os.tag != .windows) {
-        try runtime.writeVmPid(vm_dir, @intCast(child.id));
+        try runtime.writeVmPid(vm_dir, @intCast(child.id.?));
     }
 
     var started = false;
@@ -492,7 +683,7 @@ pub fn runStart(allocator: std.mem.Allocator, name: []const u8) !void {
             started = true;
             break;
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        sync.sleep(100 * std.time.ns_per_ms);
     }
     if (started) {
         std.debug.print("vm started: {s}\n", .{name});
@@ -503,7 +694,9 @@ pub fn runStart(allocator: std.mem.Allocator, name: []const u8) !void {
 
 pub fn runRun(allocator: std.mem.Allocator, name: []const u8) !void {
     const ensure = std.mem.eql(u8, name, "deb");
-    if (std.process.getEnvVarOwned(allocator, "M80_CONSOLE_SOCKET") catch null == null) {
+    const existing_socket = util_env.getVarOwned(allocator, "M80_CONSOLE_SOCKET") catch null;
+    defer if (existing_socket) |value| allocator.free(value);
+    if (existing_socket == null) {
         const socket_path = try runtime.vmConsoleSocketPath(allocator, name);
         defer allocator.free(socket_path);
         setEnvFlag(allocator, "M80_CONSOLE_SOCKET", socket_path) catch {};
@@ -515,17 +708,23 @@ pub fn runStop(allocator: std.mem.Allocator, name: []const u8) !void {
     const dir_path = try core.paths.vmDir(allocator, name);
     defer allocator.free(dir_path);
 
-    var cwd = std.fs.cwd();
+    var cwd = fs.cwd();
     var vm_dir = cwd.openDir(dir_path, .{}) catch errors.die("vm not found: {s}", .{name});
     defer vm_dir.close();
 
     if (runtime.readVmPid(vm_dir)) |pid| {
         vm_dir.deleteFile(runtime.stop_request_file) catch {};
         if (builtin.os.tag != .windows) {
-            runtime.writeStopRequest(vm_dir) catch |e| {
-                log.warn("stop request write failed: {s}", .{@errorName(e)});
-            };
-            var exited = runtime.waitForPidExit(pid, 100, 50);
+            var exited = false;
+            if (requestGuestShutdownBestEffort(allocator, name)) {
+                exited = runtime.waitForPidExit(pid, 100, 200);
+            }
+            if (!exited) {
+                runtime.writeStopRequest(vm_dir) catch |e| {
+                    log.warn("stop request write failed: {s}", .{@errorName(e)});
+                };
+                exited = runtime.waitForPidExit(pid, 100, 50);
+            }
             if (!exited) {
                 std.posix.kill(pid, std.posix.SIG.TERM) catch |e| switch (e) {
                     error.ProcessNotFound => {},
@@ -551,6 +750,11 @@ pub fn runStop(allocator: std.mem.Allocator, name: []const u8) !void {
             errors.die("stop failed: {s}", .{@errorName(e)});
         };
     }
+
+    daemon_client.unregisterVm(allocator, name) catch |e| {
+        log.warn("daemon unregister failed: {s}", .{@errorName(e)});
+    };
+    runtime.clearGuestCid(vm_dir);
 
     state.setStatus(allocator, name, .stopped) catch |e| switch (e) {
         error.InvalidArgs => errors.die("invalid vm name: {s}", .{name}),

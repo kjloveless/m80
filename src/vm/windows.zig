@@ -32,6 +32,8 @@
 //! - 0x4000000: Initrd
 
 const std = @import("std");
+const sync = @import("../util/sync.zig");
+const fs = @import("../util/fs.zig");
 const log = @import("../util/log.zig");
 const env_util = @import("../util/env.zig");
 const builtin = @import("builtin");
@@ -598,7 +600,7 @@ fn copyFileToGuest(
 ) !u64 {
     const memory_len = std.math.cast(usize, memory_size_bytes) orelse return error.GuestImageTooLarge;
 
-    var file = try std.fs.cwd().openFile(path, .{});
+    var file = try fs.cwd().openFile(path, .{});
     defer file.close();
 
     const stat = try file.stat();
@@ -794,6 +796,10 @@ pub fn stop() !void {
     serial_io.clear(std.heap.page_allocator);
 }
 
+pub fn isVcpuRunning() bool {
+    return vcpu_running.load(.seq_cst);
+}
+
 // =============================================================================
 // TESTS
 // =============================================================================
@@ -836,9 +842,9 @@ test "integration: cpuid/io port exits keep vcpu running" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     if (!env_util.integrationEnabled(std.testing.allocator, "whp")) return error.SkipZigTest;
 
-    const kernel = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
+    const kernel = env_util.getVarOwned(std.testing.allocator, "M80_TEST_KERNEL") catch null;
     defer if (kernel) |k| std.testing.allocator.free(k);
-    const initrd = std.process.getEnvVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
+    const initrd = env_util.getVarOwned(std.testing.allocator, "M80_TEST_INITRD") catch null;
     defer if (initrd) |i| std.testing.allocator.free(i);
 
     if (kernel == null or initrd == null) return error.SkipZigTest;
@@ -862,8 +868,8 @@ test "integration: cpuid/io port exits keep vcpu running" {
     };
     defer stop() catch {};
 
-    const deadline = std.time.milliTimestamp() + 5000;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = sync.milliTimestamp() + 5000;
+    while (sync.milliTimestamp() < deadline) {
         if (cpuid_exit_count.load(.seq_cst) > 0 or ioport_exit_count.load(.seq_cst) > 0) break;
         std.time.sleep(50 * std.time.ns_per_ms);
     }
@@ -889,7 +895,7 @@ test "windows: exit reason handling" {
 test "windows: copyFileToGuest rejects oversized image" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
@@ -910,7 +916,7 @@ test "windows: copyFileToGuest rejects oversized image" {
 test "windows: copyFileToGuest rejects null memory" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.testingTmpDir(.{});
     defer tmp.cleanup();
 
     {
