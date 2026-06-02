@@ -3203,7 +3203,7 @@ test "virtio_fs: handleInit" {
     defer device.deinit();
 
     var request: [@sizeOf(FuseInHeader) + @sizeOf(FuseInitIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const header: *FuseInHeader = @ptrCast(@alignCast(&request));
+    const header: *align(1) FuseInHeader = @ptrCast(&request);
     header.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseInitIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_INIT),
@@ -3216,7 +3216,7 @@ test "virtio_fs: handleInit" {
         .padding = 0,
     };
 
-    const init_in: *FuseInitIn = @ptrCast(@alignCast(request[@sizeOf(FuseInHeader)..]));
+    const init_in: *align(1) FuseInitIn = @ptrCast(request[@sizeOf(FuseInHeader)..].ptr);
     init_in.* = .{
         .major = 7,
         .minor = 31,
@@ -3319,7 +3319,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
     const lookup_req = try allocator.alloc(u8, lookup_len);
     defer allocator.free(lookup_req);
 
-    const lookup_hdr: *FuseInHeader = @ptrCast(@alignCast(lookup_req.ptr));
+    const lookup_hdr: *align(1) FuseInHeader = @ptrCast(lookup_req.ptr);
     lookup_hdr.* = .{
         .len = @intCast(lookup_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_LOOKUP),
@@ -3348,7 +3348,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
 
     // OPEN
     var open_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const open_hdr: *FuseInHeader = @ptrCast(@alignCast(&open_req));
+    const open_hdr: *align(1) FuseInHeader = @ptrCast(&open_req);
     open_hdr.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
@@ -3360,7 +3360,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const open_in: *FuseOpenIn = @ptrCast(@alignCast(open_req[@sizeOf(FuseInHeader)..]));
+    const open_in: *align(1) FuseOpenIn = @ptrCast(open_req[@sizeOf(FuseInHeader)..].ptr);
     open_in.* = .{ .flags = O_RDWR, .open_flags = 0 };
     var open_resp: [256]u8 = undefined;
     const open_resp_len = try device.handleRequest(&open_req, &open_resp);
@@ -3373,7 +3373,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
     const write_len = @sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) + write_data.len;
     const write_req = try allocator.alloc(u8, write_len);
     defer allocator.free(write_req);
-    const write_hdr: *FuseInHeader = @ptrCast(@alignCast(write_req.ptr));
+    const write_hdr: *align(1) FuseInHeader = @ptrCast(write_req.ptr);
     write_hdr.* = .{
         .len = @intCast(write_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_WRITE),
@@ -3385,7 +3385,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const write_in: *FuseWriteIn = @ptrCast(@alignCast(write_req[@sizeOf(FuseInHeader)..]));
+    const write_in: *align(1) FuseWriteIn = @ptrCast(write_req[@sizeOf(FuseInHeader)..].ptr);
     write_in.* = .{
         .fh = fh,
         .offset = 0,
@@ -3405,7 +3405,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
     // READ back "abc"
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
     var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
+    const read_hdr: *align(1) FuseInHeader = @ptrCast(&read_req);
     read_hdr.* = .{
         .len = read_len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_READ),
@@ -3417,7 +3417,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
+    const read_in: *align(1) FuseReadIn = @ptrCast(read_req[@sizeOf(FuseInHeader)..].ptr);
     read_in.* = .{
         .fh = fh,
         .offset = 0,
@@ -3438,7 +3438,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
     // RELEASE
     const release_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReleaseIn);
     var release_req: [release_len]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const release_hdr: *FuseInHeader = @ptrCast(@alignCast(&release_req));
+    const release_hdr: *align(1) FuseInHeader = @ptrCast(&release_req);
     release_hdr.* = .{
         .len = release_len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_RELEASE),
@@ -3450,7 +3450,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const release_in: *FuseReleaseIn = @ptrCast(@alignCast(release_req[@sizeOf(FuseInHeader)..]));
+    const release_in: *align(1) FuseReleaseIn = @ptrCast(release_req[@sizeOf(FuseInHeader)..].ptr);
     release_in.* = .{
         .fh = fh,
         .flags = 0,
@@ -3497,7 +3497,7 @@ test "virtio_fs: lookup rejects traversal" {
     const req = try allocator.alloc(u8, req_len);
     defer allocator.free(req);
 
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(req.ptr));
+    const hdr: *align(1) FuseInHeader = @ptrCast(req.ptr);
     hdr.* = .{
         .len = @intCast(req_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_LOOKUP),
@@ -3529,7 +3529,7 @@ test "virtio_fs: read rejects short payload" {
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + 2]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = @intCast(req.len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_READ),
@@ -3559,7 +3559,7 @@ test "virtio_fs: handleOpen returns not found for missing node" {
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
@@ -3571,7 +3571,7 @@ test "virtio_fs: handleOpen returns not found for missing node" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const open_in: *FuseOpenIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    const open_in: *align(1) FuseOpenIn = @ptrCast(req[@sizeOf(FuseInHeader)..].ptr);
     open_in.* = .{ .flags = O_RDONLY, .open_flags = 0 };
 
     var resp: [128]u8 = undefined;
@@ -3615,7 +3615,7 @@ test "virtio_fs: handleOpen rejects write on read-only mount" {
     const nodeid = try device.allocateNode(abs, false);
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
@@ -3627,7 +3627,7 @@ test "virtio_fs: handleOpen rejects write on read-only mount" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const open_in: *FuseOpenIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    const open_in: *align(1) FuseOpenIn = @ptrCast(req[@sizeOf(FuseInHeader)..].ptr);
     open_in.* = .{ .flags = O_RDWR, .open_flags = 0 };
 
     var resp: [128]u8 = undefined;
@@ -3671,7 +3671,7 @@ test "virtio_fs: handleOpen honors O_TRUNC" {
     const nodeid = try device.allocateNode(abs, false);
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
@@ -3683,7 +3683,7 @@ test "virtio_fs: handleOpen honors O_TRUNC" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const open_in: *FuseOpenIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    const open_in: *align(1) FuseOpenIn = @ptrCast(req[@sizeOf(FuseInHeader)..].ptr);
     open_in.* = .{ .flags = O_RDWR | O_TRUNC, .open_flags = 0 };
 
     var resp: [128]u8 = undefined;
@@ -3732,7 +3732,7 @@ test "virtio_fs: handleWrite appends with O_APPEND" {
     const nodeid = try device.allocateNode(abs, false);
 
     var open_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const open_hdr: *FuseInHeader = @ptrCast(@alignCast(&open_req));
+    const open_hdr: *align(1) FuseInHeader = @ptrCast(&open_req);
     open_hdr.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseOpenIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPEN),
@@ -3744,7 +3744,7 @@ test "virtio_fs: handleWrite appends with O_APPEND" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const open_in: *FuseOpenIn = @ptrCast(@alignCast(open_req[@sizeOf(FuseInHeader)..]));
+    const open_in: *align(1) FuseOpenIn = @ptrCast(open_req[@sizeOf(FuseInHeader)..].ptr);
     open_in.* = .{ .flags = O_WRONLY | O_APPEND, .open_flags = 0 };
 
     var open_resp: [128]u8 = undefined;
@@ -3758,7 +3758,7 @@ test "virtio_fs: handleWrite appends with O_APPEND" {
     const write_len = @sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) + write_data.len;
     var write_req = try allocator.alloc(u8, write_len);
     defer allocator.free(write_req);
-    const write_hdr: *FuseInHeader = @ptrCast(@alignCast(write_req.ptr));
+    const write_hdr: *align(1) FuseInHeader = @ptrCast(write_req.ptr);
     write_hdr.* = .{
         .len = @intCast(write_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_WRITE),
@@ -3770,7 +3770,7 @@ test "virtio_fs: handleWrite appends with O_APPEND" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const write_in: *FuseWriteIn = @ptrCast(@alignCast(write_req[@sizeOf(FuseInHeader)..]));
+    const write_in: *align(1) FuseWriteIn = @ptrCast(write_req[@sizeOf(FuseInHeader)..].ptr);
     write_in.* = .{
         .fh = open_out.fh,
         .offset = 0,
@@ -3836,7 +3836,7 @@ test "virtio_fs: handleFallocate keep size" {
     const fh = try device.allocateFileHandle(nodeid, file, O_RDWR);
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseFallocateIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseFallocateIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_FALLOCATE),
@@ -3848,7 +3848,7 @@ test "virtio_fs: handleFallocate keep size" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const falloc_in: *FuseFallocateIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    const falloc_in: *align(1) FuseFallocateIn = @ptrCast(req[@sizeOf(FuseInHeader)..].ptr);
     falloc_in.* = .{
         .fh = fh,
         .offset = 0,
@@ -3879,7 +3879,7 @@ test "virtio_fs: handleSetupmapping validates payload" {
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + 1]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = req.len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_SETUPMAPPING),
@@ -3909,7 +3909,7 @@ test "virtio_fs: handleRemovemapping validates payload" {
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseRemovemappingIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = req.len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_REMOVEMAPPING),
@@ -3921,7 +3921,7 @@ test "virtio_fs: handleRemovemapping validates payload" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const remove_in: *FuseRemovemappingIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    const remove_in: *align(1) FuseRemovemappingIn = @ptrCast(req[@sizeOf(FuseInHeader)..].ptr);
     remove_in.* = .{
         .count = 1,
         .padding = 0,
@@ -3961,7 +3961,7 @@ test "virtio_fs: handleRead rejects invalid handle" {
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
     var req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = read_len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_READ),
@@ -3973,7 +3973,7 @@ test "virtio_fs: handleRead rejects invalid handle" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const read_in: *FuseReadIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    const read_in: *align(1) FuseReadIn = @ptrCast(req[@sizeOf(FuseInHeader)..].ptr);
     read_in.* = .{
         .fh = 999,
         .offset = 0,
@@ -4029,7 +4029,7 @@ test "virtio_fs: handleRead errors on short response buffer" {
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
     var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
+    const read_hdr: *align(1) FuseInHeader = @ptrCast(&read_req);
     read_hdr.* = .{
         .len = read_len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_READ),
@@ -4041,7 +4041,7 @@ test "virtio_fs: handleRead errors on short response buffer" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
+    const read_in: *align(1) FuseReadIn = @ptrCast(read_req[@sizeOf(FuseInHeader)..].ptr);
     read_in.* = .{
         .fh = fh,
         .offset = 0,
@@ -4066,7 +4066,7 @@ test "virtio_fs: handleWrite rejects short payload" {
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) - 1]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = req.len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_WRITE),
@@ -4124,7 +4124,7 @@ test "virtio_fs: handleRead rejects write-only file handle" {
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
     var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
+    const read_hdr: *align(1) FuseInHeader = @ptrCast(&read_req);
     read_hdr.* = .{
         .len = read_len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_READ),
@@ -4136,7 +4136,7 @@ test "virtio_fs: handleRead rejects write-only file handle" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
+    const read_in: *align(1) FuseReadIn = @ptrCast(read_req[@sizeOf(FuseInHeader)..].ptr);
     read_in.* = .{
         .fh = fh,
         .offset = 0,
@@ -4197,7 +4197,7 @@ test "virtio_fs: handleWrite rejects read-only file handle" {
     const write_req = try allocator.alloc(u8, write_len);
     defer allocator.free(write_req);
 
-    const write_hdr: *FuseInHeader = @ptrCast(@alignCast(write_req.ptr));
+    const write_hdr: *align(1) FuseInHeader = @ptrCast(write_req.ptr);
     write_hdr.* = .{
         .len = @intCast(write_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_WRITE),
@@ -4209,7 +4209,7 @@ test "virtio_fs: handleWrite rejects read-only file handle" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const write_in: *FuseWriteIn = @ptrCast(@alignCast(write_req[@sizeOf(FuseInHeader)..]));
+    const write_in: *align(1) FuseWriteIn = @ptrCast(write_req[@sizeOf(FuseInHeader)..].ptr);
     write_in.* = .{
         .fh = fh,
         .offset = 0,
@@ -4268,7 +4268,7 @@ test "virtio_fs: handleOpendir rejects non-dir node" {
     const nodeid = try device.allocateNode(abs, false);
 
     var req: [@sizeOf(FuseInHeader)]u8 = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = @sizeOf(FuseInHeader),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPENDIR),
@@ -4298,7 +4298,7 @@ test "virtio_fs: handleReleasedir rejects short payload" {
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + 1]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = req.len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_RELEASEDIR),
@@ -4345,7 +4345,7 @@ test "virtio_fs: handleRelease closes file handle" {
     try std.testing.expect(device.handles.contains(fh));
 
     var req: [@sizeOf(FuseInHeader) + @sizeOf(FuseReleaseIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = req.len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_RELEASE),
@@ -4357,7 +4357,7 @@ test "virtio_fs: handleRelease closes file handle" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const release_in: *FuseReleaseIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    const release_in: *align(1) FuseReleaseIn = @ptrCast(req[@sizeOf(FuseInHeader)..].ptr);
     release_in.* = .{
         .fh = fh,
         .flags = 0,
@@ -4381,7 +4381,7 @@ test "virtio_fs: handleReaddir rejects short payload" {
     defer device.deinit();
 
     var req: [@sizeOf(FuseInHeader) + 2]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(&req));
+    const hdr: *align(1) FuseInHeader = @ptrCast(&req);
     hdr.* = .{
         .len = req.len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_READDIR),
@@ -4443,7 +4443,7 @@ test "virtio_fs: handleReaddir returns entries" {
 
     // OPENDIR
     var open_req: [@sizeOf(FuseInHeader)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const open_hdr: *FuseInHeader = @ptrCast(@alignCast(&open_req));
+    const open_hdr: *align(1) FuseInHeader = @ptrCast(&open_req);
     open_hdr.* = .{
         .len = @sizeOf(FuseInHeader),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPENDIR),
@@ -4465,7 +4465,7 @@ test "virtio_fs: handleReaddir returns entries" {
     // READDIR
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
     var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
+    const read_hdr: *align(1) FuseInHeader = @ptrCast(&read_req);
     read_hdr.* = .{
         .len = read_len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_READDIR),
@@ -4477,7 +4477,7 @@ test "virtio_fs: handleReaddir returns entries" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
+    const read_in: *align(1) FuseReadIn = @ptrCast(read_req[@sizeOf(FuseInHeader)..].ptr);
     read_in.* = .{
         .fh = fh,
         .offset = 0,
@@ -4552,7 +4552,7 @@ test "virtio_fs: readdirplus returns generation" {
     const nodeid = try device.allocateNode(abs, true);
 
     var open_req: [@sizeOf(FuseInHeader)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const open_hdr: *FuseInHeader = @ptrCast(@alignCast(&open_req));
+    const open_hdr: *align(1) FuseInHeader = @ptrCast(&open_req);
     open_hdr.* = .{
         .len = @sizeOf(FuseInHeader),
         .opcode = @intFromEnum(FuseOpcode.FUSE_OPENDIR),
@@ -4573,7 +4573,7 @@ test "virtio_fs: readdirplus returns generation" {
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
     var read_req: [read_len]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const read_hdr: *FuseInHeader = @ptrCast(@alignCast(&read_req));
+    const read_hdr: *align(1) FuseInHeader = @ptrCast(&read_req);
     read_hdr.* = .{
         .len = read_len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_READDIRPLUS),
@@ -4585,7 +4585,7 @@ test "virtio_fs: readdirplus returns generation" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const read_in: *FuseReadIn = @ptrCast(@alignCast(read_req[@sizeOf(FuseInHeader)..]));
+    const read_in: *align(1) FuseReadIn = @ptrCast(read_req[@sizeOf(FuseInHeader)..].ptr);
     read_in.* = .{
         .fh = fh,
         .offset = 0,
@@ -4666,7 +4666,7 @@ test "virtio_fs: xattr roundtrip" {
     const set_len = @sizeOf(FuseInHeader) + @sizeOf(FuseSetxattrIn) + name.len + 1 + value.len;
     var set_req = try allocator.alloc(u8, set_len);
     defer allocator.free(set_req);
-    const set_hdr: *FuseInHeader = @ptrCast(@alignCast(set_req.ptr));
+    const set_hdr: *align(1) FuseInHeader = @ptrCast(set_req.ptr);
     set_hdr.* = .{
         .len = @intCast(set_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_SETXATTR),
@@ -4678,7 +4678,7 @@ test "virtio_fs: xattr roundtrip" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const set_in: *FuseSetxattrIn = @ptrCast(@alignCast(set_req[@sizeOf(FuseInHeader)..]));
+    const set_in: *align(1) FuseSetxattrIn = @ptrCast(set_req[@sizeOf(FuseInHeader)..].ptr);
     set_in.* = .{
         .size = @intCast(value.len),
         .flags = 0,
@@ -4702,7 +4702,7 @@ test "virtio_fs: xattr roundtrip" {
     const get0_len = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn) + name.len + 1;
     var get0_req = try allocator.alloc(u8, get0_len);
     defer allocator.free(get0_req);
-    const get0_hdr: *FuseInHeader = @ptrCast(@alignCast(get0_req.ptr));
+    const get0_hdr: *align(1) FuseInHeader = @ptrCast(get0_req.ptr);
     get0_hdr.* = .{
         .len = @intCast(get0_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_GETXATTR),
@@ -4714,7 +4714,7 @@ test "virtio_fs: xattr roundtrip" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const get0_in: *FuseGetxattrIn = @ptrCast(@alignCast(get0_req[@sizeOf(FuseInHeader)..]));
+    const get0_in: *align(1) FuseGetxattrIn = @ptrCast(get0_req[@sizeOf(FuseInHeader)..].ptr);
     get0_in.* = .{ .size = 0, .padding = 0 };
     pos = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn);
     @memcpy(get0_req[pos..][0..name.len], name);
@@ -4732,7 +4732,7 @@ test "virtio_fs: xattr roundtrip" {
     const get_len = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn) + name.len + 1;
     var get_req = try allocator.alloc(u8, get_len);
     defer allocator.free(get_req);
-    const get_hdr: *FuseInHeader = @ptrCast(@alignCast(get_req.ptr));
+    const get_hdr: *align(1) FuseInHeader = @ptrCast(get_req.ptr);
     get_hdr.* = .{
         .len = @intCast(get_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_GETXATTR),
@@ -4744,7 +4744,7 @@ test "virtio_fs: xattr roundtrip" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const get_in: *FuseGetxattrIn = @ptrCast(@alignCast(get_req[@sizeOf(FuseInHeader)..]));
+    const get_in: *align(1) FuseGetxattrIn = @ptrCast(get_req[@sizeOf(FuseInHeader)..].ptr);
     get_in.* = .{ .size = @intCast(value.len), .padding = 0 };
     pos = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn);
     @memcpy(get_req[pos..][0..name.len], name);
@@ -4762,7 +4762,7 @@ test "virtio_fs: xattr roundtrip" {
     // LISTXATTR size=0
     const list0_len = @sizeOf(FuseInHeader) + @sizeOf(FuseGetxattrIn);
     var list0_req: [list0_len]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const list0_hdr: *FuseInHeader = @ptrCast(@alignCast(&list0_req));
+    const list0_hdr: *align(1) FuseInHeader = @ptrCast(&list0_req);
     list0_hdr.* = .{
         .len = list0_len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_LISTXATTR),
@@ -4774,7 +4774,7 @@ test "virtio_fs: xattr roundtrip" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const list0_in: *FuseGetxattrIn = @ptrCast(@alignCast(list0_req[@sizeOf(FuseInHeader)..]));
+    const list0_in: *align(1) FuseGetxattrIn = @ptrCast(list0_req[@sizeOf(FuseInHeader)..].ptr);
     list0_in.* = .{ .size = 0, .padding = 0 };
     var list0_resp: [256]u8 = undefined;
     const list0_resp_len = try device.handleRequest(&list0_req, &list0_resp);
@@ -4786,7 +4786,7 @@ test "virtio_fs: xattr roundtrip" {
 
     // LISTXATTR with buffer
     var list_req: [list0_len]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const list_hdr: *FuseInHeader = @ptrCast(@alignCast(&list_req));
+    const list_hdr: *align(1) FuseInHeader = @ptrCast(&list_req);
     list_hdr.* = .{
         .len = list0_len,
         .opcode = @intFromEnum(FuseOpcode.FUSE_LISTXATTR),
@@ -4798,7 +4798,7 @@ test "virtio_fs: xattr roundtrip" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const list_in: *FuseGetxattrIn = @ptrCast(@alignCast(list_req[@sizeOf(FuseInHeader)..]));
+    const list_in: *align(1) FuseGetxattrIn = @ptrCast(list_req[@sizeOf(FuseInHeader)..].ptr);
     list_in.* = .{ .size = @intCast(list_len), .padding = 0 };
     var list_resp: [256]u8 = undefined;
     const list_resp_len = try device.handleRequest(&list_req, &list_resp);
@@ -4812,7 +4812,7 @@ test "virtio_fs: xattr roundtrip" {
     const rem_len = @sizeOf(FuseInHeader) + name.len + 1;
     var rem_req = try allocator.alloc(u8, rem_len);
     defer allocator.free(rem_req);
-    const rem_hdr: *FuseInHeader = @ptrCast(@alignCast(rem_req.ptr));
+    const rem_hdr: *align(1) FuseInHeader = @ptrCast(rem_req.ptr);
     rem_hdr.* = .{
         .len = @intCast(rem_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_REMOVEXATTR),
@@ -4932,7 +4932,7 @@ test "virtio_fs: setattr ctime no-op succeeds" {
     const lookup_len = @sizeOf(FuseInHeader) + name.len + 1;
     const lookup_req = try allocator.alloc(u8, lookup_len);
     defer allocator.free(lookup_req);
-    const lookup_hdr: *FuseInHeader = @ptrCast(@alignCast(lookup_req.ptr));
+    const lookup_hdr: *align(1) FuseInHeader = @ptrCast(lookup_req.ptr);
     lookup_hdr.* = .{
         .len = @intCast(lookup_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_LOOKUP),
@@ -4954,7 +4954,7 @@ test "virtio_fs: setattr ctime no-op succeeds" {
     const nodeid = entry_out.nodeid;
 
     var set_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseSetattrIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const set_hdr: *FuseInHeader = @ptrCast(@alignCast(&set_req));
+    const set_hdr: *align(1) FuseInHeader = @ptrCast(&set_req);
     set_hdr.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseSetattrIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_SETATTR),
@@ -4966,7 +4966,7 @@ test "virtio_fs: setattr ctime no-op succeeds" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const set_in: *FuseSetattrIn = @ptrCast(@alignCast(set_req[@sizeOf(FuseInHeader)..]));
+    const set_in: *align(1) FuseSetattrIn = @ptrCast(set_req[@sizeOf(FuseInHeader)..].ptr);
     set_in.* = std.mem.zeroes(FuseSetattrIn);
     set_in.valid = FATTR_CTIME;
     set_in.ctime = 0;
@@ -5028,7 +5028,7 @@ test "virtio_fs: fcntl locks" {
         .padding = 0,
     };
     var set_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseLkIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const set_hdr: *FuseInHeader = @ptrCast(@alignCast(&set_req));
+    const set_hdr: *align(1) FuseInHeader = @ptrCast(&set_req);
     set_hdr.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseLkIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_SETLK),
@@ -5048,7 +5048,7 @@ test "virtio_fs: fcntl locks" {
     _ = set_resp_len;
 
     var get_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseLkIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
-    const get_hdr: *FuseInHeader = @ptrCast(@alignCast(&get_req));
+    const get_hdr: *align(1) FuseInHeader = @ptrCast(&get_req);
     get_hdr.* = .{
         .len = @sizeOf(FuseInHeader) + @sizeOf(FuseLkIn),
         .opcode = @intFromEnum(FuseOpcode.FUSE_GETLK),
@@ -5108,7 +5108,7 @@ test "virtio_fs: ioctl with buffers" {
     const req_len = @sizeOf(FuseInHeader) + @sizeOf(FuseIoctlIn) + data.len;
     var req = try allocator.alloc(u8, req_len);
     defer allocator.free(req);
-    const hdr: *FuseInHeader = @ptrCast(@alignCast(req.ptr));
+    const hdr: *align(1) FuseInHeader = @ptrCast(req.ptr);
     hdr.* = .{
         .len = @intCast(req_len),
         .opcode = @intFromEnum(FuseOpcode.FUSE_IOCTL),
@@ -5120,7 +5120,7 @@ test "virtio_fs: ioctl with buffers" {
         .total_extlen = 0,
         .padding = 0,
     };
-    const ioctl_in: *FuseIoctlIn = @ptrCast(@alignCast(req[@sizeOf(FuseInHeader)..]));
+    const ioctl_in: *align(1) FuseIoctlIn = @ptrCast(req[@sizeOf(FuseInHeader)..].ptr);
     ioctl_in.* = .{
         .fh = fh,
         .flags = 0,
