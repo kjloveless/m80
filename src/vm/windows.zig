@@ -948,7 +948,7 @@ fn buildEffectiveCmdline(allocator: std.mem.Allocator, cfg: config.VmConfig) ![]
 
 fn activeMemorySlice() ?[]u8 {
     const mem_ptr = active_memory orelse return null;
-    const base_ptr: [*]u8 = @ptrCast(@alignCast(mem_ptr));
+    const base_ptr: [*]u8 = @ptrCast(mem_ptr);
     return base_ptr[0..active_memory_size];
 }
 
@@ -1364,7 +1364,7 @@ fn copyFileToGuest(
         return error.GuestImageTooLarge;
 
     const mem_ptr = mem orelse return error.MemoryAllocFailed;
-    const base_ptr: [*]u8 = @ptrCast(@alignCast(mem_ptr));
+    const base_ptr: [*]u8 = @ptrCast(mem_ptr);
     const dst = base_ptr[range.offset..range.end];
 
     var buf: [4096]u8 = undefined;
@@ -1419,7 +1419,7 @@ fn writeCmdlineToGuest(mem: ?*anyopaque, memory_size_bytes: u64, state: boot.Boo
         return error.GuestImageTooLarge;
 
     const mem_ptr = mem orelse return error.MemoryAllocFailed;
-    const base_ptr: [*]u8 = @ptrCast(@alignCast(mem_ptr));
+    const base_ptr: [*]u8 = @ptrCast(mem_ptr);
     const dst = base_ptr[range.offset..range.end];
 
     @memset(dst, 0);
@@ -1862,7 +1862,7 @@ test "windows: writeCmdlineToGuest writes null-terminated string" {
     @memset(mem, 0xCC);
 
     const state = try boot.computeBootState(0x4000, 0x1000, 0x200, "abc");
-    try writeCmdlineToGuest(@ptrCast(@alignCast(mem.ptr)), 0x4000, state, "abc");
+    try writeCmdlineToGuest(@ptrCast(mem.ptr), 0x4000, state, "abc");
 
     const cmdline_offset: usize = @intCast(state.cmdline_addr);
     try std.testing.expectEqual(@as(u8, 'a'), mem[cmdline_offset]);
