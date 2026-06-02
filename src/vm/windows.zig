@@ -91,8 +91,15 @@ const VirtioIrqLayout = struct {
 
 const virtio_irq_layout = VirtioIrqLayout{};
 
+const WhvX64LocalApicEmulationMode = enum(u32) {
+    None = 0,
+    XApic = 1,
+    X2Apic = 2,
+};
+
 const WHV_PARTITION_PROPERTY = extern union {
     ProcessorCount: u32,
+    LocalApicEmulationMode: WhvX64LocalApicEmulationMode,
 };
 
 const WhvX64VpExecutionState = extern union {
@@ -290,7 +297,8 @@ pub const Whp = struct {
         memory_mb: u32,
     };
 
-    const WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT: u32 = 0x00000001;
+    const WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE: u32 = 0x00001005;
+    const WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT: u32 = 0x00001fff;
 
     const PFN_WHvCreatePartition = *const fn (*PartitionHandle) callconv(.winapi) HRESULT;
     const PFN_WHvSetupPartition = *const fn (PartitionHandle) callconv(.winapi) HRESULT;
@@ -438,6 +446,15 @@ pub const Whp = struct {
             @sizeOf(WHV_PARTITION_PROPERTY),
         );
         if (failed(hr_prop)) return error.WhpFailure;
+
+        var apic_prop = WHV_PARTITION_PROPERTY{ .LocalApicEmulationMode = .XApic };
+        const hr_apic = whp.set_property(
+            handle,
+            WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE,
+            &apic_prop,
+            @sizeOf(WHV_PARTITION_PROPERTY),
+        );
+        if (failed(hr_apic)) return error.WhpFailure;
 
         const hr = whp.setup(handle);
         if (failed(hr)) return error.WhpFailure;
@@ -2047,6 +2064,13 @@ test "windows: applyVirtioDeviceIrqsFromCmdline overrides default irq mapping" {
 
     applyVirtioDeviceIrqsFromCmdline("console=ttyS0 virtio_mmio.device=0x1000@0xa000000:19");
     try std.testing.expectEqual(@as(?u32, 19), virtio.gic_virtio_blk_intid[0]);
+}
+
+test "windows: WHP partition properties match API values" {
+    try std.testing.expectEqual(@as(u32, 0x00001005), Whp.WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE);
+    try std.testing.expectEqual(@as(u32, 0x00001fff), Whp.WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT);
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(WhvX64LocalApicEmulationMode.XApic));
+    try std.testing.expectEqual(@sizeOf(u32), @sizeOf(WHV_PARTITION_PROPERTY));
 }
 
 test "windows: irqToX86Vector adds legacy vector offset" {
