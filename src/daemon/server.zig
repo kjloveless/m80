@@ -692,6 +692,8 @@ fn closeSocket(socket: std.Io.net.Socket) void {
     socket.close(fs.io());
 }
 
+const tcp_connect_timeout_ms: i64 = 5000;
+
 fn shortTimeout(ms: i64) std.Io.Timeout {
     return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
 }
@@ -917,7 +919,7 @@ fn openTcpConnection(allocator: std.mem.Allocator, record: *const VmRecord, host
         const stream = address.connect(fs.io(), .{
             .mode = .stream,
             .protocol = .tcp,
-            .timeout = .none,
+            .timeout = shortTimeout(tcp_connect_timeout_ms),
         }) catch |e| {
             last_error = e;
             continue;
