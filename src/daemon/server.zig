@@ -1853,6 +1853,50 @@ fn responseErrorString(allocator: std.mem.Allocator, response: []const u8) !?[]u
     return try allocator.dupe(u8, parsed.value.object.get("error").?.string);
 }
 
+fn closeTcpStreamsForTest(state: *DaemonState) void {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
+    var stream_it = state.tcp_streams.iterator();
+    while (stream_it.next()) |entry| {
+        closeTcpStream(entry.value_ptr.stream);
+    }
+    state.tcp_streams.clearRetainingCapacity();
+}
+
+fn wakeTcpServer(port: u16) void {
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var stream = address.connect(fs.io(), .{
+        .mode = .stream,
+        .protocol = .tcp,
+        .timeout = .none,
+    }) catch return;
+    stream.close(fs.io());
+}
+
+fn wakeUdpSocket(port: u16) void {
+    const bind_addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var socket = bind_addr.bind(fs.io(), .{ .mode = .dgram, .protocol = .udp }) catch return;
+    defer socket.close(fs.io());
+
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    socket.send(fs.io(), &address, "wake") catch {};
+}
+
+fn readFdWithTimeout(fd: std.posix.fd_t, buf: []u8, timeout_ms: i32) !usize {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(fds[0..], timeout_ms);
+    if (ready == 0) return error.Timeout;
+    const revents = fds[0].revents;
+    if ((revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return error.SocketUnconnected;
+    if ((revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0) return error.Timeout;
+    return fs.readFd(fd, buf);
+}
+
 test "daemon server: control ping succeeds" {
     var state = DaemonState.init(std.testing.allocator);
     defer state.deinit();
@@ -2052,7 +2096,8 @@ fn tcpEchoOnce(server: *std.Io.net.Server) void {
     var stream = server.accept(fs.io()) catch return;
     defer stream.close(fs.io());
     var buf: [32]u8 = undefined;
-    const n = fs.readFd(stream.socket.handle, &buf) catch return;
+    const n = readFdWithTimeout(stream.socket.handle, &buf, 2000) catch return;
+    if (n == 0) return;
     writeFullFd(stream.socket.handle, buf[0..n]) catch {};
 }
 
@@ -2062,6 +2107,17 @@ fn tcpAcceptCloseOnce(server: *std.Io.net.Server) void {
 }
 
 fn udpEchoOnce(fd: std.posix.fd_t) void {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(fds[0..], 2000) catch return;
+    if (ready == 0) return;
+    const revents = fds[0].revents;
+    if ((revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return;
+    if ((revents & std.posix.POLL.IN) == 0) return;
+
     var buf: [128]u8 = undefined;
     var peer: std.c.sockaddr.storage = undefined;
     var peer_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
@@ -2096,6 +2152,8 @@ test "daemon server: tcp streams are cid-bound and enforce ip allowlist" {
     const port = server.socket.address.getPort();
     const thread = try std.Thread.spawn(.{}, tcpEchoOnce, .{&server});
     defer {
+        closeTcpStreamsForTest(&state);
+        wakeTcpServer(port);
         server.deinit(fs.io());
         thread.join();
     }
@@ -2159,6 +2217,8 @@ test "daemon server: tcp connect aliases tcp open stream registration" {
     const port = server.socket.address.getPort();
     const thread = try std.Thread.spawn(.{}, tcpAcceptCloseOnce, .{&server});
     defer {
+        closeTcpStreamsForTest(&state);
+        wakeTcpServer(port);
         server.deinit(fs.io());
         thread.join();
     }
@@ -2210,6 +2270,7 @@ test "daemon server: udp exchange enforces policy before host socket use" {
     const port = socket.address.getPort();
     const thread = try std.Thread.spawn(.{}, udpEchoOnce, .{socket.handle});
     defer {
+        wakeUdpSocket(port);
         socket.close(fs.io());
         thread.join();
     }

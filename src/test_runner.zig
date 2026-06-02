@@ -367,6 +367,8 @@ pub fn main(init: std.process.Init) !void {
         // Print progress
         if (use_ansi) {
             printProgress(i, selected_tests.items.len, test_fn.name, ok_count, fail_count, skip_count);
+        } else {
+            std.debug.print("test {d}/{d}: {s}\n", .{ i + 1, selected_tests.items.len, test_fn.name });
         }
 
         // Time the test
