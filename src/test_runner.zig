@@ -358,6 +358,11 @@ pub fn main(init: std.process.Init) !void {
     for (selected_tests.items, 0..) |test_fn, i| {
         // Fresh allocator per test for leak detection
         testing.allocator_instance = .{};
+        testing.environ = init.minimal.environ;
+        testing.io_instance = .init(testing.allocator, .{
+            .argv0 = .init(init.minimal.args),
+            .environ = init.minimal.environ,
+        });
 
         testing.log_level = .warn;
 
@@ -373,7 +378,10 @@ pub fn main(init: std.process.Init) !void {
 
         // Time the test
         const test_start = nanoTimestamp();
-        const test_result = test_fn.func();
+        const test_result = blk: {
+            defer testing.io_instance.deinit();
+            break :blk test_fn.func();
+        };
         const test_end = nanoTimestamp();
         const duration: u64 = @intCast(@max(0, test_end - test_start));
 
