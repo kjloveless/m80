@@ -175,6 +175,25 @@ pub const FuseInitOut = extern struct {
     unused: [8]u32,
 };
 
+fn writeStructAt(buf: []u8, offset: usize, value: anytype) void {
+    const T = @TypeOf(value);
+    @memcpy(buf[offset..][0..@sizeOf(T)], std.mem.asBytes(&value));
+}
+
+fn readStructAt(comptime T: type, buf: []const u8, offset: usize) T {
+    var value: T = undefined;
+    @memcpy(std.mem.asBytes(&value), buf[offset..][0..@sizeOf(T)]);
+    return value;
+}
+
+fn writeOutHeader(buf: []u8, len: usize, err: i32, unique: u64) void {
+    writeStructAt(buf, 0, FuseOutHeader{
+        .len = @intCast(len),
+        .@"error" = err,
+        .unique = unique,
+    });
+}
+
 pub const FuseSetattrIn = extern struct {
     valid: u32,
     padding: u32,
@@ -709,19 +728,15 @@ pub const VirtioFsDevice = struct {
             return VirtioFsError.IoError;
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(total_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
+        writeOutHeader(response_buf, total_size, 0, header.unique);
 
-        const out_init: *FuseInitOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
         var flags: u32 = 0;
         switch (self.cache_mode) {
             .none => {},
             .auto => flags |= FuseInitFlags.FUSE_CAP_AUTO_INVAL_DATA,
             .always => flags |= FuseInitFlags.FUSE_CAP_WRITEBACK_CACHE,
         }
-        out_init.* = .{
+        const out_init = FuseInitOut{
             .major = @max(init_in.major, 7),
             .minor = @min(init_in.minor, 31),
             .max_readahead = @min(init_in.max_readahead, 131072),
@@ -734,6 +749,7 @@ pub const VirtioFsDevice = struct {
             .map_alignment = 0,
             .unused = std.mem.zeroes([8]u32),
         };
+        writeStructAt(response_buf, out_header_size, out_init);
 
         return total_size;
     }
@@ -824,10 +840,7 @@ pub const VirtioFsDevice = struct {
             else => return self.sendError(header, -5, response_buf),
         };
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + link_len);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
+        writeOutHeader(response_buf, out_header_size + link_len, 0, header.unique);
         return out_header_size + link_len;
     }
 
@@ -886,7 +899,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -2, response_buf);
         };
 
-        const rename_in: *const FuseRenameIn = @ptrCast(@alignCast(payload.ptr));
+        const rename_in = readStructAt(FuseRenameIn, payload, 0);
         const new_parent = self.nodes.get(rename_in.newdir) orelse {
             return self.sendError(header, -2, response_buf);
         };
@@ -936,7 +949,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseRename2In)) {
             return self.sendError(header, -22, response_buf);
         }
-        const rename2_in: *const FuseRename2In = @ptrCast(@alignCast(payload.ptr));
+        const rename2_in = readStructAt(FuseRename2In, payload, 0);
         // Only support flags=0 or NOREPLACE (1).
         const RENAME_NOREPLACE: u32 = 1;
         if (rename2_in.flags != 0 and rename2_in.flags != RENAME_NOREPLACE) {
@@ -1005,7 +1018,7 @@ pub const VirtioFsDevice = struct {
         const parent_node = self.nodes.get(header.nodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
-        const link_in: *const FuseLinkIn = @ptrCast(@alignCast(payload.ptr));
+        const link_in = readStructAt(FuseLinkIn, payload, 0);
         const old_node = self.nodes.get(link_in.oldnodeid) orelse {
             return self.sendError(header, -2, response_buf);
         };
@@ -1195,7 +1208,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -21, response_buf);
         }
 
-        const open_in: *const FuseOpenIn = @ptrCast(@alignCast(payload.ptr));
+        const open_in = readStructAt(FuseOpenIn, payload, 0);
         const accmode = open_in.flags & O_ACCMODE;
         const write_access = accmode != O_RDONLY;
         if ((open_in.flags & O_TRUNC) != 0 and !write_access) {
@@ -1368,10 +1381,7 @@ pub const VirtioFsDevice = struct {
         f.seekTo(read_in.offset) catch return self.sendError(header, -5, response_buf);
         const bytes_read = f.read(response_buf[out_header_size..][0..max_data]) catch return self.sendError(header, -5, response_buf);
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + bytes_read);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
+        writeOutHeader(response_buf, out_header_size + bytes_read, 0, header.unique);
 
         return out_header_size + bytes_read;
     }
@@ -1439,12 +1449,8 @@ pub const VirtioFsDevice = struct {
             const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseStatfsOut);
             if (response_buf.len < total_size) return VirtioFsError.IoError;
 
-            const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-            out_header.len = @intCast(total_size);
-            out_header.@"error" = 0;
-            out_header.unique = header.unique;
+            writeOutHeader(response_buf, total_size, 0, header.unique);
 
-            var stat_out: *FuseStatfsOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
             var st: c.struct_statfs = undefined;
             // statfs on current working dir; callers generally use root node.
             const stat_path_z = try toZ(self.allocator, stat_path);
@@ -1454,7 +1460,7 @@ pub const VirtioFsDevice = struct {
             }
             const name_len: u64 = if (builtin.os.tag == .macos) 255 else @intCast(st.f_namelen);
             const frsize: u64 = if (builtin.os.tag == .linux) @intCast(st.f_frsize) else @intCast(st.f_bsize);
-            stat_out.st = .{
+            const stat_out = FuseStatfsOut{ .st = .{
                 .blocks = @intCast(st.f_blocks),
                 .bfree = @intCast(st.f_bfree),
                 .bavail = @intCast(st.f_bavail),
@@ -1465,20 +1471,17 @@ pub const VirtioFsDevice = struct {
                 .frsize = @intCast(frsize),
                 .padding = 0,
                 .spare = std.mem.zeroes([6]u32),
-            };
+            } };
+            writeStructAt(response_buf, @sizeOf(FuseOutHeader), stat_out);
             return total_size;
         }
 
         const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseStatfsOut);
         if (response_buf.len < total_size) return VirtioFsError.IoError;
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(total_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
+        writeOutHeader(response_buf, total_size, 0, header.unique);
 
-        const stat_out: *FuseStatfsOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
-        stat_out.st = .{
+        const stat_out = FuseStatfsOut{ .st = .{
             .blocks = 0,
             .bfree = 0,
             .bavail = 0,
@@ -1489,7 +1492,8 @@ pub const VirtioFsDevice = struct {
             .frsize = 4096,
             .padding = 0,
             .spare = std.mem.zeroes([6]u32),
-        };
+        } };
+        writeStructAt(response_buf, @sizeOf(FuseOutHeader), stat_out);
 
         return total_size;
     }
@@ -1528,7 +1532,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        const create_in: *const FuseCreateIn = @ptrCast(@alignCast(payload.ptr));
+        const create_in = readStructAt(FuseCreateIn, payload, 0);
         const accmode = create_in.flags & O_ACCMODE;
         const read_enabled = accmode != O_WRONLY;
         if ((create_in.flags & O_TRUNC) != 0 and accmode == O_RDONLY) {
@@ -1691,7 +1695,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseFsyncIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const fsync_in: *const FuseFsyncIn = @ptrCast(@alignCast(payload.ptr));
+        const fsync_in = readStructAt(FuseFsyncIn, payload, 0);
         const handle = self.handles.get(fsync_in.fh) orelse return self.sendError(header, -9, response_buf);
         if (handle.file) |f| {
             f.sync() catch return self.sendError(header, -5, response_buf);
@@ -1806,10 +1810,7 @@ pub const VirtioFsDevice = struct {
             next_off += 1;
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(pos);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
+        writeOutHeader(response_buf, pos, 0, header.unique);
 
         return pos;
     }
@@ -1913,10 +1914,7 @@ pub const VirtioFsDevice = struct {
             next_off += 1;
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(pos);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
+        writeOutHeader(response_buf, pos, 0, header.unique);
 
         return pos;
     }
@@ -1953,7 +1951,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseFsyncIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const fsync_in: *const FuseFsyncIn = @ptrCast(@alignCast(payload.ptr));
+        const fsync_in = readStructAt(FuseFsyncIn, payload, 0);
         const handle = self.handles.get(fsync_in.fh) orelse return self.sendError(header, -9, response_buf);
         if (handle.dir) |d| {
             fs.syncFd(d.fd) catch return self.sendError(header, -5, response_buf);
@@ -1975,7 +1973,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, -2, response_buf);
         };
 
-        const access_in: *const FuseAccessIn = @ptrCast(@alignCast(payload.ptr));
+        const access_in = readStructAt(FuseAccessIn, payload, 0);
         const R_OK: u32 = 4;
         const W_OK: u32 = 2;
         const X_OK: u32 = 1;
@@ -2030,7 +2028,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        const set_in: *const FuseSetxattrIn = @ptrCast(@alignCast(payload.ptr));
+        const set_in = readStructAt(FuseSetxattrIn, payload, 0);
         const name = parseCString(payload, @sizeOf(FuseSetxattrIn)) orelse return self.sendError(header, -22, response_buf);
         const value_start = name.next;
         if (value_start + set_in.size > payload.len) {
@@ -2073,7 +2071,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        const get_in: *const FuseGetxattrIn = @ptrCast(@alignCast(payload.ptr));
+        const get_in = readStructAt(FuseGetxattrIn, payload, 0);
         const name = parseCString(payload, @sizeOf(FuseGetxattrIn)) orelse return self.sendError(header, -22, response_buf);
 
         const path_z = try toZ(self.allocator, node.path);
@@ -2091,13 +2089,11 @@ pub const VirtioFsDevice = struct {
             }
             const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseGetxattrOut);
             if (response_buf.len < total_size) return VirtioFsError.IoError;
-            const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-            out_header.len = @intCast(total_size);
-            out_header.@"error" = 0;
-            out_header.unique = header.unique;
-            const out: *FuseGetxattrOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
-            out.size = @intCast(size);
-            out.padding = 0;
+            writeOutHeader(response_buf, total_size, 0, header.unique);
+            writeStructAt(response_buf, @sizeOf(FuseOutHeader), FuseGetxattrOut{
+                .size = @intCast(size),
+                .padding = 0,
+            });
             return total_size;
         }
 
@@ -2112,10 +2108,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + @as(usize, @intCast(size)));
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
+        writeOutHeader(response_buf, out_header_size + @as(usize, @intCast(size)), 0, header.unique);
         return out_header_size + @as(usize, @intCast(size));
     }
 
@@ -2137,7 +2130,7 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errno, response_buf);
         }
 
-        const list_in: *const FuseGetxattrIn = @ptrCast(@alignCast(payload.ptr));
+        const list_in = readStructAt(FuseGetxattrIn, payload, 0);
         const path_z = try toZ(self.allocator, node.path);
         defer self.allocator.free(path_z);
 
@@ -2151,13 +2144,11 @@ pub const VirtioFsDevice = struct {
             }
             const total_size = @sizeOf(FuseOutHeader) + @sizeOf(FuseGetxattrOut);
             if (response_buf.len < total_size) return VirtioFsError.IoError;
-            const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-            out_header.len = @intCast(total_size);
-            out_header.@"error" = 0;
-            out_header.unique = header.unique;
-            const out: *FuseGetxattrOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
-            out.size = @intCast(size);
-            out.padding = 0;
+            writeOutHeader(response_buf, total_size, 0, header.unique);
+            writeStructAt(response_buf, @sizeOf(FuseOutHeader), FuseGetxattrOut{
+                .size = @intCast(size),
+                .padding = 0,
+            });
             return total_size;
         }
 
@@ -2171,10 +2162,7 @@ pub const VirtioFsDevice = struct {
         if (size < 0) {
             return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
         }
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + @as(usize, @intCast(size)));
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
+        writeOutHeader(response_buf, out_header_size + @as(usize, @intCast(size)), 0, header.unique);
         return out_header_size + @as(usize, @intCast(size));
     }
 
@@ -2216,7 +2204,7 @@ pub const VirtioFsDevice = struct {
     ) VirtioFsError!usize {
         if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
         if (payload.len < @sizeOf(FuseLkIn)) return self.sendError(header, -22, response_buf);
-        const lk_in: *const FuseLkIn = @ptrCast(@alignCast(payload.ptr));
+        const lk_in = readStructAt(FuseLkIn, payload, 0);
         const handle = self.handles.get(lk_in.fh) orelse return self.sendError(header, -9, response_buf);
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
 
@@ -2228,12 +2216,8 @@ pub const VirtioFsDevice = struct {
         const out_header_size = @sizeOf(FuseOutHeader);
         const out_size = @sizeOf(FuseLkOut);
         if (response_buf.len < out_header_size + out_size) return VirtioFsError.IoError;
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + out_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-        const out: *FuseLkOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
-        out.lk = flockToLock(flock);
+        writeOutHeader(response_buf, out_header_size + out_size, 0, header.unique);
+        writeStructAt(response_buf, out_header_size, FuseLkOut{ .lk = flockToLock(flock) });
         return out_header_size + out_size;
     }
 
@@ -2266,7 +2250,7 @@ pub const VirtioFsDevice = struct {
     ) VirtioFsError!usize {
         if (builtin.os.tag == .windows) return self.sendError(header, -38, response_buf);
         if (payload.len < @sizeOf(FuseLkIn)) return self.sendError(header, -22, response_buf);
-        const lk_in: *const FuseLkIn = @ptrCast(@alignCast(payload.ptr));
+        const lk_in = readStructAt(FuseLkIn, payload, 0);
         const handle = self.handles.get(lk_in.fh) orelse return self.sendError(header, -9, response_buf);
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
 
@@ -2299,13 +2283,9 @@ pub const VirtioFsDevice = struct {
         const out_header_size = @sizeOf(FuseOutHeader);
         const out_size = @sizeOf(FuseBmapOut);
         if (response_buf.len < out_header_size + out_size) return VirtioFsError.IoError;
-        const in: *const FuseBmapIn = @ptrCast(@alignCast(payload.ptr));
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + out_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-        const out: *FuseBmapOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
-        out.block = in.block;
+        const in = readStructAt(FuseBmapIn, payload, 0);
+        writeOutHeader(response_buf, out_header_size + out_size, 0, header.unique);
+        writeStructAt(response_buf, out_header_size, FuseBmapOut{ .block = in.block });
         return out_header_size + out_size;
     }
 
@@ -2321,7 +2301,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseIoctlIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const ioctl_in: *const FuseIoctlIn = @ptrCast(@alignCast(payload.ptr));
+        const ioctl_in = readStructAt(FuseIoctlIn, payload, 0);
         const handle = self.handles.get(ioctl_in.fh) orelse return self.sendError(header, -9, response_buf);
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
         if (ioctl_in.flags != 0) {
@@ -2351,15 +2331,13 @@ pub const VirtioFsDevice = struct {
             return self.sendError(header, errnoToFuse(std.posix.errno(@as(isize, -1))), response_buf);
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + out_struct_size + out_data_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-        const out: *FuseIoctlOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
-        out.result = @intCast(rc);
-        out.flags = 0;
-        out.in_iovs = 0;
-        out.out_iovs = 0;
+        writeOutHeader(response_buf, out_header_size + out_struct_size + out_data_size, 0, header.unique);
+        writeStructAt(response_buf, out_header_size, FuseIoctlOut{
+            .result = @intCast(rc),
+            .flags = 0,
+            .in_iovs = 0,
+            .out_iovs = 0,
+        });
         if (out_data_size > 0) {
             @memcpy(
                 response_buf[out_header_size + out_struct_size ..][0..out_data_size],
@@ -2378,18 +2356,16 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FusePollIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const poll_in: *const FusePollIn = @ptrCast(@alignCast(payload.ptr));
+        const poll_in = readStructAt(FusePollIn, payload, 0);
         const out_header_size = @sizeOf(FuseOutHeader);
         const out_size = @sizeOf(FusePollOut);
         if (response_buf.len < out_header_size + out_size) return VirtioFsError.IoError;
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + out_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-        const out: *FusePollOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
-        out.revents = poll_in.events;
-        out.padding = 0;
+        writeOutHeader(response_buf, out_header_size + out_size, 0, header.unique);
+        writeStructAt(response_buf, out_header_size, FusePollOut{
+            .revents = poll_in.events,
+            .padding = 0,
+        });
         return out_header_size + out_size;
     }
 
@@ -2402,7 +2378,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseBatchForgetIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const batch_in: *const FuseBatchForgetIn = @ptrCast(@alignCast(payload.ptr));
+        const batch_in = readStructAt(FuseBatchForgetIn, payload, 0);
         const needed = @sizeOf(FuseBatchForgetIn) + batch_in.count * @sizeOf(FuseForgetOne);
         if (payload.len < needed) {
             return self.sendError(header, -22, response_buf);
@@ -2410,7 +2386,7 @@ pub const VirtioFsDevice = struct {
         var offset: usize = @sizeOf(FuseBatchForgetIn);
         var i: u32 = 0;
         while (i < batch_in.count) : (i += 1) {
-            const forget_one: *const FuseForgetOne = @ptrCast(@alignCast(payload[offset..].ptr));
+            const forget_one = readStructAt(FuseForgetOne, payload, offset);
             if (forget_one.nodeid != 1) {
                 if (self.nodes.fetchRemove(forget_one.nodeid)) |kv| {
                     self.allocator.free(kv.value.path);
@@ -2430,7 +2406,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseLseekIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const lseek_in: *const FuseLseekIn = @ptrCast(@alignCast(payload.ptr));
+        const lseek_in = readStructAt(FuseLseekIn, payload, 0);
         const handle = self.handles.get(lseek_in.fh) orelse return self.sendError(header, -9, response_buf);
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
 
@@ -2451,13 +2427,8 @@ pub const VirtioFsDevice = struct {
             else => return self.sendError(header, -22, response_buf),
         };
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(out_header_size + out_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-
-        const out: *FuseLseekOut = @ptrCast(@alignCast(response_buf.ptr + out_header_size));
-        out.offset = offset;
+        writeOutHeader(response_buf, out_header_size + out_size, 0, header.unique);
+        writeStructAt(response_buf, out_header_size, FuseLseekOut{ .offset = offset });
         return out_header_size + out_size;
     }
 
@@ -2470,7 +2441,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseCopyFileRangeIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const copy_in: *const FuseCopyFileRangeIn = @ptrCast(@alignCast(payload.ptr));
+        const copy_in = readStructAt(FuseCopyFileRangeIn, payload, 0);
         const in_handle = self.handles.get(copy_in.fh_in) orelse return self.sendError(header, -9, response_buf);
         const out_handle = self.handles.get(copy_in.fh_out) orelse return self.sendError(header, -9, response_buf);
         const in_file = in_handle.file orelse return self.sendError(header, -9, response_buf);
@@ -2501,7 +2472,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseFallocateIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const fallocate_in: *const FuseFallocateIn = @ptrCast(@alignCast(payload.ptr));
+        const fallocate_in = readStructAt(FuseFallocateIn, payload, 0);
         const handle = self.handles.get(fallocate_in.fh) orelse return self.sendError(header, -9, response_buf);
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
 
@@ -2550,7 +2521,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseSetupmappingIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const setup_in: *const FuseSetupmappingIn = @ptrCast(@alignCast(payload.ptr));
+        const setup_in = readStructAt(FuseSetupmappingIn, payload, 0);
         const handle = self.handles.get(setup_in.fh) orelse return self.sendError(header, -9, response_buf);
         const file = handle.file orelse return self.sendError(header, -9, response_buf);
         const dax = self.dax orelse return self.sendError(header, -95, response_buf);
@@ -2589,7 +2560,7 @@ pub const VirtioFsDevice = struct {
         if (payload.len < @sizeOf(FuseRemovemappingIn)) {
             return self.sendError(header, -22, response_buf);
         }
-        const remove_in: *const FuseRemovemappingIn = @ptrCast(@alignCast(payload.ptr));
+        const remove_in = readStructAt(FuseRemovemappingIn, payload, 0);
         const needed = @sizeOf(FuseRemovemappingIn) + @as(usize, @intCast(remove_in.count)) * @sizeOf(FuseRemovemappingOne);
         if (payload.len < needed) {
             return self.sendError(header, -22, response_buf);
@@ -2600,7 +2571,7 @@ pub const VirtioFsDevice = struct {
         var offset: usize = @sizeOf(FuseRemovemappingIn);
         var i: u32 = 0;
         while (i < remove_in.count) : (i += 1) {
-            const one: *const FuseRemovemappingOne = @ptrCast(@alignCast(payload[offset..].ptr));
+            const one = readStructAt(FuseRemovemappingOne, payload, offset);
             if (one.len == 0) {
                 offset += @sizeOf(FuseRemovemappingOne);
                 continue;
@@ -2622,10 +2593,10 @@ pub const VirtioFsDevice = struct {
         header: *const FuseInHeader,
         response_buf: []u8,
     ) VirtioFsError!usize {
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @sizeOf(FuseOutHeader);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
+        if (response_buf.len < @sizeOf(FuseOutHeader)) {
+            return VirtioFsError.IoError;
+        }
+        writeOutHeader(response_buf, @sizeOf(FuseOutHeader), 0, header.unique);
         return @sizeOf(FuseOutHeader);
     }
 
@@ -2639,10 +2610,7 @@ pub const VirtioFsDevice = struct {
             return VirtioFsError.IoError;
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @sizeOf(FuseOutHeader);
-        out_header.@"error" = err;
-        out_header.unique = header.unique;
+        writeOutHeader(response_buf, @sizeOf(FuseOutHeader), err, header.unique);
 
         return @sizeOf(FuseOutHeader);
     }
@@ -2658,16 +2626,13 @@ pub const VirtioFsDevice = struct {
             return VirtioFsError.IoError;
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(total_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-
-        const attr_out: *FuseAttrOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
-        attr_out.attr_valid = 1;
-        attr_out.attr_valid_nsec = 0;
-        attr_out.dummy = 0;
-        attr_out.attr = statToFuseAttr(header.nodeid, stat);
+        writeOutHeader(response_buf, total_size, 0, header.unique);
+        writeStructAt(response_buf, @sizeOf(FuseOutHeader), FuseAttrOut{
+            .attr_valid = 1,
+            .attr_valid_nsec = 0,
+            .dummy = 0,
+            .attr = statToFuseAttr(header.nodeid, stat),
+        });
 
         return total_size;
     }
@@ -2686,26 +2651,25 @@ pub const VirtioFsDevice = struct {
             return VirtioFsError.IoError;
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(total_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-
-        const entry_out: *FuseEntryOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
-        entry_out.nodeid = nodeid;
-        entry_out.generation = generation;
-        entry_out.entry_valid = 1;
-        entry_out.attr_valid = 1;
-        entry_out.entry_valid_nsec = 0;
-        entry_out.attr_valid_nsec = 0;
-        entry_out.attr = statToFuseAttr(nodeid, stat);
-
-        const open_out: *FuseOpenOut = @ptrCast(@alignCast(
-            response_buf.ptr + @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut),
-        ));
-        open_out.fh = fh;
-        open_out.open_flags = 0;
-        open_out.padding = 0;
+        writeOutHeader(response_buf, total_size, 0, header.unique);
+        writeStructAt(response_buf, @sizeOf(FuseOutHeader), FuseEntryOut{
+            .nodeid = nodeid,
+            .generation = generation,
+            .entry_valid = 1,
+            .attr_valid = 1,
+            .entry_valid_nsec = 0,
+            .attr_valid_nsec = 0,
+            .attr = statToFuseAttr(nodeid, stat),
+        });
+        writeStructAt(
+            response_buf,
+            @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut),
+            FuseOpenOut{
+                .fh = fh,
+                .open_flags = 0,
+                .padding = 0,
+            },
+        );
 
         return total_size;
     }
@@ -2723,19 +2687,16 @@ pub const VirtioFsDevice = struct {
             return VirtioFsError.IoError;
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(total_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-
-        const entry_out: *FuseEntryOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
-        entry_out.nodeid = nodeid;
-        entry_out.generation = generation;
-        entry_out.entry_valid = 1;
-        entry_out.attr_valid = 1;
-        entry_out.entry_valid_nsec = 0;
-        entry_out.attr_valid_nsec = 0;
-        entry_out.attr = statToFuseAttr(nodeid, stat);
+        writeOutHeader(response_buf, total_size, 0, header.unique);
+        writeStructAt(response_buf, @sizeOf(FuseOutHeader), FuseEntryOut{
+            .nodeid = nodeid,
+            .generation = generation,
+            .entry_valid = 1,
+            .attr_valid = 1,
+            .entry_valid_nsec = 0,
+            .attr_valid_nsec = 0,
+            .attr = statToFuseAttr(nodeid, stat),
+        });
 
         return total_size;
     }
@@ -2751,15 +2712,12 @@ pub const VirtioFsDevice = struct {
             return VirtioFsError.IoError;
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(total_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-
-        const open_out: *FuseOpenOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
-        open_out.fh = fh;
-        open_out.open_flags = 0;
-        open_out.padding = 0;
+        writeOutHeader(response_buf, total_size, 0, header.unique);
+        writeStructAt(response_buf, @sizeOf(FuseOutHeader), FuseOpenOut{
+            .fh = fh,
+            .open_flags = 0,
+            .padding = 0,
+        });
 
         return total_size;
     }
@@ -2775,14 +2733,11 @@ pub const VirtioFsDevice = struct {
             return VirtioFsError.IoError;
         }
 
-        const out_header: *FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-        out_header.len = @intCast(total_size);
-        out_header.@"error" = 0;
-        out_header.unique = header.unique;
-
-        const write_out: *FuseWriteOut = @ptrCast(@alignCast(response_buf.ptr + @sizeOf(FuseOutHeader)));
-        write_out.size = size;
-        write_out.padding = 0;
+        writeOutHeader(response_buf, total_size, 0, header.unique);
+        writeStructAt(response_buf, @sizeOf(FuseOutHeader), FuseWriteOut{
+            .size = size,
+            .padding = 0,
+        });
 
         return total_size;
     }
@@ -3276,7 +3231,7 @@ test "virtio_fs: handleInit" {
 
     try std.testing.expect(len >= @sizeOf(FuseOutHeader));
 
-    const out_header: *const FuseOutHeader = @ptrCast(@alignCast(&response));
+    const out_header = readStructAt(FuseOutHeader, response[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), out_header.@"error");
     try std.testing.expectEqual(@as(u64, 1), out_header.unique);
 }
@@ -3323,7 +3278,7 @@ test "virtio_fs: handleInit accepts unaligned request" {
     const len = try device.handleRequest(request, &response);
     try std.testing.expect(len >= @sizeOf(FuseOutHeader));
 
-    const out_header: *const FuseOutHeader = @ptrCast(@alignCast(&response));
+    const out_header = readStructAt(FuseOutHeader, response[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), out_header.@"error");
     try std.testing.expectEqual(@as(u64, 101), out_header.unique);
 }
@@ -3383,9 +3338,9 @@ test "virtio_fs: lookup open read write release roundtrip" {
     const lookup_resp_len = try device.handleRequest(lookup_req, &lookup_resp);
     try std.testing.expect(lookup_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut));
 
-    const lookup_out: *const FuseOutHeader = @ptrCast(@alignCast(&lookup_resp));
+    const lookup_out = readStructAt(FuseOutHeader, lookup_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), lookup_out.@"error");
-    const entry_out: *const FuseEntryOut = @ptrCast(@alignCast(lookup_resp[@sizeOf(FuseOutHeader)..]));
+    const entry_out = readStructAt(FuseEntryOut, lookup_resp[0..], @sizeOf(FuseOutHeader));
     const nodeid = entry_out.nodeid;
     try std.testing.expectEqual(@as(u64, 2), nodeid);
     try std.testing.expect(entry_out.generation != 0);
@@ -3410,7 +3365,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
     var open_resp: [256]u8 = undefined;
     const open_resp_len = try device.handleRequest(&open_req, &open_resp);
     try std.testing.expect(open_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut));
-    const open_out: *const FuseOpenOut = @ptrCast(@alignCast(open_resp[@sizeOf(FuseOutHeader)..]));
+    const open_out = readStructAt(FuseOpenOut, open_resp[0..], @sizeOf(FuseOutHeader));
     const fh = open_out.fh;
 
     // WRITE "abc"
@@ -3444,7 +3399,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
     var write_resp: [256]u8 = undefined;
     const write_resp_len = try device.handleRequest(write_req, &write_resp);
     try std.testing.expect(write_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseWriteOut));
-    const write_out: *const FuseWriteOut = @ptrCast(@alignCast(write_resp[@sizeOf(FuseOutHeader)..]));
+    const write_out = readStructAt(FuseWriteOut, write_resp[0..], @sizeOf(FuseOutHeader));
     try std.testing.expectEqual(@as(u32, 3), write_out.size);
 
     // READ back "abc"
@@ -3510,7 +3465,7 @@ test "virtio_fs: lookup open read write release roundtrip" {
     var read_again_resp: [256]u8 = undefined;
     const read_again_len = try device.handleRequest(&read_req, &read_again_resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), read_again_len);
-    const read_again_out: *const FuseOutHeader = @ptrCast(@alignCast(&read_again_resp));
+    const read_again_out = readStructAt(FuseOutHeader, read_again_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -9), read_again_out.@"error");
 }
 
@@ -3560,7 +3515,7 @@ test "virtio_fs: lookup rejects traversal" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -1), out.@"error");
 }
 
@@ -3590,7 +3545,7 @@ test "virtio_fs: read rejects short payload" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -22), out.@"error");
 }
 
@@ -3622,7 +3577,7 @@ test "virtio_fs: handleOpen returns not found for missing node" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -2), out.@"error");
 }
 
@@ -3678,7 +3633,7 @@ test "virtio_fs: handleOpen rejects write on read-only mount" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -30), out.@"error");
 }
 
@@ -3734,7 +3689,7 @@ test "virtio_fs: handleOpen honors O_TRUNC" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), out.@"error");
 
     var check = try fs.cwd().openFile(abs, .{ .mode = .read_only });
@@ -3795,9 +3750,9 @@ test "virtio_fs: handleWrite appends with O_APPEND" {
     var open_resp: [128]u8 = undefined;
     const open_resp_len = try device.handleRequest(&open_req, &open_resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut)), open_resp_len);
-    const open_hdr_out: *const FuseOutHeader = @ptrCast(@alignCast(&open_resp));
+    const open_hdr_out = readStructAt(FuseOutHeader, open_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), open_hdr_out.@"error");
-    const open_out: *const FuseOpenOut = @ptrCast(@alignCast(open_resp[@sizeOf(FuseOutHeader)..]));
+    const open_out = readStructAt(FuseOpenOut, open_resp[0..], @sizeOf(FuseOutHeader));
 
     const write_data = "z";
     const write_len = @sizeOf(FuseInHeader) + @sizeOf(FuseWriteIn) + write_data.len;
@@ -3833,7 +3788,7 @@ test "virtio_fs: handleWrite appends with O_APPEND" {
     var write_resp: [128]u8 = undefined;
     const write_resp_len = try device.handleRequest(write_req, &write_resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader) + @sizeOf(FuseWriteOut)), write_resp_len);
-    const write_out: *const FuseOutHeader = @ptrCast(@alignCast(&write_resp));
+    const write_out = readStructAt(FuseOutHeader, write_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), write_out.@"error");
 
     var check = try fs.cwd().openFile(abs, .{ .mode = .read_only });
@@ -3905,7 +3860,7 @@ test "virtio_fs: handleFallocate keep size" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), out.@"error");
 
     var check = try fs.cwd().openFile(abs, .{ .mode = .read_only });
@@ -3940,7 +3895,7 @@ test "virtio_fs: handleSetupmapping validates payload" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -22), out.@"error");
 }
 
@@ -3975,7 +3930,7 @@ test "virtio_fs: handleRemovemapping validates payload" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -22), out.@"error");
 }
 
@@ -4032,7 +3987,7 @@ test "virtio_fs: handleRead rejects invalid handle" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -9), out.@"error");
 }
 
@@ -4127,7 +4082,7 @@ test "virtio_fs: handleWrite rejects short payload" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -22), out.@"error");
 }
 
@@ -4195,7 +4150,7 @@ test "virtio_fs: handleRead rejects write-only file handle" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&read_req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -13), out.@"error");
 
     _ = device.handles.fetchRemove(fh);
@@ -4272,7 +4227,7 @@ test "virtio_fs: handleWrite rejects read-only file handle" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(write_req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -13), out.@"error");
 
     _ = device.handles.fetchRemove(fh);
@@ -4329,7 +4284,7 @@ test "virtio_fs: handleOpendir rejects non-dir node" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -20), out.@"error");
 }
 
@@ -4359,7 +4314,7 @@ test "virtio_fs: handleReleasedir rejects short payload" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -22), out.@"error");
 }
 
@@ -4442,7 +4397,7 @@ test "virtio_fs: handleReaddir rejects short payload" {
     var resp: [128]u8 = undefined;
     const resp_len = try device.handleRequest(&req, &resp);
     try std.testing.expectEqual(@as(usize, @sizeOf(FuseOutHeader)), resp_len);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     try std.testing.expectEqual(@as(i32, -22), out.@"error");
 }
 
@@ -4504,7 +4459,7 @@ test "virtio_fs: handleReaddir returns entries" {
     var open_resp: [256]u8 = undefined;
     const open_resp_len = try device.handleRequest(&open_req, &open_resp);
     try std.testing.expect(open_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut));
-    const open_out: *const FuseOpenOut = @ptrCast(@alignCast(open_resp[@sizeOf(FuseOutHeader)..]));
+    const open_out = readStructAt(FuseOpenOut, open_resp[0..], @sizeOf(FuseOutHeader));
     const fh = open_out.fh;
 
     // READDIR
@@ -4613,7 +4568,7 @@ test "virtio_fs: readdirplus returns generation" {
     var open_resp: [256]u8 = undefined;
     const open_resp_len = try device.handleRequest(&open_req, &open_resp);
     try std.testing.expect(open_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseOpenOut));
-    const open_out: *const FuseOpenOut = @ptrCast(@alignCast(open_resp[@sizeOf(FuseOutHeader)..]));
+    const open_out = readStructAt(FuseOpenOut, open_resp[0..], @sizeOf(FuseOutHeader));
     const fh = open_out.fh;
 
     const read_len = @sizeOf(FuseInHeader) + @sizeOf(FuseReadIn);
@@ -4736,7 +4691,7 @@ test "virtio_fs: xattr roundtrip" {
     @memcpy(set_req[pos..][0..value.len], value);
     var set_resp: [256]u8 = undefined;
     const set_len_resp = try device.handleRequest(set_req, &set_resp);
-    const set_out: *const FuseOutHeader = @ptrCast(@alignCast(&set_resp));
+    const set_out = readStructAt(FuseOutHeader, set_resp[0..], 0);
     if (set_out.@"error" != 0) {
         if (set_out.@"error" == -95 or set_out.@"error" == -13) return error.SkipZigTest;
         try std.testing.expectEqual(@as(i32, 0), set_out.@"error");
@@ -4766,9 +4721,9 @@ test "virtio_fs: xattr roundtrip" {
     get0_req[pos + name.len] = 0;
     var get0_resp: [256]u8 = undefined;
     const get0_resp_len = try device.handleRequest(get0_req, &get0_resp);
-    const get0_out: *const FuseOutHeader = @ptrCast(@alignCast(&get0_resp));
+    const get0_out = readStructAt(FuseOutHeader, get0_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), get0_out.@"error");
-    const get0_payload: *const FuseGetxattrOut = @ptrCast(@alignCast(get0_resp[@sizeOf(FuseOutHeader)..]));
+    const get0_payload = readStructAt(FuseGetxattrOut, get0_resp[0..], @sizeOf(FuseOutHeader));
     const value_len: usize = @intCast(get0_payload.size);
     try std.testing.expectEqual(value.len, value_len);
     _ = get0_resp_len;
@@ -4796,7 +4751,7 @@ test "virtio_fs: xattr roundtrip" {
     get_req[pos + name.len] = 0;
     var get_resp: [256]u8 = undefined;
     const get_resp_len = try device.handleRequest(get_req, &get_resp);
-    const get_out: *const FuseOutHeader = @ptrCast(@alignCast(&get_resp));
+    const get_out = readStructAt(FuseOutHeader, get_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), get_out.@"error");
     try std.testing.expectEqualStrings(
         value,
@@ -4823,9 +4778,9 @@ test "virtio_fs: xattr roundtrip" {
     list0_in.* = .{ .size = 0, .padding = 0 };
     var list0_resp: [256]u8 = undefined;
     const list0_resp_len = try device.handleRequest(&list0_req, &list0_resp);
-    const list0_out: *const FuseOutHeader = @ptrCast(@alignCast(&list0_resp));
+    const list0_out = readStructAt(FuseOutHeader, list0_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), list0_out.@"error");
-    const list0_payload: *const FuseGetxattrOut = @ptrCast(@alignCast(list0_resp[@sizeOf(FuseOutHeader)..]));
+    const list0_payload = readStructAt(FuseGetxattrOut, list0_resp[0..], @sizeOf(FuseOutHeader));
     const list_len: usize = @intCast(list0_payload.size);
     _ = list0_resp_len;
 
@@ -4847,7 +4802,7 @@ test "virtio_fs: xattr roundtrip" {
     list_in.* = .{ .size = @intCast(list_len), .padding = 0 };
     var list_resp: [256]u8 = undefined;
     const list_resp_len = try device.handleRequest(&list_req, &list_resp);
-    const list_out: *const FuseOutHeader = @ptrCast(@alignCast(&list_resp));
+    const list_out = readStructAt(FuseOutHeader, list_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), list_out.@"error");
     const list_data = list_resp[@sizeOf(FuseOutHeader)..][0..list_len];
     try std.testing.expect(std.mem.indexOf(u8, list_data, name) != null);
@@ -4874,7 +4829,7 @@ test "virtio_fs: xattr roundtrip" {
     rem_req[pos + name.len] = 0;
     var rem_resp: [256]u8 = undefined;
     const rem_resp_len = try device.handleRequest(rem_req, &rem_resp);
-    const rem_out: *const FuseOutHeader = @ptrCast(@alignCast(&rem_resp));
+    const rem_out = readStructAt(FuseOutHeader, rem_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), rem_out.@"error");
     _ = rem_resp_len;
 }
@@ -4995,7 +4950,7 @@ test "virtio_fs: setattr ctime no-op succeeds" {
     var lookup_resp: [512]u8 = undefined;
     const lookup_resp_len = try device.handleRequest(lookup_req, &lookup_resp);
     try std.testing.expect(lookup_resp_len >= @sizeOf(FuseOutHeader) + @sizeOf(FuseEntryOut));
-    const entry_out: *const FuseEntryOut = @ptrCast(@alignCast(lookup_resp[@sizeOf(FuseOutHeader)..]));
+    const entry_out = readStructAt(FuseEntryOut, lookup_resp[0..], @sizeOf(FuseOutHeader));
     const nodeid = entry_out.nodeid;
 
     var set_req: [@sizeOf(FuseInHeader) + @sizeOf(FuseSetattrIn)]u8 align(@alignOf(FuseInHeader)) = undefined;
@@ -5020,7 +4975,7 @@ test "virtio_fs: setattr ctime no-op succeeds" {
     var set_resp: [256]u8 = undefined;
     const set_len = try device.handleRequest(&set_req, &set_resp);
     try std.testing.expect(set_len >= @sizeOf(FuseOutHeader));
-    const out_hdr: *const FuseOutHeader = @ptrCast(@alignCast(&set_resp));
+    const out_hdr = readStructAt(FuseOutHeader, set_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), out_hdr.@"error");
 }
 
@@ -5088,7 +5043,7 @@ test "virtio_fs: fcntl locks" {
     @memcpy(set_req[@sizeOf(FuseInHeader)..][0..@sizeOf(FuseLkIn)], std.mem.asBytes(&lk_in));
     var set_resp: [128]u8 = undefined;
     const set_resp_len = try device.handleRequest(&set_req, &set_resp);
-    const set_out: *const FuseOutHeader = @ptrCast(@alignCast(&set_resp));
+    const set_out = readStructAt(FuseOutHeader, set_resp[0..], 0);
     if (set_out.@"error" != 0) return error.SkipZigTest;
     _ = set_resp_len;
 
@@ -5108,7 +5063,7 @@ test "virtio_fs: fcntl locks" {
     @memcpy(get_req[@sizeOf(FuseInHeader)..][0..@sizeOf(FuseLkIn)], std.mem.asBytes(&lk_in));
     var get_resp: [256]u8 = undefined;
     const get_resp_len = try device.handleRequest(&get_req, &get_resp);
-    const get_out: *const FuseOutHeader = @ptrCast(@alignCast(&get_resp));
+    const get_out = readStructAt(FuseOutHeader, get_resp[0..], 0);
     try std.testing.expectEqual(@as(i32, 0), get_out.@"error");
     _ = get_resp_len;
 }
@@ -5181,7 +5136,7 @@ test "virtio_fs: ioctl with buffers" {
 
     var resp: [256]u8 = undefined;
     const resp_len = try device.handleRequest(req, &resp);
-    const out: *const FuseOutHeader = @ptrCast(@alignCast(&resp));
+    const out = readStructAt(FuseOutHeader, resp[0..], 0);
     if (out.@"error" != 0 and out.@"error" != -25) {
         try std.testing.expectEqual(@as(i32, 0), out.@"error");
     }

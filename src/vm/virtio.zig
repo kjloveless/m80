@@ -2242,12 +2242,15 @@ pub fn processVirtioFsQueue(queue_index: usize) !void {
         }
 
         if (!no_reply and response_len == 0 and request.items.len >= @sizeOf(virtio_fs.FuseInHeader)) {
+            if (response_buf.len < @sizeOf(virtio_fs.FuseOutHeader)) return error.InvalidGuestLayout;
             var in_header: virtio_fs.FuseInHeader = undefined;
             @memcpy(std.mem.asBytes(&in_header), request.items[0..@sizeOf(virtio_fs.FuseInHeader)]);
-            const out_header: *virtio_fs.FuseOutHeader = @ptrCast(@alignCast(response_buf.ptr));
-            out_header.len = @intCast(@sizeOf(virtio_fs.FuseOutHeader));
-            out_header.@"error" = -5;
-            out_header.unique = in_header.unique;
+            const out_header = virtio_fs.FuseOutHeader{
+                .len = @intCast(@sizeOf(virtio_fs.FuseOutHeader)),
+                .@"error" = -5,
+                .unique = in_header.unique,
+            };
+            @memcpy(response_buf[0..@sizeOf(virtio_fs.FuseOutHeader)], std.mem.asBytes(&out_header));
             response_len = @sizeOf(virtio_fs.FuseOutHeader);
         }
 
