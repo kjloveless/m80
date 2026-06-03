@@ -36,6 +36,12 @@ const TcpStream = struct {
     stream: std.Io.net.Stream,
 };
 
+const PosixIpAddress = extern union {
+    any: std.posix.sockaddr,
+    in: std.posix.sockaddr.in,
+    in6: std.posix.sockaddr.in6,
+};
+
 const DaemonState = struct {
     allocator: std.mem.Allocator,
     mutex: sync.Mutex = .{},
@@ -698,6 +704,88 @@ fn shortTimeout(ms: i64) std.Io.Timeout {
     return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
 }
 
+fn ipAddressFamily(address: std.Io.net.IpAddress) std.posix.sa_family_t {
+    return switch (address) {
+        .ip4 => std.posix.AF.INET,
+        .ip6 => std.posix.AF.INET6,
+    };
+}
+
+fn ipAddressToPosix(address: std.Io.net.IpAddress, storage: *PosixIpAddress) std.posix.socklen_t {
+    return switch (address) {
+        .ip4 => |ip4| {
+            storage.in = .{
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            };
+            return @sizeOf(std.posix.sockaddr.in);
+        },
+        .ip6 => |ip6| {
+            storage.in6 = .{
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            };
+            return @sizeOf(std.posix.sockaddr.in6);
+        },
+    };
+}
+
+fn waitForTcpConnect(fd: std.posix.fd_t) !void {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = @intCast(std.c.POLL.OUT),
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&fds, tcp_connect_timeout_ms);
+    if (ready == 0) return error.Timeout;
+
+    var socket_error: c_int = 0;
+    var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+    const rc = std.c.getsockopt(fd, std.c.SOL.SOCKET, std.c.SO.ERROR, &socket_error, &socket_error_len);
+    if (rc != 0 or socket_error != 0) return error.ConnectFailed;
+}
+
+fn connectIpAddressPosix(address: std.Io.net.IpAddress) !std.Io.net.Stream {
+    var storage: PosixIpAddress = undefined;
+    const address_len = ipAddressToPosix(address, &storage);
+
+    const fd_rc = std.c.socket(@intCast(ipAddressFamily(address)), @intCast(std.posix.SOCK.STREAM), @intCast(std.posix.IPPROTO.TCP));
+    switch (std.c.errno(fd_rc)) {
+        .SUCCESS => {},
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        else => return error.ConnectFailed,
+    }
+    const fd: std.posix.fd_t = @intCast(fd_rc);
+    errdefer fs.closeFd(fd);
+
+    try net.setNonblocking(fd, true);
+    const rc = std.c.connect(fd, &storage.any, address_len);
+    switch (std.c.errno(rc)) {
+        .SUCCESS => {},
+        .INPROGRESS => try waitForTcpConnect(fd),
+        .ISCONN => {},
+        else => return error.ConnectFailed,
+    }
+    return .{ .socket = .{
+        .handle = fd,
+        .address = address,
+    } };
+}
+
+fn connectIpAddress(address: std.Io.net.IpAddress) !std.Io.net.Stream {
+    if (builtin.os.tag == .windows) {
+        return address.connect(fs.io(), .{
+            .mode = .stream,
+            .protocol = .tcp,
+            .timeout = shortTimeout(tcp_connect_timeout_ms),
+        });
+    }
+    return connectIpAddressPosix(address);
+}
+
 const TcpReadResult = struct {
     len: usize = 0,
     eof: bool = false,
@@ -916,11 +1004,7 @@ fn openTcpConnection(allocator: std.mem.Allocator, record: *const VmRecord, host
             last_error = error.BlockedResolvedAddress;
             continue;
         }
-        const stream = address.connect(fs.io(), .{
-            .mode = .stream,
-            .protocol = .tcp,
-            .timeout = shortTimeout(tcp_connect_timeout_ms),
-        }) catch |e| {
+        const stream = connectIpAddress(address) catch |e| {
             last_error = e;
             continue;
         };
