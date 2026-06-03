@@ -26,6 +26,7 @@ const sync = @import("../util/sync.zig");
 const fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const log = @import("../util/log.zig");
+const env_util = @import("../util/env.zig");
 const config = @import("../core/config.zig");
 const Jailer = @import("../jailer/jailer.zig").Jailer;
 const windows = @import("windows.zig");
@@ -629,6 +630,8 @@ pub const Vm = struct {
 // =============================================================================
 
 test "smoke: backend start/stop" {
+    if (builtin.os.tag == .linux and !env_util.integrationEnabled(std.testing.allocator, "kvm")) return error.SkipZigTest;
+
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -643,9 +646,12 @@ test "smoke: backend start/stop" {
     var cfg_mut = cfg;
     defer @import("../core/config.zig").freeConfig(allocator, &cfg_mut);
 
-    vm.start(cfg_mut) catch |e| switch (e) {
+    vm.start(cfg_mut) catch |e| switch (@as(anyerror, e)) {
         error.NotImplemented => return error.SkipZigTest,
         error.HvfFailure => return,
+        error.WhpFailure => return error.SkipZigTest,
+        error.LibraryLoadFailed => return error.SkipZigTest,
+        error.ProcNotFound => return error.SkipZigTest,
         else => return e,
     };
     try vm.stop();

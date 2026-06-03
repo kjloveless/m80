@@ -134,7 +134,7 @@ fn runStop(allocator: std.mem.Allocator) !void {
     const payload = try protocol.buildRequestPayload(allocator, 1, "daemon.shutdown", struct {}{});
     defer allocator.free(payload);
 
-    const response = protocol.rpc(allocator, control_path, payload) catch |e| switch (e) {
+    const response = protocol.rpc(allocator, control_path, payload) catch |e| switch (@as(anyerror, e)) {
         error.FileNotFound, error.ConnectionRefused => {
             std.debug.print("daemon stopped\n", .{});
             return;

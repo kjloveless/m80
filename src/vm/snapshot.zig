@@ -1279,19 +1279,23 @@ pub fn saveStreaming(
 
     // Reserve header space (will rewrite at end)
     try file.seekTo(@sizeOf(SnapshotHeader));
+    var write_offset: u64 = @sizeOf(SnapshotHeader);
 
     // Write vCPU states
     header.vcpu_state_offset = @sizeOf(SnapshotHeader);
     if (vcpu_states.len > 0) {
         try file.writeAll(std.mem.sliceAsBytes(vcpu_states));
+        write_offset += @intCast(vcpu_states.len * @sizeOf(VcpuState));
     }
 
     // Write device states (header + data for each)
-    header.device_state_offset = try file.getPos();
+    header.device_state_offset = write_offset;
     for (device_states) |ds| {
         try file.writeAll(std.mem.asBytes(&ds.header));
+        write_offset += @sizeOf(DeviceState);
         if (ds.data.len > 0) {
             try file.writeAll(ds.data);
+            write_offset += ds.data.len;
         }
     }
 
@@ -1299,7 +1303,7 @@ pub fn saveStreaming(
     var page_entries = std.ArrayList(PageTableEntry).empty;
     defer page_entries.deinit(allocator);
 
-    header.memory_data_offset = try file.getPos();
+    header.memory_data_offset = write_offset;
     var data_offset: u64 = 0;
 
     for (0..total_pages) |page_idx| {
@@ -1317,11 +1321,12 @@ pub fn saveStreaming(
             // For now, write uncompressed
             try file.writeAll(page);
             data_offset += page_size;
+            write_offset += page_size;
         }
     }
 
     // Write page table at current position
-    header.memory_page_table_offset = try file.getPos();
+    header.memory_page_table_offset = write_offset;
     header.non_zero_page_count = page_entries.items.len;
     if (page_entries.items.len > 0) {
         try file.writeAll(std.mem.sliceAsBytes(page_entries.items));

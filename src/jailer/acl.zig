@@ -183,6 +183,13 @@ fn verifyHardenedPermissionsPosix(path: []const u8) AclError!bool {
 fn verifyHardenedPermissionsWindows(path: []const u8) AclError!bool {
     if (builtin.os.tag != .windows) return true;
 
+    const stat = fs.cwd().statFile(path) catch |e| switch (e) {
+        error.AccessDenied => return AclError.PermissionDenied,
+        error.FileNotFound => return AclError.InvalidPath,
+        else => return AclError.SystemError,
+    };
+    const is_dir = stat.kind == .directory;
+
     const allocator = std.heap.page_allocator;
     const wide = try utf16ZFromUtf8Alloc(allocator, path);
     defer allocator.free(wide);
@@ -213,16 +220,18 @@ fn verifyHardenedPermissionsWindows(path: []const u8) AclError!bool {
     while (i < acl.AceCount) : (i += 1) {
         var ace_ptr: ?*anyopaque = null;
         const ok = GetAce(dacl, i, &ace_ptr);
-        if (ok == 0 or ace_ptr == null) return false;
+        if (!ok.toBool() or ace_ptr == null) return false;
 
         const header: *const ACE_HEADER = @ptrCast(@alignCast(ace_ptr.?));
         if (header.AceType != ACCESS_ALLOWED_ACE_TYPE) return false;
-        if ((header.AceFlags & INHERITANCE_FLAGS_MASK) != 0) return false;
+        if ((header.AceFlags & INHERITED_ACE) != 0) return false;
+        const allowed_inheritance = if (is_dir) OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE else 0;
+        if ((header.AceFlags & INHERITANCE_FLAGS_MASK & ~allowed_inheritance) != 0) return false;
 
         const allowed: *const ACCESS_ALLOWED_ACE = @ptrCast(@alignCast(ace_ptr.?));
         if (allowed.Mask != FILE_ALL_ACCESS) return false;
         const ace_sid: PSID = @ptrCast(@constCast(&allowed.SidStart));
-        if (EqualSid(owner.?, ace_sid) == 0) return false;
+        if (!EqualSid(owner.?, ace_sid).toBool()) return false;
     }
     return true;
 }
@@ -383,6 +392,8 @@ const ACCESS_ALLOWED_ACE = extern struct {
 };
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x0;
+const OBJECT_INHERIT_ACE: u8 = 0x01;
+const CONTAINER_INHERIT_ACE: u8 = 0x02;
 const INHERITED_ACE: u8 = 0x10;
 const INHERITANCE_FLAGS_MASK: u8 = 0x1F;
 
@@ -407,7 +418,7 @@ extern "advapi32" fn GetNamedSecurityInfoW(
     ppDacl: *PACL,
     ppSacl: ?*PACL,
     ppSecurityDescriptor: *PSECURITY_DESCRIPTOR,
-) callconv(windows.WINAPI) DWORD;
+) callconv(.winapi) DWORD;
 
 extern "advapi32" fn SetNamedSecurityInfoW(
     pObjectName: LPWSTR,
@@ -417,27 +428,27 @@ extern "advapi32" fn SetNamedSecurityInfoW(
     psidGroup: PSID,
     pDacl: PACL,
     pSacl: PACL,
-) callconv(windows.WINAPI) DWORD;
+) callconv(.winapi) DWORD;
 
 extern "advapi32" fn SetEntriesInAclW(
     cCountOfExplicitEntries: DWORD,
     pListOfExplicitEntries: *const EXPLICIT_ACCESSW,
     OldAcl: PACL,
     NewAcl: *PACL,
-) callconv(windows.WINAPI) DWORD;
+) callconv(.winapi) DWORD;
 
 extern "advapi32" fn GetAce(
     pAcl: PACL,
     dwAceIndex: DWORD,
     pAce: *?*anyopaque,
-) callconv(windows.WINAPI) BOOL;
+) callconv(.winapi) BOOL;
 
 extern "advapi32" fn EqualSid(
     pSid1: PSID,
     pSid2: PSID,
-) callconv(windows.WINAPI) BOOL;
+) callconv(.winapi) BOOL;
 
-extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(windows.WINAPI) ?*anyopaque;
+extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 
 fn utf16ZFromUtf8Alloc(allocator: std.mem.Allocator, path: []const u8) AclError![:0]u16 {
     const utf16 = std.unicode.utf8ToUtf16LeAlloc(allocator, path) catch |e| switch (e) {

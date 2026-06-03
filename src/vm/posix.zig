@@ -166,6 +166,35 @@ const KvmRegSet = extern struct {
     sregs: KvmSregs,
 };
 
+const NativeKvmSegment = if (builtin.os.tag == .linux) linux_kvm.kvm_segment else KvmSegment;
+const NativeKvmDtable = if (builtin.os.tag == .linux) linux_kvm.kvm_dtable else KvmDtable;
+
+fn nativeKvmSegment(segment: KvmSegment) NativeKvmSegment {
+    return .{
+        .base = segment.base,
+        .limit = segment.limit,
+        .selector = segment.selector,
+        .type = segment.type,
+        .present = segment.present,
+        .dpl = segment.dpl,
+        .db = segment.db,
+        .s = segment.s,
+        .l = segment.l,
+        .g = segment.g,
+        .avl = segment.avl,
+        .unusable = segment.unusable,
+        .padding = segment.padding,
+    };
+}
+
+fn nativeKvmDtable(dtable: KvmDtable) NativeKvmDtable {
+    return .{
+        .base = dtable.base,
+        .limit = dtable.limit,
+        .padding = dtable.padding,
+    };
+}
+
 const KvmIoExit = extern struct {
     direction: KvmIoExitDirection,
     size: u8,
@@ -220,7 +249,7 @@ fn kvmSetRegs(handle: KvmHandle, regs: KvmRegs) !void {
     native.rflags = regs.rflags;
 
     const rc = std.os.linux.ioctl(fd, linux_kvm.KVM_SET_REGS, @intFromPtr(&native));
-    if (std.os.linux.E.init(rc) != .SUCCESS) return error.SystemError;
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.SystemError;
 }
 
 fn kvmSetSregs(handle: KvmHandle, sregs: KvmSregs) !void {
@@ -231,16 +260,16 @@ fn kvmSetSregs(handle: KvmHandle, sregs: KvmSregs) !void {
     const fd: std.os.linux.fd_t = @intCast(handle);
     var native = std.mem.zeroes(linux_kvm.kvm_sregs);
 
-    native.cs = sregs.cs;
-    native.ds = sregs.ds;
-    native.es = sregs.es;
-    native.fs = sregs.fs;
-    native.gs = sregs.gs;
-    native.ss = sregs.ss;
-    native.tr = sregs.tr;
-    native.ldt = sregs.ldt;
-    native.gdt = sregs.gdt;
-    native.idt = sregs.idt;
+    native.cs = nativeKvmSegment(sregs.cs);
+    native.ds = nativeKvmSegment(sregs.ds);
+    native.es = nativeKvmSegment(sregs.es);
+    native.fs = nativeKvmSegment(sregs.fs);
+    native.gs = nativeKvmSegment(sregs.gs);
+    native.ss = nativeKvmSegment(sregs.ss);
+    native.tr = nativeKvmSegment(sregs.tr);
+    native.ldt = nativeKvmSegment(sregs.ldt);
+    native.gdt = nativeKvmDtable(sregs.gdt);
+    native.idt = nativeKvmDtable(sregs.idt);
     native.cr0 = sregs.cr0;
     native.cr2 = sregs.cr2;
     native.cr3 = sregs.cr3;
@@ -251,7 +280,7 @@ fn kvmSetSregs(handle: KvmHandle, sregs: KvmSregs) !void {
     native.interrupt_bitmap = sregs.interrupt_bitmap;
 
     const rc = std.os.linux.ioctl(fd, linux_kvm.KVM_SET_SREGS, @intFromPtr(&native));
-    if (std.os.linux.E.init(rc) != .SUCCESS) return error.SystemError;
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.SystemError;
 }
 
 fn readLeU64(data: []const u8, size: usize) u64 {
@@ -528,15 +557,15 @@ fn loadFileToGuest(path: []const u8, guest_addr: u64, label: []const u8) !void {
 
 fn handleMmioExit(state: *KvmState) void {
     if (builtin.os.tag != .linux) return;
-    const exit = state.run;
-    const addr = exit.mmio.phys_addr;
-    const len: usize = @intCast(exit.mmio.len);
-    const is_write = exit.mmio.is_write != 0;
+    const mmio = &state.run.unnamed_0.mmio;
+    const addr = mmio.phys_addr;
+    const len: usize = @intCast(mmio.len);
+    const is_write = mmio.is_write != 0;
     var value: u64 = 0;
     if (is_write) {
         var i: usize = 0;
-        while (i < len and i < exit.mmio.data.len) : (i += 1) {
-            value |= @as(u64, exit.mmio.data[i]) << @as(u6, @intCast(i * 8));
+        while (i < len and i < mmio.data.len) : (i += 1) {
+            value |= @as(u64, mmio.data[i]) << @as(u6, @intCast(i * 8));
         }
     }
 
@@ -547,28 +576,28 @@ fn handleMmioExit(state: *KvmState) void {
     if (addr >= virtio.virtio_console_mmio_base and addr < virtio.virtio_console_mmio_base + virtio.virtio_console_mmio_size) {
         const result = virtio.handleVirtioConsoleMmio(addr - virtio.virtio_console_mmio_base, is_write, len, value);
         if (!is_write) {
-            std.mem.writeInt(u64, exit.mmio.data[0..8], result, .little);
+            std.mem.writeInt(u64, mmio.data[0..8], result, .little);
         }
         return;
     }
     if (addr >= virtio.virtio_rng_mmio_base and addr < virtio.virtio_rng_mmio_base + virtio.virtio_rng_mmio_size) {
         const result = virtio.handleVirtioRngMmio(addr - virtio.virtio_rng_mmio_base, is_write, len, value);
         if (!is_write) {
-            std.mem.writeInt(u64, exit.mmio.data[0..8], result, .little);
+            std.mem.writeInt(u64, mmio.data[0..8], result, .little);
         }
         return;
     }
     if (addr >= virtio.virtio_fs_mmio_base and addr < virtio.virtio_fs_mmio_base + virtio.virtio_fs_mmio_size) {
         const result = virtio.handleVirtioFsMmio(addr - virtio.virtio_fs_mmio_base, is_write, len, value);
         if (!is_write) {
-            std.mem.writeInt(u64, exit.mmio.data[0..8], result, .little);
+            std.mem.writeInt(u64, mmio.data[0..8], result, .little);
         }
         return;
     }
     if (addr >= virtio.virtio_vsock_mmio_base and addr < virtio.virtio_vsock_mmio_base + virtio.virtio_vsock_mmio_size) {
         const result = virtio.handleVirtioVsockMmio(addr - virtio.virtio_vsock_mmio_base, is_write, len, value);
         if (!is_write) {
-            std.mem.writeInt(u64, exit.mmio.data[0..8], result, .little);
+            std.mem.writeInt(u64, mmio.data[0..8], result, .little);
         }
         return;
     }
@@ -579,18 +608,27 @@ fn runVcpuKvm(state: *KvmState) void {
     log.info("posix vcpu 0 kvm run loop entered", .{});
     while (vcpu_running.load(.seq_cst)) {
         const rc = std.os.linux.ioctl(state.vcpu_fd, linux_kvm.KVM_RUN, 0);
-        if (std.os.linux.E.init(rc) != .SUCCESS) {
+        if (std.os.linux.errno(rc) != .SUCCESS) {
             log.err("posix KVM_RUN failed", .{});
             break;
         }
 
         switch (state.run.exit_reason) {
             linux_kvm.KVM_EXIT_IO => {
-                const offset: usize = @intCast(state.run.io.data_offset);
+                const io_exit = state.run.unnamed_0.io;
+                const offset: usize = @intCast(io_exit.data_offset);
                 const base: [*]u8 = @ptrCast(state.run);
-                const size: usize = @intCast(state.run.io.size);
+                const size: usize = @intCast(io_exit.size);
                 const data = base[offset..][0..size];
-                const exit = kvmIoExitToIoExit(state.run.io, data);
+                const is_write = io_exit.direction == @intFromEnum(KvmIoExitDirection.Out);
+                const exit = IoExit{
+                    .port = io_exit.port,
+                    .is_write = is_write,
+                    .size = size,
+                    .rax = if (is_write) readLeU64(data, size) else 0,
+                    .is_string = io_exit.count > 1,
+                    .has_rep = io_exit.count > 1,
+                };
                 if (exit.is_write) {
                     _ = handleIoExit(exit);
                 } else {
@@ -692,7 +730,7 @@ pub fn start(cfg: config.VmConfig) !void {
     }
 
     if (builtin.os.tag == .linux) {
-        const kvm_fd = try std.posix.open("/dev/kvm", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+        const kvm_fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/kvm", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
         errdefer fs.closeFd(kvm_fd);
 
         const api_version = std.os.linux.ioctl(kvm_fd, linux_kvm.KVM_GET_API_VERSION, 0);
@@ -714,7 +752,7 @@ pub fn start(cfg: config.VmConfig) !void {
             .userspace_addr = @intFromPtr(guest_memory.ptr),
         };
         const rc_mem = std.os.linux.ioctl(@intCast(vm_fd), linux_kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region));
-        if (std.os.linux.E.init(rc_mem) != .SUCCESS) return error.SystemError;
+        if (std.os.linux.errno(rc_mem) != .SUCCESS) return error.SystemError;
 
         const vcpu_fd = std.os.linux.ioctl(@intCast(vm_fd), linux_kvm.KVM_CREATE_VCPU, 0);
         if (vcpu_fd < 0) return error.SystemError;
@@ -786,7 +824,8 @@ pub fn stop() !void {
     serial_io.clear(std.heap.page_allocator);
     if (builtin.os.tag == .linux) {
         if (active_kvm) |state| {
-            std.posix.munmap(state.run[0..state.run_size]);
+            const run_bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(state.run));
+            std.posix.munmap(run_bytes[0..state.run_size]);
             fs.closeFd(state.vcpu_fd);
             fs.closeFd(state.vm_fd);
             fs.closeFd(state.kvm_fd);
@@ -812,6 +851,7 @@ pub fn isVcpuRunning() bool {
 test "smoke: posix backend start/stop" {
     const tag = @import("builtin").os.tag;
     if (tag == .windows or tag == .macos) return error.SkipZigTest;
+    if (tag == .linux and !env.integrationEnabled(std.testing.allocator, "kvm")) return error.SkipZigTest;
     const cfg = try config.defaultConfig(std.testing.allocator, "test");
     var cfg_mut = cfg;
     defer config.freeConfig(std.testing.allocator, &cfg_mut);

@@ -1,6 +1,9 @@
 /zig-out
 .zig-cache
-entitlements/
+entitlements/*
+!entitlements/
+!entitlements/hvf-entitlements.xml
+!entitlements/hvf-entitlements-test.xml
 images/
 codesign.conf
 docs/codesigning_hell.md

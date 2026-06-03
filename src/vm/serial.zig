@@ -110,7 +110,7 @@ fn writeToConsole(size: usize, rax: u64) bool {
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &bytes, rax, .little);
     const chunk = bytes[0..size];
-    writeAllFd(fd, chunk) catch |e| switch (e) {
+    writeAllFd(fd, chunk) catch |e| switch (@as(anyerror, e)) {
         error.BrokenPipe, error.ConnectionResetByPeer => {
             console_fd = null;
             return false;
@@ -132,7 +132,7 @@ pub fn writeConsoleBytes(bytes: []const u8) void {
         console_backlog.items.len = remaining.len;
     }
     const fd = console_fd orelse return;
-    writeAllFd(fd, bytes) catch |e| switch (e) {
+    writeAllFd(fd, bytes) catch |e| switch (@as(anyerror, e)) {
         error.BrokenPipe, error.ConnectionResetByPeer => {
             console_fd = null;
         },

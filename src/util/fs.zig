@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const path = std.fs.path;
 pub const max_path_bytes = std.Io.Dir.max_path_bytes;
@@ -63,6 +64,22 @@ pub const File = struct {
                 .block_size = @intCast(@max(1, posix_stat.blksize)),
             };
         }
+
+        pub fn fromLinuxStatx(statx: std.os.linux.Statx) Stat {
+            const mode: std.posix.mode_t = @intCast(statx.mode);
+            return .{
+                .inode = @intCast(statx.ino),
+                .nlink = @intCast(statx.nlink),
+                .size = @intCast(statx.size),
+                .mode = mode,
+                .permissions = permissionsFromMode(mode),
+                .kind = kindFromMode(mode),
+                .atime = @as(i128, statx.atime.sec) * std.time.ns_per_s + statx.atime.nsec,
+                .mtime = @as(i128, statx.mtime.sec) * std.time.ns_per_s + statx.mtime.nsec,
+                .ctime = @as(i128, statx.ctime.sec) * std.time.ns_per_s + statx.ctime.nsec,
+                .block_size = @intCast(@max(@as(u32, 1), statx.blksize)),
+            };
+        }
     };
 
     fn wrap(file: std.Io.File) File {
@@ -119,7 +136,7 @@ pub const File = struct {
     }
 
     pub fn seekBy(self: File, offset: i64) !void {
-        _ = try seekFd(self.handle, offset, std.c.SEEK.CUR);
+        try io().vtable.fileSeekBy(io().userdata, self.raw(), offset);
     }
 
     pub fn getPos(self: File) !u64 {
@@ -247,6 +264,10 @@ pub const Dir = struct {
         return Stat.fromIo(try self.raw().statFile(io(), sub_path, .{}));
     }
 
+    pub fn statFileNoFollow(self: Dir, sub_path: []const u8) !Stat {
+        return Stat.fromIo(try self.raw().statFile(io(), sub_path, .{ .follow_symlinks = false }));
+    }
+
     pub fn realpathAlloc(self: Dir, allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
         var buffer: [max_path_bytes]u8 = undefined;
         const n = try self.raw().realPathFile(io(), sub_path, &buffer);
@@ -320,6 +341,7 @@ pub fn testingTmpDir(options: std.Io.Dir.OpenOptions) TmpDir {
 }
 
 pub fn chmodAt(dirfd: std.posix.fd_t, sub_path: []const u8, mode: std.posix.mode_t, flags: c_uint) !void {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     const path_z = try std.posix.toPosixPath(sub_path);
     if (std.c.fchmodat(dirfd, &path_z, mode, flags) == 0) return;
     return switch (std.c.errno(-1)) {
@@ -331,6 +353,7 @@ pub fn chmodAt(dirfd: std.posix.fd_t, sub_path: []const u8, mode: std.posix.mode
 }
 
 pub fn openAt(dirfd: std.posix.fd_t, sub_path: []const u8, flags: std.posix.O, mode: std.posix.mode_t) !std.posix.fd_t {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     const path_z = try std.posix.toPosixPath(sub_path);
     while (true) {
         const rc = std.c.openat(dirfd, &path_z, flags, mode);
@@ -351,10 +374,32 @@ pub fn openAt(dirfd: std.posix.fd_t, sub_path: []const u8, flags: std.posix.O, m
 }
 
 pub fn statAt(dirfd: std.posix.fd_t, sub_path: []const u8, flags: c_uint) !File.Stat {
+    if (comptime builtin.os.tag == .linux) {
+        return File.Stat.fromLinuxStatx(try statxAt(dirfd, sub_path, flags));
+    }
     return File.Stat.fromPosix(try statPosixAt(dirfd, sub_path, flags));
 }
 
+pub fn statxAt(dirfd: std.posix.fd_t, sub_path: []const u8, flags: c_uint) !std.os.linux.Statx {
+    if (builtin.os.tag != .linux) return error.NotSupported;
+    const path_z = try std.posix.toPosixPath(sub_path);
+    var st: std.os.linux.Statx = undefined;
+    const rc = std.os.linux.statx(@intCast(dirfd), &path_z, @intCast(flags), std.os.linux.STATX.BASIC_STATS, &st);
+    return switch (std.os.linux.errno(rc)) {
+        .SUCCESS => st,
+        .ACCES, .PERM => error.AccessDenied,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .LOOP => error.SymLinkLoop,
+        else => error.Unexpected,
+    };
+}
+
 pub fn statPosixAt(dirfd: std.posix.fd_t, sub_path: []const u8, flags: c_uint) !std.posix.Stat {
+    if (builtin.os.tag == .windows) return error.NotSupported;
+    if (comptime builtin.os.tag == .linux) {
+        @compileError("statPosixAt is not available on Linux; use statAt or statxAt");
+    }
     const path_z = try std.posix.toPosixPath(sub_path);
     var st: std.posix.Stat = undefined;
     if (std.c.fstatat(dirfd, &path_z, &st, flags) == 0) return st;
@@ -368,6 +413,7 @@ pub fn statPosixAt(dirfd: std.posix.fd_t, sub_path: []const u8, flags: c_uint) !
 }
 
 pub fn accessAt(dirfd: std.posix.fd_t, sub_path: []const u8, mask: u32, flags: c_uint) !void {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     const path_z = try std.posix.toPosixPath(sub_path);
     if (std.c.faccessat(dirfd, &path_z, @intCast(mask), flags) == 0) return;
     return switch (std.c.errno(-1)) {
@@ -380,6 +426,7 @@ pub fn accessAt(dirfd: std.posix.fd_t, sub_path: []const u8, mask: u32, flags: c
 }
 
 pub fn readLink(path_name: []const u8, buffer: []u8) !usize {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     const path_z = try std.posix.toPosixPath(path_name);
     while (true) {
         const rc = std.c.readlink(&path_z, buffer.ptr, buffer.len);
@@ -397,6 +444,7 @@ pub fn readLink(path_name: []const u8, buffer: []u8) !usize {
 }
 
 pub fn symLink(target_path: []const u8, sym_link_path: []const u8) !void {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     const target_z = try std.posix.toPosixPath(target_path);
     const link_z = try std.posix.toPosixPath(sym_link_path);
     if (std.c.symlink(&target_z, &link_z) == 0) return;
@@ -411,6 +459,7 @@ pub fn symLink(target_path: []const u8, sym_link_path: []const u8) !void {
 }
 
 pub fn renamePath(old_path: []const u8, new_path: []const u8) !void {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     const old_z = try std.posix.toPosixPath(old_path);
     const new_z = try std.posix.toPosixPath(new_path);
     if (std.c.rename(&old_z, &new_z) == 0) return;
@@ -426,6 +475,7 @@ pub fn renamePath(old_path: []const u8, new_path: []const u8) !void {
 }
 
 pub fn linkPath(old_path: []const u8, new_path: []const u8) !void {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     const old_z = try std.posix.toPosixPath(old_path);
     const new_z = try std.posix.toPosixPath(new_path);
     if (std.c.link(&old_z, &new_z) == 0) return;
@@ -440,6 +490,7 @@ pub fn linkPath(old_path: []const u8, new_path: []const u8) !void {
 }
 
 pub fn syncFd(fd: std.posix.fd_t) !void {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     while (true) {
         const rc = std.c.fsync(fd);
         return switch (std.c.errno(rc)) {
@@ -452,6 +503,7 @@ pub fn syncFd(fd: std.posix.fd_t) !void {
 }
 
 pub fn chownFd(fd: std.posix.fd_t, uid: ?std.posix.uid_t, gid: ?std.posix.gid_t) !void {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     const owner = uid orelse std.math.maxInt(std.posix.uid_t);
     const group = gid orelse std.math.maxInt(std.posix.gid_t);
     while (true) {
@@ -468,10 +520,12 @@ pub fn chownFd(fd: std.posix.fd_t, uid: ?std.posix.uid_t, gid: ?std.posix.gid_t)
 }
 
 pub fn closeFd(fd: std.posix.fd_t) void {
+    if (builtin.os.tag == .windows) return;
     File.wrap(.{ .handle = fd, .flags = .{ .nonblocking = false } }).close();
 }
 
 pub fn seekFd(fd: std.posix.fd_t, offset: i64, whence: c_int) !u64 {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     while (true) {
         const rc = std.c.lseek(fd, @intCast(offset), whence);
         return switch (std.c.errno(rc)) {
@@ -486,6 +540,7 @@ pub fn seekFd(fd: std.posix.fd_t, offset: i64, whence: c_int) !u64 {
 }
 
 pub fn writeFd(fd: std.posix.fd_t, bytes: []const u8) !usize {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     while (true) {
         const rc = std.c.write(fd, bytes.ptr, bytes.len);
         return switch (std.c.errno(rc)) {
@@ -501,6 +556,7 @@ pub fn writeFd(fd: std.posix.fd_t, bytes: []const u8) !usize {
 }
 
 pub fn readFd(fd: std.posix.fd_t, buffer: []u8) !usize {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     while (true) {
         const rc = std.c.read(fd, buffer.ptr, buffer.len);
         return switch (std.c.errno(rc)) {
@@ -515,6 +571,7 @@ pub fn readFd(fd: std.posix.fd_t, buffer: []u8) !usize {
 }
 
 pub fn pipe() ![2]std.posix.fd_t {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     var fds: [2]std.posix.fd_t = undefined;
     if (std.c.pipe(&fds) == 0) return fds;
     return switch (std.c.errno(-1)) {
@@ -525,14 +582,17 @@ pub fn pipe() ![2]std.posix.fd_t {
 }
 
 pub fn isTty(fd: std.posix.fd_t) bool {
+    if (builtin.os.tag == .windows) return false;
     return std.c.isatty(fd) != 0;
 }
 
 pub fn getUid() std.posix.uid_t {
+    if (builtin.os.tag == .windows) return 0;
     return std.c.getuid();
 }
 
 pub fn copyFileRange(in_fd: std.posix.fd_t, off_in: u64, out_fd: std.posix.fd_t, off_out: u64, len: usize, flags: u64) !usize {
+    if (builtin.os.tag == .windows) return error.NotSupported;
     if (flags != 0) return error.InvalidArgument;
     var copied: usize = 0;
     var buf: [64 * 1024]u8 = undefined;
@@ -566,6 +626,7 @@ pub fn copyFileRange(in_fd: std.posix.fd_t, off_in: u64, out_fd: std.posix.fd_t,
 }
 
 fn permissionMode(permissions: File.Permissions) std.posix.mode_t {
+    if (builtin.os.tag == .windows) return 0o666;
     if (@hasDecl(File.Permissions, "toMode")) {
         return permissions.toMode();
     }
@@ -573,6 +634,7 @@ fn permissionMode(permissions: File.Permissions) std.posix.mode_t {
 }
 
 fn permissionsFromMode(mode: std.posix.mode_t) File.Permissions {
+    if (builtin.os.tag == .windows) return .default_file;
     if (@hasDecl(File.Permissions, "fromMode")) {
         return File.Permissions.fromMode(mode);
     }
@@ -580,6 +642,13 @@ fn permissionsFromMode(mode: std.posix.mode_t) File.Permissions {
 }
 
 fn modeFromKind(kind: File.Kind) std.posix.mode_t {
+    if (builtin.os.tag == .windows) {
+        return switch (kind) {
+            .directory => 0o040000,
+            .sym_link => 0o120000,
+            else => 0o100000,
+        };
+    }
     const S = std.posix.S;
     return switch (kind) {
         .directory => S.IFDIR,
@@ -592,7 +661,13 @@ fn modeFromKind(kind: File.Kind) std.posix.mode_t {
     };
 }
 
-fn kindFromMode(mode: std.posix.mode_t) File.Kind {
+pub fn kindFromMode(mode: std.posix.mode_t) File.Kind {
+    if (builtin.os.tag == .windows) {
+        if ((mode & 0o170000) == 0o040000) return .directory;
+        if ((mode & 0o170000) == 0o120000) return .sym_link;
+        if ((mode & 0o170000) == 0o100000) return .file;
+        return .unknown;
+    }
     const S = std.posix.S;
     const fmt = mode & S.IFMT;
     if (fmt == S.IFDIR) return .directory;

@@ -12,6 +12,8 @@
 //! When adding a new module with tests, add an import line below to include
 //! it in the test suite.
 
+const builtin = @import("builtin");
+
 test "import: all modules" {
     // Importing modules here ensures tests are discovered by the runner.
     _ = @import("core.zig");
@@ -31,21 +33,21 @@ test "import: all modules" {
     _ = @import("fs/virtio_fs.zig");
     _ = @import("jailer/acl.zig");
     _ = @import("jailer/jailer.zig");
-    _ = @import("jailer/sandbox_darwin.zig");
+    if (builtin.os.tag == .macos) _ = @import("jailer/sandbox_darwin.zig");
     _ = @import("jailer/sandbox_windows.zig");
     _ = @import("jailer/seccomp.zig");
     _ = @import("main.zig");
     _ = @import("net/dns.zig");
     _ = @import("daemon/protocol.zig");
-    _ = @import("daemon/server.zig");
+    if (builtin.os.tag != .windows) _ = @import("daemon/server.zig");
     _ = @import("util/env.zig");
     _ = @import("util/log.zig");
     _ = @import("util/path.zig");
-    _ = @import("vm/hvf.zig");
+    if (builtin.os.tag != .windows) _ = @import("vm/hvf.zig");
     _ = @import("vm/dtb.zig");
     _ = @import("vm/boot.zig");
     _ = @import("vm/guest_mem.zig");
-    _ = @import("vm/posix.zig");
+    if (builtin.os.tag != .windows) _ = @import("vm/posix.zig");
     _ = @import("vm/serial.zig");
     _ = @import("vm/snapshot.zig");
     _ = @import("vm/virtio.zig");

@@ -312,7 +312,9 @@ pub fn main(init: std.process.Init) !void {
     // Detect if we're in a TTY for fancy output
     const use_ansi = blk: {
         // Check stderr (fd 2) for TTY
-        if (@hasDecl(std.c, "isatty")) break :blk std.c.isatty(std.posix.STDERR_FILENO) != 0;
+        if (builtin.os.tag != .windows and @hasDecl(std.c, "isatty")) {
+            break :blk std.c.isatty(std.posix.STDERR_FILENO) != 0;
+        }
         // Fallback: assume TTY on most systems
         break :blk true;
     };
@@ -356,6 +358,11 @@ pub fn main(init: std.process.Init) !void {
     for (selected_tests.items, 0..) |test_fn, i| {
         // Fresh allocator per test for leak detection
         testing.allocator_instance = .{};
+        testing.environ = init.minimal.environ;
+        testing.io_instance = .init(testing.allocator, .{
+            .argv0 = .init(init.minimal.args),
+            .environ = init.minimal.environ,
+        });
 
         testing.log_level = .warn;
 
@@ -365,11 +372,16 @@ pub fn main(init: std.process.Init) !void {
         // Print progress
         if (use_ansi) {
             printProgress(i, selected_tests.items.len, test_fn.name, ok_count, fail_count, skip_count);
+        } else {
+            std.debug.print("test {d}/{d}: {s}\n", .{ i + 1, selected_tests.items.len, test_fn.name });
         }
 
         // Time the test
         const test_start = nanoTimestamp();
-        const test_result = test_fn.func();
+        const test_result = blk: {
+            defer testing.io_instance.deinit();
+            break :blk test_fn.func();
+        };
         const test_end = nanoTimestamp();
         const duration: u64 = @intCast(@max(0, test_end - test_start));
 

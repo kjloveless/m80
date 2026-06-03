@@ -7,10 +7,10 @@ See [docs/PROJECT.md](docs/PROJECT.md) for the canonical project status, roadmap
 ## Status
 
 - `m80 daemon` now provides the local control-plane daemon used by `m80 start` and `m80 run`.
-- macOS HVF is the active backend for the `network_*` guest networking model and virtio-vsock.
-- Windows WHP and Linux/POSIX KVM paths still need real-host lifecycle validation and fail fast when `network_*` guest networking is enabled.
+- macOS HVF is the active backend for the full `network_*` guest networking model and virtio-vsock.
+- Windows WHP now uses virtio-vsock with a named-pipe daemon transport for VM registration and guest sessions, and the daemon egress handlers use the shared host socket path; WHP still needs real-host validation. Linux/POSIX KVM paths still fail fast when `network_*` guest networking is enabled.
 - Guest-local DNS, metadata, external DNS forwarding, TCP CONNECT, SOCKS5 UDP ASSOCIATE, and daemon-side ICMP echo run over an authenticated per-VM vsock session. TCP and UDP egress are exposed through a guest-local SOCKS5 endpoint on `127.0.0.1:1080`; transparent TUN remains pending.
-- Latest local validation from 2026-05-31: `zig build test` with Zig 0.16.0 loaded 333 tests; 312 passed, 21 skipped, 0 failed.
+- Latest local validation from 2026-06-02: `zig build test` with Zig 0.16.0 loaded 354 tests; 330 passed, 24 skipped, 0 failed.
 
 ## Build
 
@@ -77,7 +77,7 @@ virtio_fs_queues=1
 virtio_fs_cache=auto
 ```
 
-`kernel_path` is required to start. Either `initrd_path` or `disk_path` is required. `network_*` guest networking is currently implemented on the macOS HVF path only. `network_mode=open` requires `M80_ALLOW_OPEN_NETWORK=1`; `services=`, `metadata_file=`, `allowed_domains=`, and `allowed_ips=` are rejected with migration guidance. For `allowlist` and gated `open` modes, guest TCP and UDP egress are available through `socks5h://127.0.0.1:1080` when using the m80 initramfs, and ICMP echo uses the m80 TUN/vsock path with IPv4 and IPv6 allowlist enforcement.
+`kernel_path` is required to start. Either `initrd_path` or `disk_path` is required. Full `network_*` guest networking is validated on the macOS HVF path; WHP has named-pipe-backed daemon registration, virtio-vsock guest sessions, and shared host egress handlers, but still needs real Windows validation. `network_mode=open` requires `M80_ALLOW_OPEN_NETWORK=1`; `services=`, `metadata_file=`, `allowed_domains=`, and `allowed_ips=` are rejected with migration guidance. For `allowlist` and gated `open` modes, guest TCP and UDP egress are available through `socks5h://127.0.0.1:1080` when using the m80 initramfs, and ICMP echo uses the m80 TUN/vsock path with IPv4 and IPv6 allowlist enforcement.
 
 ## Logging
 

@@ -4054,6 +4054,11 @@ test "hvf: virtio-console rx writes guest buffers" {
 
     virtio.resetVirtioConsoleState();
     defer virtio.resetVirtioConsoleState();
+    virtio.initGuestIo(.{
+        .read_bytes = readGuestBytes,
+        .write_bytes = writeGuestBytes,
+    });
+    defer virtio.clearGuestIo();
     virtio.virtio_console_state.enabled = true;
 
     const base = guestMemoryBase();

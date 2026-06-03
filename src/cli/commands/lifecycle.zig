@@ -500,8 +500,6 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
         try ensureDebVmConfig(allocator);
     }
 
-    try daemon_cmd.ensureStarted(allocator);
-
     var jailer = try Jailer.init(allocator);
     defer jailer.deinit();
 
@@ -527,9 +525,11 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     var cfg_mut = cfg;
     defer core.config.freeConfig(allocator, &cfg_mut);
 
-    if ((cfg_mut.network_services.len > 0 or cfg_mut.network_mode != .locked_down) and builtin.os.tag != .macos) {
-        errors.die("network_* guest networking is currently supported only on the HVF backend (NotSupported).", .{});
+    const needs_guest_network = cfg_mut.network_services.len > 0 or cfg_mut.network_mode != .locked_down;
+    if (needs_guest_network and builtin.os.tag != .macos and builtin.os.tag != .windows) {
+        errors.die("network_* guest networking is currently supported only on the HVF and WHP backends.", .{});
     }
+    try daemon_cmd.ensureStarted(allocator);
 
     try core.config.resolveRelativePaths(allocator, dir_path, &cfg_mut);
     ensureServiceInitrd(allocator, vm_dir, dir_path, &cfg_mut) catch |e| {
@@ -548,7 +548,12 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     const guest_mounts = try collectGuestMountPaths(allocator, &cfg_mut);
     defer freeGuestMountPaths(allocator, guest_mounts);
 
-    var registration = daemon_client.registerVm(allocator, .{
+    var registration: ?daemon_client.VmRegistrationResult = null;
+    var daemon_registered = false;
+    defer if (registration) |*reg| reg.deinit(allocator);
+    errdefer if (daemon_registered) unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+
+    registration = daemon_client.registerVm(allocator, .{
         .name = cfg_mut.name,
         .memory_mb = cfg_mut.memory_mb,
         .cpu_cores = cfg_mut.cpu_cores,
@@ -562,16 +567,16 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     }) catch |e| {
         errors.die("daemon registration failed: {s}", .{@errorName(e)});
     };
-    defer registration.deinit(allocator);
-    errdefer unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+    daemon_registered = true;
 
-    const guest_cid = registration.guest_cid;
+    const guest_cid = registration.?.guest_cid;
     runtime.writeGuestCid(vm_dir, guest_cid) catch |e| {
         unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+        daemon_registered = false;
         errors.die("failed to persist guest cid: {s}", .{@errorName(e)});
     };
     cfg_mut.assigned_guest_cid = guest_cid;
-    cfg_mut.assigned_guest_session_socket_path = try allocator.dupe(u8, registration.guest_socket_path);
+    cfg_mut.assigned_guest_session_socket_path = try allocator.dupe(u8, registration.?.guest_socket_path);
 
     jailer.prepareForVm(dir_path, &cfg_mut) catch |e| {
         unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
@@ -579,7 +584,10 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     };
 
     vm.start(cfg_mut) catch |e| {
-        unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+        if (daemon_registered) {
+            unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+            daemon_registered = false;
+        }
         switch (e) {
             error.MountsInvalid => errors.die(
                 "mounts rejected. Ensure mount_roots includes the host path and no path traversal is present.",
@@ -613,7 +621,10 @@ fn startVmCommand(allocator: std.mem.Allocator, name: []const u8, ensure_deb: bo
     vm.stop() catch |e| {
         errors.die("stop failed: {s}", .{@errorName(e)});
     };
-    unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+    if (daemon_registered) {
+        unregisterVmBestEffort(allocator, vm_dir, cfg_mut.name);
+        daemon_registered = false;
+    }
     state.setStatus(allocator, name, .stopped) catch |e| switch (e) {
         error.InvalidArgs => errors.die("invalid vm name: {s}\n", .{name}),
         error.NotFound => errors.die("vm not found: {s}\n", .{name}),

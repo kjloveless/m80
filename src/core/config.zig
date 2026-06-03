@@ -465,7 +465,7 @@ pub fn resolveRelativePaths(
             resolved = expanded;
         }
         if (!fs.path.isAbsolute(resolved)) {
-            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            const joined = try joinRelativeConfigPath(allocator, base_dir, resolved);
             allocator.free(resolved);
             cfg.kernel_path = joined;
         } else {
@@ -479,7 +479,7 @@ pub fn resolveRelativePaths(
             resolved = expanded;
         }
         if (!fs.path.isAbsolute(resolved)) {
-            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            const joined = try joinRelativeConfigPath(allocator, base_dir, resolved);
             allocator.free(resolved);
             cfg.initrd_path = joined;
         } else {
@@ -493,7 +493,7 @@ pub fn resolveRelativePaths(
             resolved = expanded;
         }
         if (!fs.path.isAbsolute(resolved)) {
-            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            const joined = try joinRelativeConfigPath(allocator, base_dir, resolved);
             allocator.free(resolved);
             cfg.disk_path = joined;
         } else {
@@ -507,7 +507,7 @@ pub fn resolveRelativePaths(
             resolved = expanded;
         }
         if (!fs.path.isAbsolute(resolved)) {
-            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            const joined = try joinRelativeConfigPath(allocator, base_dir, resolved);
             allocator.free(resolved);
             cfg.seed_path = joined;
         } else {
@@ -521,7 +521,7 @@ pub fn resolveRelativePaths(
             resolved = expanded;
         }
         if (!fs.path.isAbsolute(resolved)) {
-            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            const joined = try joinRelativeConfigPath(allocator, base_dir, resolved);
             allocator.free(resolved);
             cfg.data_disk_path = joined;
         } else {
@@ -549,7 +549,7 @@ pub fn resolveRelativePaths(
                     resolved = expanded;
                 }
                 if (!fs.path.isAbsolute(resolved)) {
-                    const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+                    const joined = try joinRelativeConfigPath(allocator, base_dir, resolved);
                     allocator.free(resolved);
                     rewritten[i] = joined;
                 } else {
@@ -567,7 +567,7 @@ pub fn resolveRelativePaths(
                 mount_cfg.host_path = expanded;
             }
             if (!fs.path.isAbsolute(mount_cfg.host_path)) {
-                const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, mount_cfg.host_path });
+                const joined = try joinRelativeConfigPath(allocator, base_dir, mount_cfg.host_path);
                 allocator.free(mount_cfg.host_path);
                 mount_cfg.host_path = joined;
             }
@@ -580,13 +580,23 @@ pub fn resolveRelativePaths(
             resolved = expanded;
         }
         if (!fs.path.isAbsolute(resolved)) {
-            const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, resolved });
+            const joined = try joinRelativeConfigPath(allocator, base_dir, resolved);
             allocator.free(resolved);
             cfg.network_metadata_file = joined;
         } else {
             cfg.network_metadata_file = resolved;
         }
     }
+}
+
+fn joinRelativeConfigPath(allocator: std.mem.Allocator, base_dir: []const u8, relative: []const u8) ![]u8 {
+    const joined = try fs.path.join(allocator, &[_][]const u8{ base_dir, relative });
+    if (std.mem.indexOfScalar(u8, base_dir, '/')) |_| {
+        for (joined) |*ch| {
+            if (ch.* == '\\') ch.* = '/';
+        }
+    }
+    return joined;
 }
 
 fn expandTildePath(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
@@ -1228,7 +1238,7 @@ test "config: parse kernel/initrd paths and overrides" {
     try f.writeAll("name=testvm\n" ++
         "ephemeral=true\n" ++
         "memory_mb=4096\n" ++
-        "cpu_cores=4\n" ++
+        "cpu_cores=1\n" ++
         "kernel_path=/kernels/vmlinuz\n" ++
         "initrd_path=/images/initrd.img\n" ++
         "disk_path=/images/rootfs.ext4\n" ++
@@ -1245,7 +1255,7 @@ test "config: parse kernel/initrd paths and overrides" {
     try std.testing.expectEqualStrings("testvm", cfg_mut.name);
     try std.testing.expect(cfg_mut.ephemeral);
     try std.testing.expectEqual(@as(u32, 4096), cfg_mut.memory_mb);
-    try std.testing.expectEqual(@as(u16, 4), cfg_mut.cpu_cores);
+    try std.testing.expectEqual(@as(u16, 1), cfg_mut.cpu_cores);
     try std.testing.expectEqualStrings("/kernels/vmlinuz", cfg_mut.kernel_path.?);
     try std.testing.expectEqualStrings("/images/initrd.img", cfg_mut.initrd_path.?);
     try std.testing.expectEqualStrings("/images/rootfs.ext4", cfg_mut.disk_path.?);

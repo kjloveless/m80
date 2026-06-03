@@ -445,7 +445,7 @@ test "dns: buildQuery" {
 
     try std.testing.expect(len > @sizeOf(DnsHeader));
 
-    const header: *const DnsHeader = @ptrCast(@alignCast(&buf));
+    const header: *align(1) const DnsHeader = @ptrCast(&buf);
     try std.testing.expectEqual(@as(u16, 0x1234), std.mem.bigToNative(u16, header.id));
 }
 
@@ -486,14 +486,14 @@ test "dns: buildQuery rejects oversized label" {
 
 test "dns: parseResponse rejects non-response header" {
     var response: [@sizeOf(DnsHeader)]u8 = undefined;
-    const header: *DnsHeader = @ptrCast(@alignCast(&response));
+    const header: *align(1) DnsHeader = @ptrCast(&response);
     header.* = DnsHeader.init(0x1234);
     try std.testing.expectError(error.InvalidResponse, parseResponse(std.testing.allocator, &response));
 }
 
 test "dns: parseResponse rejects non-zero rcode" {
     var response: [@sizeOf(DnsHeader)]u8 = undefined;
-    const header: *DnsHeader = @ptrCast(@alignCast(&response));
+    const header: *align(1) DnsHeader = @ptrCast(&response);
     header.* = DnsHeader.init(0x1234);
     header.flags = std.mem.nativeToBig(u16, 0x8001); // response + rcode 1
     try std.testing.expectError(error.ResolutionFailed, parseResponse(std.testing.allocator, &response));
@@ -501,7 +501,7 @@ test "dns: parseResponse rejects non-zero rcode" {
 
 test "dns: parseResponse rejects empty answers" {
     var response: [@sizeOf(DnsHeader)]u8 = undefined;
-    const header: *DnsHeader = @ptrCast(@alignCast(&response));
+    const header: *align(1) DnsHeader = @ptrCast(&response);
     header.* = DnsHeader.init(0x1234);
     header.flags = std.mem.nativeToBig(u16, 0x8000); // response
     header.an_count = std.mem.nativeToBig(u16, 0);
@@ -513,7 +513,7 @@ test "dns: parseResponse parses A record" {
     const qlen = try buildQuery(&query_buf, "example.com", 0xBEEF);
 
     var response: [512]u8 = undefined;
-    const header: *DnsHeader = @ptrCast(@alignCast(&response));
+    const header: *align(1) DnsHeader = @ptrCast(&response);
     header.* = DnsHeader.init(0xBEEF);
     header.flags = std.mem.nativeToBig(u16, 0x8000); // response
     header.qd_count = std.mem.nativeToBig(u16, 1);
@@ -615,7 +615,7 @@ test "dns: parseResponse ignores non-A records" {
     const qlen = try buildQuery(&query_buf, "example.com", 0xBEEF);
 
     var response: [512]u8 = undefined;
-    const header: *DnsHeader = @ptrCast(@alignCast(&response));
+    const header: *align(1) DnsHeader = @ptrCast(&response);
     header.* = DnsHeader.init(0xBEEF);
     header.flags = std.mem.nativeToBig(u16, 0x8000); // response
     header.qd_count = std.mem.nativeToBig(u16, 1);

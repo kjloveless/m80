@@ -1,0 +1,294 @@
+name: Integration (Self-Hosted)
+run-name: Integration ${{ inputs.suite }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Integration suite to run
+        required: true
+        type: choice
+        options:
+          - kvm-reliability
+          - hvf-reliability
+          - hvf-vmnet-policy
+          - hvf-vmnet-positive
+          - whp-cpuid-io
+          - whp-reliability
+          - whp-validation
+      kernel_path:
+        description: Guest kernel path on the runner (optional when runner env sets M80_TEST_KERNEL)
+        required: false
+        default: ""
+        type: string
+      initrd_path:
+        description: Guest initrd path on the runner (optional when runner env sets M80_TEST_INITRD)
+        required: false
+        default: ""
+        type: string
+      disk_path:
+        description: Guest disk path (required by hvf-vmnet-positive)
+        required: false
+        type: string
+      seed_path:
+        description: Optional seed image path
+        required: false
+        type: string
+      cycles:
+        description: Reliability loop count
+        required: false
+        default: "20"
+        type: string
+      serial_expect:
+        description: Expected serial marker for smoke/reliability checks
+        required: false
+        default: "m80 initramfs: boot ok"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  kvm-reliability:
+    if: ${{ inputs.suite == 'kvm-reliability' }}
+    runs-on: [self-hosted, linux]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Run KVM reliability integration test
+        run: |
+          scripts/run-kvm-reliability.sh \
+            "${{ inputs.kernel_path }}" \
+            "${{ inputs.initrd_path }}" \
+            "${{ inputs.cycles }}"
+
+  hvf-reliability:
+    if: ${{ inputs.suite == 'hvf-reliability' }}
+    runs-on: [self-hosted, macos]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Run HVF reliability integration test
+        run: |
+          scripts/run-hvf-reliability.sh \
+            "${{ inputs.kernel_path }}" \
+            "${{ inputs.initrd_path }}" \
+            "${{ inputs.cycles }}" \
+            "${{ inputs.serial_expect }}"
+
+  hvf-vmnet-policy:
+    if: ${{ inputs.suite == 'hvf-vmnet-policy' }}
+    runs-on: [self-hosted, macos]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Run HVF vmnet policy integration test
+        run: |
+          make hvf-vmnet-policy \
+            KERNEL="${{ inputs.kernel_path }}" \
+            INITRD="${{ inputs.initrd_path }}"
+
+  hvf-vmnet-positive:
+    if: ${{ inputs.suite == 'hvf-vmnet-positive' }}
+    runs-on: [self-hosted, macos]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Run HVF vmnet positive integration test
+        run: |
+          make hvf-vmnet-positive \
+            KERNEL="${{ inputs.kernel_path }}" \
+            INITRD="${{ inputs.initrd_path }}" \
+            DISK="${{ inputs.disk_path }}" \
+            SEED="${{ inputs.seed_path }}"
+
+  whp-cpuid-io:
+    if: ${{ inputs.suite == 'whp-cpuid-io' }}
+    runs-on: [self-hosted, windows]
+    env:
+      WHP_LOG_PATH: ${{ github.workspace }}\whp-cpuid-io.log
+      WHP_DIAG_PATH: ${{ github.workspace }}\whp-host-diag-cpuid-io.txt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Collect WHP host diagnostics
+        shell: pwsh
+        run: |
+          "suite=whp-cpuid-io" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Encoding utf8
+          "timestamp=$(Get-Date -Format o)" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "kernel_path=${{ inputs.kernel_path }}" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "initrd_path=${{ inputs.initrd_path }}" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "=== zig ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          zig version | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "=== systeminfo ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          systeminfo | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+            "=== WHP Optional Feature ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform | Format-List * | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            "=== Hyper-V Optional Feature ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All | Format-List * | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          } else {
+            "Get-WindowsOptionalFeature not available on this runner." | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          }
+      - name: Run WHP integration test
+        shell: pwsh
+        run: |
+          ./scripts/run-whp-integration.ps1 `
+            -KernelPath "${{ inputs.kernel_path }}" `
+            -InitrdPath "${{ inputs.initrd_path }}" `
+            -LogPath "$env:WHP_LOG_PATH"
+      - name: Upload WHP integration log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whp-cpuid-io-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.WHP_LOG_PATH }}
+            ${{ env.WHP_DIAG_PATH }}
+          if-no-files-found: warn
+
+  whp-reliability:
+    if: ${{ inputs.suite == 'whp-reliability' }}
+    runs-on: [self-hosted, windows]
+    env:
+      WHP_LOG_PATH: ${{ github.workspace }}\whp-reliability.log
+      WHP_DIAG_PATH: ${{ github.workspace }}\whp-host-diag-reliability.txt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Collect WHP host diagnostics
+        shell: pwsh
+        run: |
+          "suite=whp-reliability" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Encoding utf8
+          "timestamp=$(Get-Date -Format o)" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "kernel_path=${{ inputs.kernel_path }}" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "initrd_path=${{ inputs.initrd_path }}" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "cycles=${{ inputs.cycles }}" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "=== zig ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          zig version | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "=== systeminfo ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          systeminfo | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+            "=== WHP Optional Feature ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform | Format-List * | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            "=== Hyper-V Optional Feature ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All | Format-List * | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          } else {
+            "Get-WindowsOptionalFeature not available on this runner." | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          }
+      - name: Run WHP reliability integration test
+        shell: pwsh
+        run: |
+          ./scripts/run-whp-reliability.ps1 `
+            -KernelPath "${{ inputs.kernel_path }}" `
+            -InitrdPath "${{ inputs.initrd_path }}" `
+            -Cycles "${{ inputs.cycles }}" `
+            -LogPath "$env:WHP_LOG_PATH"
+      - name: Upload WHP reliability log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whp-reliability-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.WHP_LOG_PATH }}
+            ${{ env.WHP_DIAG_PATH }}
+          if-no-files-found: warn
+
+  whp-validation:
+    if: ${{ inputs.suite == 'whp-validation' }}
+    runs-on: [self-hosted, windows]
+    env:
+      WHP_ARTIFACT_DIR: ${{ github.workspace }}\whp-validation
+      WHP_DIAG_PATH: ${{ github.workspace }}\whp-host-diag-validation.txt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Collect WHP host diagnostics
+        shell: pwsh
+        run: |
+          "suite=whp-validation" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Encoding utf8
+          "timestamp=$(Get-Date -Format o)" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "kernel_path=${{ inputs.kernel_path }}" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "initrd_path=${{ inputs.initrd_path }}" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "cycles=${{ inputs.cycles }}" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "=== zig ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          zig version | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "=== systeminfo ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          systeminfo | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+            "=== WHP Optional Feature ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform | Format-List * | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            "" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            "=== Hyper-V Optional Feature ===" | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+            Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All | Format-List * | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          } else {
+            "Get-WindowsOptionalFeature not available on this runner." | Out-File -FilePath "$env:WHP_DIAG_PATH" -Append -Encoding utf8
+          }
+      - name: Run WHP validation suite
+        shell: pwsh
+        run: |
+          ./scripts/run-whp-validation.ps1 `
+            -KernelPath "${{ inputs.kernel_path }}" `
+            -InitrdPath "${{ inputs.initrd_path }}" `
+            -Cycles "${{ inputs.cycles }}" `
+            -ArtifactsDir "$env:WHP_ARTIFACT_DIR"
+      - name: Upload WHP validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whp-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.WHP_ARTIFACT_DIR }}\*.log
+            ${{ env.WHP_DIAG_PATH }}
+          if-no-files-found: warn
