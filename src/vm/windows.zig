@@ -1135,19 +1135,25 @@ fn resetVirtioState() void {
     virtio.resetVirtioVsockState();
 }
 
-fn unmapMmioIfEnabled(handle: Whp.PartitionHandle, base: u64, size: u64, enabled: bool) !void {
+fn mmioRangeIsMappedRam(base: u64, size: u64, mapped_memory_size: u64) bool {
+    if (size == 0 or base >= mapped_memory_size) return false;
+    return size <= mapped_memory_size - base;
+}
+
+fn unmapMmioIfEnabled(handle: Whp.PartitionHandle, base: u64, size: u64, enabled: bool, mapped_memory_size: u64) !void {
     if (!enabled) return;
+    if (!mmioRangeIsMappedRam(base, size, mapped_memory_size)) return;
     try Whp.unmapGpaRange(handle, base, size);
 }
 
-fn configureMmioIntercepts(handle: Whp.PartitionHandle) !void {
+fn configureMmioIntercepts(handle: Whp.PartitionHandle, mapped_memory_size: u64) !void {
     for (virtio.virtio_blk_devices, 0..) |device, index| {
-        try unmapMmioIfEnabled(handle, virtio.virtioBlkMmioBase(index), virtio.virtio_blk_mmio_size, device.enabled);
+        try unmapMmioIfEnabled(handle, virtio.virtioBlkMmioBase(index), virtio.virtio_blk_mmio_size, device.enabled, mapped_memory_size);
     }
-    try unmapMmioIfEnabled(handle, virtio.virtio_console_mmio_base, virtio.virtio_console_mmio_size, virtio.virtio_console_state.enabled);
-    try unmapMmioIfEnabled(handle, virtio.virtio_rng_mmio_base, virtio.virtio_rng_mmio_size, virtio.virtio_rng_state.enabled);
-    try unmapMmioIfEnabled(handle, virtio.virtio_fs_mmio_base, virtio.virtio_fs_mmio_size, virtio.virtio_fs_state.enabled);
-    try unmapMmioIfEnabled(handle, virtio.virtio_vsock_mmio_base, virtio.virtio_vsock_mmio_size, virtio.virtio_vsock_state.enabled);
+    try unmapMmioIfEnabled(handle, virtio.virtio_console_mmio_base, virtio.virtio_console_mmio_size, virtio.virtio_console_state.enabled, mapped_memory_size);
+    try unmapMmioIfEnabled(handle, virtio.virtio_rng_mmio_base, virtio.virtio_rng_mmio_size, virtio.virtio_rng_state.enabled, mapped_memory_size);
+    try unmapMmioIfEnabled(handle, virtio.virtio_fs_mmio_base, virtio.virtio_fs_mmio_size, virtio.virtio_fs_state.enabled, mapped_memory_size);
+    try unmapMmioIfEnabled(handle, virtio.virtio_vsock_mmio_base, virtio.virtio_vsock_mmio_size, virtio.virtio_vsock_state.enabled, mapped_memory_size);
 }
 
 fn handleMmioExit(index: u32, ctx: *const WhvRunVpExitContext) bool {
@@ -1555,7 +1561,7 @@ pub fn start(cfg: config.VmConfig) !void {
         .partition = handle,
         .vp_index = default_vcpu_index,
     };
-    try configureMmioIntercepts(handle);
+    try configureMmioIntercepts(handle, size_bytes_u64);
 
     interrupt_partition = handle;
     errdefer interrupt_partition = null;
@@ -1897,6 +1903,28 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
         pos = idx + needle.len;
     }
     return count;
+}
+
+test "windows: mmio unmap ranges are limited to mapped guest RAM" {
+    const small_memory = 128 * mb_to_bytes;
+    try std.testing.expect(!mmioRangeIsMappedRam(
+        virtio.virtio_console_mmio_base,
+        virtio.virtio_console_mmio_size,
+        small_memory,
+    ));
+
+    const mapped_end = virtio.virtio_rng_mmio_base + virtio.virtio_rng_mmio_size;
+    try std.testing.expect(mmioRangeIsMappedRam(
+        virtio.virtio_rng_mmio_base,
+        virtio.virtio_rng_mmio_size,
+        mapped_end,
+    ));
+    try std.testing.expect(!mmioRangeIsMappedRam(
+        virtio.virtio_rng_mmio_base,
+        virtio.virtio_rng_mmio_size,
+        mapped_end - 1,
+    ));
+    try std.testing.expect(!mmioRangeIsMappedRam(virtio.virtio_rng_mmio_base, 0, mapped_end));
 }
 
 test "windows: buildEffectiveCmdline appends enabled virtio-mmio devices" {
